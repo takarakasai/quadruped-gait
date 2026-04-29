@@ -349,6 +349,44 @@ mod tests {
     }
 
     #[test]
+    fn stance_foot_moves_backward_in_body_frame_when_walking_forward() {
+        // Regression test for a Phase 2 bug where Footstep::stance_at
+        // interpolated lift_off → touch_down (back to front) instead of
+        // touch_down → lift_off (front to back). When a quadruped walks
+        // forward (+vx), the foot in stance must sweep BACKWARD relative
+        // to the body — that's what creates the forward-pushing reaction
+        // force at contact. The bug had foot moving forward, propelling
+        // the robot the wrong way.
+        let mut ctrl = GaitController::new(GaitConfig::trot(), build_kin());
+        ctrl.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
+
+        let dt = 0.002;
+        let mut samples: Vec<(f64, bool, f64)> = Vec::new(); // (cycle pos, is_stance, foot.x)
+        let n = (ctrl.config().cycle_period_s / dt) as usize + 1;
+        for _ in 0..n {
+            let out = ctrl.tick(dt);
+            let fl = &out.legs[0]; // FL slot
+            samples.push((fl.phase.cycle_position, fl.phase.is_stance, fl.foot_body.x));
+        }
+
+        // Find a stance run and verify foot.x decreases monotonically.
+        let stance_runs: Vec<&(f64, bool, f64)> =
+            samples.iter().filter(|s| s.1).collect();
+        assert!(
+            stance_runs.len() >= 4,
+            "expected several stance samples, got {}",
+            stance_runs.len(),
+        );
+        let first_x = stance_runs.first().unwrap().2;
+        let last_x = stance_runs.last().unwrap().2;
+        assert!(
+            last_x < first_x,
+            "stance foot.x must decrease (move back in body frame) when walking +x; \
+             got first={first_x} last={last_x}",
+        );
+    }
+
+    #[test]
     fn knee_pattern_round_trip_through_controller() {
         use crate::config::KneePattern;
         let mut ctrl = GaitController::new(GaitConfig::trot(), build_kin());

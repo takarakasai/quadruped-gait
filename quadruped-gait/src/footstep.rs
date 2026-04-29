@@ -45,11 +45,17 @@ pub struct Footstep {
 }
 
 impl Footstep {
-    /// Linearly interpolate between `lift_off` and `touch_down` by `frac`.
-    /// Used by stance — see also [`crate::stance_position`] which wraps this.
+    /// Position along the stance line at sub-phase `frac ∈ [0, 1]`.
+    /// `frac = 0` is **touch-down** (the foot has just landed at the front
+    /// of the stride), `frac = 1` is **lift-off** (the foot is about to
+    /// leave the ground at the back of the stride). This direction —
+    /// front-to-back in body frame — is the one that pushes the body
+    /// forward when contact is present, and matches the swing's
+    /// lift_off → touch_down direction so there's no discontinuity at
+    /// the stance/swing boundary.
     pub fn stance_at(&self, frac: f64) -> Vector3<f64> {
         let f = frac.clamp(0.0, 1.0);
-        self.lift_off * (1.0 - f) + self.touch_down * f
+        self.touch_down * (1.0 - f) + self.lift_off * f
     }
 }
 
@@ -177,6 +183,10 @@ mod tests {
 
     #[test]
     fn stance_at_endpoints_exact() {
+        // Stance starts at touch_down (foot just landed) and ends at
+        // lift_off (foot about to leave). This direction is what pushes
+        // the body forward — the controller had this backwards in the
+        // first Phase 2 cut.
         let kin = fl_kin();
         let gait = GaitConfig::trot();
         let cmd = VelocityCmd { vx: 0.3, vy: 0.0, wz: 0.0 };
@@ -184,8 +194,42 @@ mod tests {
         let p0 = fs.stance_at(0.0);
         let p1 = fs.stance_at(1.0);
         for ax in 0..3 {
-            assert_relative_eq!(p0[ax], fs.lift_off[ax], epsilon = 1e-9);
-            assert_relative_eq!(p1[ax], fs.touch_down[ax], epsilon = 1e-9);
+            assert_relative_eq!(p0[ax], fs.touch_down[ax], epsilon = 1e-9);
+            assert_relative_eq!(p1[ax], fs.lift_off[ax], epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn stance_swing_transition_is_continuous() {
+        // The end of stance must coincide with the start of swing — same
+        // foot position in body frame — otherwise the controller emits
+        // a step-change in the position target every cycle, generating
+        // a huge transient torque (and visually-broken trot motion).
+        let kin = fl_kin();
+        let gait = GaitConfig::trot();
+        let cmd = VelocityCmd { vx: 0.3, vy: 0.0, wz: 0.0 };
+        let fs = compute_footstep(&kin, &gait, &cmd);
+        let stance_end = fs.stance_at(1.0);
+        let swing_start = crate::swing_traj::swing_position(
+            fs.lift_off,
+            fs.touch_down,
+            gait.swing_height_m,
+            0.0,
+        );
+        for ax in 0..3 {
+            assert_relative_eq!(stance_end[ax], swing_start[ax], epsilon = 1e-9);
+        }
+
+        // Symmetric check: swing's end must coincide with stance's start.
+        let swing_end = crate::swing_traj::swing_position(
+            fs.lift_off,
+            fs.touch_down,
+            gait.swing_height_m,
+            1.0,
+        );
+        let stance_start = fs.stance_at(0.0);
+        for ax in 0..3 {
+            assert_relative_eq!(swing_end[ax], stance_start[ax], epsilon = 1e-9);
         }
     }
 }
