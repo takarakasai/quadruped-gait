@@ -52,14 +52,21 @@
 //! See `tests/` for unit-tested behaviour and the `articara` GUI for an
 //! interactive driver.
 
+pub mod body_state;
 pub mod config;
+pub mod controller;
+pub mod footstep;
 pub mod ik;
 pub mod phase;
 pub mod swing_traj;
 
+pub use body_state::BodyState;
 pub use config::{
     GaitConfig, GaitType, KinematicsConfig, LegId, LegKinematics, VelocityCmd,
+    DEFAULT_FOOT_LINKS,
 };
+pub use controller::{ControllerOutput, GaitController, LegOutput};
+pub use footstep::{compute_footstep, Footstep};
 pub use ik::{solve_leg_ik, LegIkSolution};
 pub use phase::{PhaseGenerator, PhaseState};
 pub use swing_traj::{stance_position, swing_position};

@@ -1,17 +1,12 @@
-//! Phase 1 integration test: simulate one full Trot cycle at vx = 0.3 m/s
-//! by manually wiring `PhaseGenerator` + Raibert footstep heuristic +
-//! `swing_position` / `stance_position` + per-leg `solve_leg_ik`. Dumps a
-//! CSV of (time, body-frame foot xyz, joint angles) for every leg every
-//! tick so the trajectory can be plotted and eyeballed.
+//! Integration test: simulate one full Trot cycle at vx = 0.3 m/s through
+//! the full Phase 2 controller stack. Dumps a CSV of (time, body-frame
+//! foot xyz, joint angles, body world pose) for every leg every tick so
+//! the trajectory can be plotted and eyeballed.
 //!
-//! The footstep planner and `GaitController` are deliberately NOT used —
-//! they're Phase 2's job. This test serves three purposes:
-//!
-//! 1. Confirm the Phase 1 pieces fit together cleanly when wired by hand.
-//! 2. Document the intended pipeline so Phase 2's controller has a
-//!    reference behaviour.
-//! 3. Lock in regression assertions against numeric drift in any of
-//!    `PhaseGenerator`, `swing_position`, or `solve_leg_ik`.
+//! Originally written as a Phase 1 hand-wired smoke test; rewritten in
+//! Phase 2 to drive [`GaitController`] directly. The pre-controller
+//! Raibert / phase / IK invariants remain valid since the controller is
+//! a deterministic composition of the same primitives.
 
 use std::fs::File;
 use std::io::Write;
@@ -20,8 +15,8 @@ use std::path::PathBuf;
 use approx::assert_relative_eq;
 use nalgebra::Vector3;
 use quadruped_gait::{
-    solve_leg_ik, stance_position, swing_position, GaitConfig, KinematicsConfig, LegId,
-    LegKinematics, PhaseGenerator, PhaseState, VelocityCmd,
+    ControllerOutput, GaitConfig, GaitController, KinematicsConfig, LegId, LegKinematics,
+    LegOutput, VelocityCmd,
 };
 
 /// Build a small symmetric quadruped: 0.36 m body length, 0.10 m body
@@ -62,53 +57,16 @@ fn build_kinematics() -> KinematicsConfig {
     }
 }
 
-/// Inline Raibert-style footstep target for one leg at the current phase.
-///
-/// During stance, the foot stays planted on the ground while the body
-/// moves forward — equivalently, the foot moves *backward* relative to
-/// the body by `vx · t`. We span from `+step/2` at touch-down to
-/// `-step/2` at lift-off.
-///
-/// During swing, the foot lifts off at `-step/2` (where stance left it),
-/// arcs over the body's path, and lands at `+step/2` ready for the next
-/// stance.
-fn foot_target(
-    kin: &LegKinematics,
-    phase: PhaseState,
-    cycle_period: f64,
-    duty: f64,
-    swing_height: f64,
-    vx: f64,
-) -> Vector3<f64> {
-    // Step length is the distance the body covers during one stance phase.
-    let stance_duration = cycle_period * duty;
-    let step = vx * stance_duration;
-
-    let fwd = Vector3::new(1.0, 0.0, 0.0);
-    let nominal = kin.nominal_foot_body;
-    let lift_off = nominal - fwd * (step * 0.5); // back side of stance
-    let touch_down = nominal + fwd * (step * 0.5); // front side of stance
-
-    if phase.is_stance {
-        // Stance: from touch_down → lift_off as sub-fraction grows.
-        stance_position(touch_down, lift_off, phase.sub_fraction)
-    } else {
-        // Swing: from lift_off → touch_down as sub-fraction grows.
-        swing_position(lift_off, touch_down, swing_height, phase.sub_fraction)
-    }
-}
-
-/// One sample of the dump CSV.
-///
-/// Per-leg arrays are stored in canonical [`LegId::ALL`] order
-/// (FL, FR, RL, RR) regardless of the order [`PhaseGenerator::legs`]
-/// returns, so test assertions can index by a fixed convention.
-#[derive(Clone, Copy, Debug)]
+/// One sample of the dump CSV. Per-leg slots are in canonical
+/// [`LegId::ALL`] order (FL, FR, RL, RR) — same layout the controller
+/// already produces, no remapping needed.
+#[derive(Clone, Debug)]
 struct Sample {
     t: f64,
-    foot_body: [Vector3<f64>; 4],
-    joints: [(f64, f64, f64); 4], // (hip, thigh, calf)
-    is_stance: [bool; 4],
+    body_x: f64,
+    body_y: f64,
+    body_yaw: f64,
+    legs: [LegOutput; 4],
 }
 
 /// Position of `id` inside [`LegId::ALL`] for canonical-order indexing.
@@ -121,8 +79,8 @@ fn slot_of(id: LegId) -> usize {
     }
 }
 
-/// Run one cycle and return the samples plus a flag indicating whether
-/// every leg's IK solution was reachable throughout.
+/// Run one cycle through [`GaitController`] and return the samples plus
+/// a flag indicating whether every leg's IK was reachable throughout.
 fn simulate_cycle(
     kin: &KinematicsConfig,
     cfg: &GaitConfig,
@@ -130,57 +88,31 @@ fn simulate_cycle(
     dt: f64,
     n_ticks: usize,
 ) -> (Vec<Sample>, bool) {
-    let mut phase_gen = PhaseGenerator::new(cfg.clone());
-    let cmd = VelocityCmd { vx, vy: 0.0, wz: 0.0 };
+    let mut ctrl = GaitController::new(cfg.clone(), kin.clone());
+    ctrl.set_velocity_cmd(VelocityCmd { vx, vy: 0.0, wz: 0.0 });
     let mut samples = Vec::with_capacity(n_ticks);
     let mut all_reachable = true;
-
     for tick in 0..n_ticks {
-        phase_gen.advance(dt, &cmd);
-        let phases = phase_gen.legs();
-        let mut foot_body = [Vector3::zeros(); 4];
-        let mut joints = [(0.0, 0.0, 0.0); 4];
-        let mut is_stance = [false; 4];
-
-        for ps in phases.iter() {
-            let kin_leg = kin.leg(ps.leg);
-            let target = foot_target(
-                kin_leg,
-                *ps,
-                cfg.cycle_period_s,
-                cfg.duty_factor,
-                cfg.swing_height_m,
-                vx,
-            );
-            // Front legs knee-forward, rear legs knee-back is a common
-            // quadruped convention. For symmetric testing of the IK
-            // alone, use knee_forward = false on all legs; flip later if
-            // a specific URDF demands.
-            let sol = solve_leg_ik(kin_leg, target, false);
-            if !sol.is_reachable() {
-                all_reachable = false;
-            }
-            let slot = slot_of(ps.leg);
-            foot_body[slot] = target;
-            joints[slot] = sol.angles();
-            is_stance[slot] = ps.is_stance;
+        let out: ControllerOutput = ctrl.tick(dt);
+        if !out.all_reachable() {
+            all_reachable = false;
         }
         samples.push(Sample {
             t: (tick as f64 + 1.0) * dt,
-            foot_body,
-            joints,
-            is_stance,
+            body_x: out.body_state.world_position.x,
+            body_y: out.body_state.world_position.y,
+            body_yaw: out.body_state.world_yaw,
+            legs: out.legs,
         });
     }
     (samples, all_reachable)
 }
 
-/// Write the dump as CSV. One row per tick, 4 legs × (xfoot, yfoot,
-/// zfoot, hip, thigh, calf, stance) in canonical FL/FR/RL/RR order
-/// matching [`Sample`]'s slot layout.
+/// Write the dump as CSV. One row per tick:
+/// `t, body_x, body_y, body_yaw, {LEG}_{xfoot,yfoot,zfoot,hip,thigh,calf,stance}` × 4.
 fn write_csv(path: &PathBuf, samples: &[Sample]) -> std::io::Result<()> {
     let mut f = File::create(path)?;
-    write!(f, "t")?;
+    write!(f, "t,body_x,body_y,body_yaw")?;
     for tag in [LegId::FL, LegId::FR, LegId::RL, LegId::RR] {
         for col in ["xfoot", "yfoot", "zfoot", "hip", "thigh", "calf", "stance"] {
             write!(f, ",{}_{col}", tag.label())?;
@@ -188,14 +120,18 @@ fn write_csv(path: &PathBuf, samples: &[Sample]) -> std::io::Result<()> {
     }
     writeln!(f)?;
     for s in samples {
-        write!(f, "{:.5}", s.t)?;
-        for i in 0..4 {
-            let p = s.foot_body[i];
-            let (h, t, c) = s.joints[i];
+        write!(f, "{:.5},{:.5},{:.5},{:.5}", s.t, s.body_x, s.body_y, s.body_yaw)?;
+        for leg in &s.legs {
             write!(
                 f,
                 ",{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{}",
-                p.x, p.y, p.z, h, t, c, if s.is_stance[i] { 1 } else { 0 },
+                leg.foot_body.x,
+                leg.foot_body.y,
+                leg.foot_body.z,
+                leg.q_hip,
+                leg.q_thigh,
+                leg.q_calf,
+                if leg.phase.is_stance { 1 } else { 0 },
             )?;
         }
         writeln!(f)?;
@@ -233,15 +169,15 @@ fn one_trot_cycle_at_vx_0_3() {
     //    and FR / RL share the opposite state.
     for (i, s) in samples.iter().enumerate() {
         assert_eq!(
-            s.is_stance[fl], s.is_stance[rr],
+            s.legs[fl].phase.is_stance, s.legs[rr].phase.is_stance,
             "tick {i}: FL and RR should be in the same sub-phase",
         );
         assert_eq!(
-            s.is_stance[fr], s.is_stance[rl],
+            s.legs[fr].phase.is_stance, s.legs[rl].phase.is_stance,
             "tick {i}: FR and RL should be in the same sub-phase",
         );
         assert_ne!(
-            s.is_stance[fl], s.is_stance[fr],
+            s.legs[fl].phase.is_stance, s.legs[fr].phase.is_stance,
             "tick {i}: diagonal pairs should be in opposite sub-phases",
         );
     }
@@ -250,7 +186,7 @@ fn one_trot_cycle_at_vx_0_3() {
     //    in stance (within ±1 due to integer rounding).
     let expected_stance = (cfg.duty_factor * n_ticks as f64).round() as i64;
     for slot in 0..4 {
-        let count = samples.iter().filter(|s| s.is_stance[slot]).count() as i64;
+        let count = samples.iter().filter(|s| s.legs[slot].phase.is_stance).count() as i64;
         assert!(
             (count - expected_stance).abs() <= 1,
             "leg {slot}: stance count {count} not within 1 of expected {expected_stance}",
@@ -259,7 +195,7 @@ fn one_trot_cycle_at_vx_0_3() {
 
     // 3. Step length matches the catalogue: the foot's body-frame x range
     //    over a cycle should equal vx · stance_duration. We inspect FL.
-    let fl_x: Vec<f64> = samples.iter().map(|s| s.foot_body[fl].x).collect();
+    let fl_x: Vec<f64> = samples.iter().map(|s| s.legs[fl].foot_body.x).collect();
     let x_min = fl_x.iter().cloned().fold(f64::INFINITY, f64::min);
     let x_max = fl_x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let observed_step = x_max - x_min;
@@ -271,33 +207,37 @@ fn one_trot_cycle_at_vx_0_3() {
     let fl_nominal_z = kin.fl.nominal_foot_body.z;
     let fl_swing_zmax = samples
         .iter()
-        .filter(|s| !s.is_stance[fl])
-        .map(|s| s.foot_body[fl].z)
+        .filter(|s| !s.legs[fl].phase.is_stance)
+        .map(|s| s.legs[fl].foot_body.z)
         .fold(f64::NEG_INFINITY, f64::max);
     assert!(
         fl_swing_zmax > fl_nominal_z + cfg.swing_height_m * 0.5,
         "expected FL swing peak above nominal+0.5·H, got {fl_swing_zmax} vs nominal {fl_nominal_z}",
     );
 
-    // 5. During stance, FL's foot.z stays exactly at the nominal plane
-    //    (within rounding). This is the contract: stance line is in the
-    //    z = nominal_z plane.
+    // 5. During stance, FL's foot.z stays exactly at the nominal plane.
     for s in &samples {
-        if s.is_stance[fl] {
-            assert_relative_eq!(s.foot_body[fl].z, fl_nominal_z, epsilon = 1e-9);
+        if s.legs[fl].phase.is_stance {
+            assert_relative_eq!(s.legs[fl].foot_body.z, fl_nominal_z, epsilon = 1e-9);
         }
     }
 
-    // 6. Joint angles stay sane. Hips < ±0.5 rad (lateral motion only
-    //    from the hip-to-thigh offset, not from a yaw command), thighs
-    //    and calves bounded by the geometry.
+    // 6. Joint angles stay sane.
     for s in &samples {
-        for (h, t, c) in s.joints {
-            assert!(h.abs() < 0.6, "hip out of range: {h}");
-            assert!(t.abs() < 1.5, "thigh out of range: {t}");
-            assert!(c.abs() < 1.5, "calf out of range: {c}");
+        for leg in &s.legs {
+            assert!(leg.q_hip.abs() < 0.6, "hip out of range: {}", leg.q_hip);
+            assert!(leg.q_thigh.abs() < 1.5, "thigh out of range: {}", leg.q_thigh);
+            assert!(leg.q_calf.abs() < 1.5, "calf out of range: {}", leg.q_calf);
         }
     }
+
+    // 7. Body integrator: after `n_ticks · dt` seconds the world position
+    //    should match vx · t (no yaw, body stays on the +x axis).
+    let last = samples.last().unwrap();
+    let expected_x = vx * (n_ticks as f64) * 0.002;
+    assert_relative_eq!(last.body_x, expected_x, epsilon = 1e-9);
+    assert_relative_eq!(last.body_y, 0.0, epsilon = 1e-12);
+    assert_relative_eq!(last.body_yaw, 0.0, epsilon = 1e-12);
 }
 
 #[test]
@@ -314,16 +254,21 @@ fn zero_command_holds_static_pose() {
     // Pick the first tick's joint vector and confirm every later tick
     // matches it. With vx=0, the phase generator holds, the foot target
     // collapses to the nominal stance, and IK output is constant.
-    let baseline = samples[0].joints;
+    let baseline: Vec<(f64, f64, f64)> = samples[0]
+        .legs
+        .iter()
+        .map(|l| (l.q_hip, l.q_thigh, l.q_calf))
+        .collect();
     for (i, s) in samples.iter().enumerate().skip(1) {
         for slot in 0..4 {
             let (h0, t0, c0) = baseline[slot];
-            let (h, t, c) = s.joints[slot];
-            assert_relative_eq!(h, h0, epsilon = 1e-12, max_relative = 1e-12);
-            assert_relative_eq!(t, t0, epsilon = 1e-12, max_relative = 1e-12);
-            assert_relative_eq!(c, c0, epsilon = 1e-12, max_relative = 1e-12);
-            // Also: every leg must be in stance.
-            assert!(s.is_stance[slot], "tick {i} leg {slot} not in stance");
+            assert_relative_eq!(s.legs[slot].q_hip, h0, epsilon = 1e-12);
+            assert_relative_eq!(s.legs[slot].q_thigh, t0, epsilon = 1e-12);
+            assert_relative_eq!(s.legs[slot].q_calf, c0, epsilon = 1e-12);
+            assert!(
+                s.legs[slot].phase.is_stance,
+                "tick {i} leg {slot} not in stance",
+            );
         }
     }
 }
