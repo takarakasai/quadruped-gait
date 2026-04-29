@@ -164,6 +164,27 @@ impl GaitController {
         self.knee_forward[slot_of(leg)] = forward;
     }
 
+    /// Apply a symmetric front/rear knee pattern (the four-pattern shorthand
+    /// `<<`, `<>`, `><`, `>>` — see [`crate::config::KneePattern`]). Sets
+    /// the per-leg knee_forward flags in one call.
+    pub fn set_knee_pattern(&mut self, pattern: crate::config::KneePattern) {
+        self.knee_forward = pattern.to_knee_forward();
+    }
+
+    /// Read back the current knee configuration as a [`KneePattern`].
+    /// When the per-leg flags are asymmetric (set via `set_knee_forward`
+    /// rather than `set_knee_pattern`) the result is best-effort — see
+    /// [`KneePattern::from_knee_forward`].
+    pub fn knee_pattern(&self) -> crate::config::KneePattern {
+        crate::config::KneePattern::from_knee_forward(self.knee_forward)
+    }
+
+    /// Read-only access to the per-leg knee_forward array, indexed
+    /// `[FL, FR, RL, RR]`.
+    pub fn knee_forward(&self) -> [bool; 4] {
+        self.knee_forward
+    }
+
     /// Reset phase + body integrator to the cycle origin and zero command.
     pub fn reset(&mut self) {
         self.phase_gen.reset();
@@ -324,6 +345,17 @@ mod tests {
         let out = ctrl.tick(0.002);
         for slot in 0..4 {
             assert!(out.legs[slot].phase.is_stance);
+        }
+    }
+
+    #[test]
+    fn knee_pattern_round_trip_through_controller() {
+        use crate::config::KneePattern;
+        let mut ctrl = GaitController::new(GaitConfig::trot(), build_kin());
+        for pattern in KneePattern::ALL {
+            ctrl.set_knee_pattern(pattern);
+            assert_eq!(ctrl.knee_pattern(), pattern);
+            assert_eq!(ctrl.knee_forward(), pattern.to_knee_forward());
         }
     }
 

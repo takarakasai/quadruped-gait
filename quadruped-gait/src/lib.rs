@@ -62,8 +62,8 @@ pub mod swing_traj;
 
 pub use body_state::BodyState;
 pub use config::{
-    GaitConfig, GaitType, KinematicsConfig, LegId, LegKinematics, VelocityCmd,
-    DEFAULT_FOOT_LINKS,
+    GaitConfig, GaitType, KinematicsConfig, KneePattern, LegId, LegKinematics,
+    VelocityCmd, DEFAULT_FOOT_LINKS,
 };
 pub use controller::{ControllerOutput, GaitController, LegOutput};
 pub use footstep::{compute_footstep, Footstep};

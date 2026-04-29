@@ -323,6 +323,96 @@ pub const DEFAULT_FOOT_LINKS: [(LegId, &str); 4] = [
     (LegId::RR, "RR_foot"),
 ];
 
+/// Symmetric knee-bend pattern for the four legs, encoded as a two-character
+/// shorthand. The first character is the front pair's bend direction, the
+/// second is the rear pair's; left and right of each pair always match.
+///
+/// - `<` = knee bends backward (calf swings back from the knee)
+/// - `>` = knee bends forward (calf swings forward from the knee)
+///
+/// So:
+/// - `<<` (`BothBack`)        — every knee bends backward
+/// - `<>` (`MammalianForward`) — front knees back, rear knees forward
+///   (typical dog / horse layout viewed in profile: \\_/)
+/// - `><` (`MammalianReverse`)— front forward, rear backward
+///   (less common; some climbing robots)
+/// - `>>` (`BothForward`)      — every knee forward
+///
+/// The pattern maps directly to the underlying `[bool; 4]` array indexed
+/// `[FL, FR, RL, RR]` consumed by [`crate::ik::solve_leg_ik`]. Patterns
+/// that aren't symmetric across the body's centerline aren't representable
+/// — drop down to the per-leg `set_knee_forward` API for those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum KneePattern {
+    /// `<<` — every knee bends backward.
+    BothBack,
+    /// `<>` — front knees backward, rear knees forward (canonical mammal).
+    MammalianForward,
+    /// `><` — front knees forward, rear knees backward.
+    MammalianReverse,
+    /// `>>` — every knee bends forward.
+    BothForward,
+}
+
+impl KneePattern {
+    pub const ALL: [KneePattern; 4] = [
+        KneePattern::BothBack,
+        KneePattern::MammalianForward,
+        KneePattern::MammalianReverse,
+        KneePattern::BothForward,
+    ];
+
+    /// The shorthand string (`"<<"`, `"<>"`, `"><"`, `">>"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            KneePattern::BothBack => "<<",
+            KneePattern::MammalianForward => "<>",
+            KneePattern::MammalianReverse => "><",
+            KneePattern::BothForward => ">>",
+        }
+    }
+
+    /// Parse one of the four shorthand strings. Returns `None` for any
+    /// other input so callers can detect typos.
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "<<" => Some(KneePattern::BothBack),
+            "<>" => Some(KneePattern::MammalianForward),
+            "><" => Some(KneePattern::MammalianReverse),
+            ">>" => Some(KneePattern::BothForward),
+            _ => None,
+        }
+    }
+
+    /// Convert to the per-leg knee-forward array indexed
+    /// `[FL, FR, RL, RR]`. Both legs in a front/rear pair share the same
+    /// boolean (no left/right asymmetry).
+    pub fn to_knee_forward(self) -> [bool; 4] {
+        match self {
+            KneePattern::BothBack => [false, false, false, false],
+            KneePattern::MammalianForward => [false, false, true, true],
+            KneePattern::MammalianReverse => [true, true, false, false],
+            KneePattern::BothForward => [true, true, true, true],
+        }
+    }
+
+    /// Best-effort inverse of [`Self::to_knee_forward`]: compress an
+    /// arbitrary `[FL, FR, RL, RR]` array into a symmetric pattern by
+    /// looking only at the front/rear majorities. Asymmetric arrays
+    /// (e.g. `[true, false, true, false]`) return whichever pattern's
+    /// front/rear flags match the *first* member of each pair, so the
+    /// round-trip via `to_knee_forward` may differ.
+    pub fn from_knee_forward(arr: [bool; 4]) -> Self {
+        match (arr[0], arr[2]) {
+            (false, false) => KneePattern::BothBack,
+            (false, true) => KneePattern::MammalianForward,
+            (true, false) => KneePattern::MammalianReverse,
+            (true, true) => KneePattern::BothForward,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +428,49 @@ mod tests {
         assert_eq!(by_leg[&LegId::FL], by_leg[&LegId::RR]);
         assert_eq!(by_leg[&LegId::FR], by_leg[&LegId::RL]);
         assert_ne!(by_leg[&LegId::FL], by_leg[&LegId::FR]);
+    }
+
+    #[test]
+    fn knee_pattern_label_round_trip() {
+        for p in KneePattern::ALL {
+            assert_eq!(KneePattern::from_label(p.label()), Some(p));
+        }
+        assert!(KneePattern::from_label("<<<").is_none());
+        assert!(KneePattern::from_label("ab").is_none());
+    }
+
+    #[test]
+    fn knee_pattern_to_array_symmetric() {
+        // Each pattern maps to a left/right-symmetric [FL, FR, RL, RR].
+        for p in KneePattern::ALL {
+            let arr = p.to_knee_forward();
+            assert_eq!(arr[0], arr[1], "pattern {:?} broke L/R front symmetry", p);
+            assert_eq!(arr[2], arr[3], "pattern {:?} broke L/R rear symmetry", p);
+        }
+    }
+
+    #[test]
+    fn knee_pattern_specific_mappings() {
+        // Pin down the specific bool layouts so a future refactor can't
+        // silently flip the FL/FR/RL/RR slot order.
+        assert_eq!(KneePattern::BothBack.to_knee_forward(), [false; 4]);
+        assert_eq!(KneePattern::BothForward.to_knee_forward(), [true; 4]);
+        assert_eq!(
+            KneePattern::MammalianForward.to_knee_forward(),
+            [false, false, true, true],
+        );
+        assert_eq!(
+            KneePattern::MammalianReverse.to_knee_forward(),
+            [true, true, false, false],
+        );
+    }
+
+    #[test]
+    fn knee_pattern_round_trips_via_array() {
+        for p in KneePattern::ALL {
+            let arr = p.to_knee_forward();
+            assert_eq!(KneePattern::from_knee_forward(arr), p);
+        }
     }
 
     #[test]
