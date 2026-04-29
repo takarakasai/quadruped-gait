@@ -306,6 +306,43 @@ mod tests {
     }
 
     #[test]
+    fn ik_fk_round_trip_both_knee_branches() {
+        // Both knee branches must hit the same foot target — they're two
+        // valid IK solutions (knee in front vs back) for the same 3D foot
+        // position. This is the kinematic guarantee that lets the user
+        // pick `<<` or `>>` purely for aesthetics: the body-frame motion
+        // is identical, only the leg silhouette differs.
+        let kin = fl_kin();
+        let nominal = kin.nominal_foot_body + Vector3::new(0.0, 0.0, 0.04);
+        let offsets = [
+            Vector3::new(0.04, 0.0, 0.0),
+            Vector3::new(-0.04, 0.0, 0.0),
+            Vector3::new(0.0, 0.02, 0.0),
+            Vector3::new(0.0, 0.0, 0.03),
+            Vector3::new(0.03, -0.01, 0.02),
+        ];
+        for d in offsets {
+            let target = nominal + d;
+            for knee_forward in [false, true] {
+                let sol = solve_leg_ik(&kin, target, knee_forward);
+                assert!(
+                    sol.is_reachable(),
+                    "offset {:?} knee_forward={knee_forward}: {:?}",
+                    d, sol,
+                );
+                let (h, t, c) = sol.angles();
+                let recovered = forward_leg_kinematics(&kin, h, t, c);
+                for ax in 0..3 {
+                    assert_relative_eq!(
+                        recovered[ax], target[ax],
+                        epsilon = 1e-3,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn far_target_returns_unreachable() {
         let kin = fl_kin();
         // Push the target way beyond reach.

@@ -387,6 +387,44 @@ mod tests {
     }
 
     #[test]
+    fn foot_trajectory_independent_of_knee_pattern() {
+        // The body-frame foot trajectory (and therefore the world-frame
+        // body motion) must be the same for `<<` and `>>` patterns — they
+        // pick different IK branches that resolve to the same foot point.
+        // If a future change accidentally couples the trajectory to the
+        // knee_forward flag, this test catches the regression that would
+        // otherwise show up as "<< walks forward, >> walks backward."
+        use crate::config::KneePattern;
+
+        let dt = 0.002;
+        let n = 200; // half a default trot cycle
+
+        let mut snapshots: Vec<Vec<f64>> = Vec::new(); // per-pattern foot.x sequence
+        for pattern in [KneePattern::BothBack, KneePattern::BothForward] {
+            let mut ctrl = GaitController::new(GaitConfig::trot(), build_kin());
+            ctrl.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
+            ctrl.set_knee_pattern(pattern);
+            let mut xs = Vec::with_capacity(n);
+            for _ in 0..n {
+                let out = ctrl.tick(dt);
+                xs.push(out.legs[0].foot_body.x);
+            }
+            snapshots.push(xs);
+        }
+
+        // The two trajectories must agree to better than 1e-9 since the
+        // foot target is computed identically; only the joint-space IK
+        // branch differs.
+        for i in 0..n {
+            assert_relative_eq!(
+                snapshots[0][i],
+                snapshots[1][i],
+                epsilon = 1e-9,
+            );
+        }
+    }
+
+    #[test]
     fn knee_pattern_round_trip_through_controller() {
         use crate::config::KneePattern;
         let mut ctrl = GaitController::new(GaitConfig::trot(), build_kin());
