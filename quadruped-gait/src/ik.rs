@@ -41,7 +41,7 @@
 //! inside the envelope; unreachability is reported so the host can warn.
 
 use crate::config::LegKinematics;
-use nalgebra::Vector3;
+use nalgebra::{Matrix3, Vector3};
 
 /// Result of solving a single leg's IK against a target foot position.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -235,6 +235,68 @@ pub fn forward_leg_kinematics(
     foot_hip + kin.hip_offset
 }
 
+/// Body-frame analytical Jacobian of the foot position w.r.t. the three leg
+/// joints `[q_hip, q_thigh, q_calf]` (IK convention — see [`solve_leg_ik`]).
+///
+/// Returns `J ∈ R^{3×3}` such that `δp_foot_body = J · δq`. The columns are
+/// the partial derivatives `∂foot_body/∂q_k` derived directly from
+/// [`forward_leg_kinematics`]; see the comments inline for the term-by-term
+/// derivation.
+///
+/// Used by the WBC layer to convert a desired foot force `f_foot_body`
+/// into joint torques via `τ = -J^T · f_foot_body`. The negative sign is
+/// the Newton's-3rd-law convention: a ground reaction `f` *on the foot*
+/// must be opposed by joint torques `-J^T·f` for the leg to support it
+/// without collapsing.
+pub fn foot_jacobian_body(
+    kin: &LegKinematics,
+    hip: f64,
+    thigh: f64,
+    calf: f64,
+) -> Matrix3<f64> {
+    let l1 = kin.upper_leg_m;
+    let l2 = kin.lower_leg_m;
+    let lateral_sign = if kin.leg.is_left() { 1.0 } else { -1.0 };
+    let l_lat = lateral_sign * kin.hip_to_thigh_y;
+
+    let q23 = thigh + calf;
+    let (s1, c1) = hip.sin_cos();
+    let (s2, c2) = thigh.sin_cos();
+    let (s23, c23) = q23.sin_cos();
+
+    // Forward kinematics intermediates (mirrored from forward_leg_kinematics):
+    //   x_hip   = L1 s2 + L2 s23
+    //   z_plane = -L1 c2 - L2 c23
+    //   y_after = l_lat c1 - z_plane s1
+    //   z_after = l_lat s1 + z_plane c1
+    let z_plane = -l1 * c2 - l2 * c23;
+    let dz_dq2 = l1 * s2 + l2 * s23; // ∂z_plane / ∂q2
+    let dz_dq3 = l2 * s23; // ∂z_plane / ∂q3
+
+    // Column 1 (∂/∂q1 = hip roll): only y_after / z_after depend on q1.
+    //   ∂y_after/∂q1 = -l_lat·s1 - z_plane·c1
+    //   ∂z_after/∂q1 =  l_lat·c1 - z_plane·s1
+    let col1 = Vector3::new(
+        0.0,
+        -l_lat * s1 - z_plane * c1,
+        l_lat * c1 - z_plane * s1,
+    );
+
+    // Column 2 (∂/∂q2 = thigh pitch):
+    //   ∂x_hip/∂q2 = L1 c2 + L2 c23
+    //   ∂y_after/∂q2 = -dz_dq2 · s1
+    //   ∂z_after/∂q2 =  dz_dq2 · c1
+    let col2 = Vector3::new(l1 * c2 + l2 * c23, -dz_dq2 * s1, dz_dq2 * c1);
+
+    // Column 3 (∂/∂q3 = calf pitch):
+    //   ∂x_hip/∂q3 = L2 c23
+    //   ∂y_after/∂q3 = -dz_dq3 · s1
+    //   ∂z_after/∂q3 =  dz_dq3 · c1
+    let col3 = Vector3::new(l2 * c23, -dz_dq3 * s1, dz_dq3 * c1);
+
+    Matrix3::from_columns(&[col1, col2, col3])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +411,83 @@ mod tests {
         let unreach = kin.nominal_foot_body + Vector3::new(2.0, 0.0, 0.0);
         let sol = solve_leg_ik(&kin, unreach, false);
         assert!(!sol.is_reachable());
+    }
+
+    /// The analytical Jacobian must agree with a central finite difference
+    /// of `forward_leg_kinematics` to ~1e-6 across a range of leg poses
+    /// (including the "knee straight" singular pose where one column
+    /// degenerates). This catches sign / index errors in the derivative
+    /// derivation directly rather than waiting for the WBC integration test
+    /// to silently produce flipped torques.
+    #[test]
+    fn foot_jacobian_matches_finite_difference() {
+        let kin = fl_kin();
+        let poses = [
+            (0.0, 0.0, 0.0),
+            (0.1, -0.3, 0.6),
+            (-0.2, 0.4, -0.5),
+            (0.05, 0.8, 1.0),
+        ];
+        let h = 1e-6;
+        for (q1, q2, q3) in poses {
+            let j = foot_jacobian_body(&kin, q1, q2, q3);
+            let qs = [q1, q2, q3];
+            for k in 0..3 {
+                let mut qp = qs;
+                let mut qm = qs;
+                qp[k] += h;
+                qm[k] -= h;
+                let fp = forward_leg_kinematics(&kin, qp[0], qp[1], qp[2]);
+                let fm = forward_leg_kinematics(&kin, qm[0], qm[1], qm[2]);
+                let fd = (fp - fm) / (2.0 * h);
+                for ax in 0..3 {
+                    assert_relative_eq!(
+                        j[(ax, k)],
+                        fd[ax],
+                        epsilon = 1e-5,
+                        max_relative = 1e-3,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Right-side legs use `lateral_sign = -1` in the FK; the Jacobian must
+    /// follow the same convention so the WBC produces correct torques on
+    /// FR / RR. Spot-check by constructing an FR kinematics with
+    /// otherwise identical dimensions and verifying the FD agreement.
+    #[test]
+    fn foot_jacobian_correct_for_right_leg() {
+        let kin = LegKinematics::new(
+            crate::config::LegId::FR,
+            "FR_hip".into(),
+            "FR_thigh".into(),
+            "FR_calf".into(),
+            "FR_foot".into(),
+            Vector3::new(0.18, -0.05, 0.0),
+            0.04,
+            0.18,
+            0.18,
+        );
+        let h = 1e-6;
+        let q = [0.07, 0.2, -0.4];
+        let j = foot_jacobian_body(&kin, q[0], q[1], q[2]);
+        for k in 0..3 {
+            let mut qp = q;
+            let mut qm = q;
+            qp[k] += h;
+            qm[k] -= h;
+            let fp = forward_leg_kinematics(&kin, qp[0], qp[1], qp[2]);
+            let fm = forward_leg_kinematics(&kin, qm[0], qm[1], qm[2]);
+            let fd = (fp - fm) / (2.0 * h);
+            for ax in 0..3 {
+                assert_relative_eq!(
+                    j[(ax, k)],
+                    fd[ax],
+                    epsilon = 1e-5,
+                    max_relative = 1e-3,
+                );
+            }
+        }
     }
 }

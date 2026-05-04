@@ -74,7 +74,7 @@ pub use config::{
 pub use controller::{ControllerOutput, GaitController, GaitController as ChampGaitController, LegOutput};
 pub use footstep::{compute_footstep, Footstep};
 pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
-pub use ik::{solve_leg_ik, LegIkSolution};
+pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolution};
 pub use mpc_controller::MpcGaitController;
 pub use phase::{PhaseGenerator, PhaseState};
 pub use srbd_mpc::{

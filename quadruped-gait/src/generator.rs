@@ -197,6 +197,22 @@ impl AnyGaitController {
             AnyGaitController::Mpc(c) => c.predicted_grfs(),
         }
     }
+
+    /// Per-leg stance-foot torque feedforward (`τ = -J^T·f_GRF`)
+    /// computed from the last MPC solve. See
+    /// [`crate::MpcGaitController::stance_grf_torques`] for the
+    /// formulation. Returns `[None; 4]` when the active mode is CHAMP
+    /// or no solution is available yet — the caller can treat this
+    /// uniformly as "no torque feedforward".
+    pub fn stance_grf_torques(
+        &self,
+        output: &ControllerOutput,
+    ) -> [Option<[f64; 3]>; 4] {
+        match self {
+            AnyGaitController::Champ(_) => [None; 4],
+            AnyGaitController::Mpc(c) => c.stance_grf_torques(output),
+        }
+    }
 }
 
 impl GaitGenerator for AnyGaitController {

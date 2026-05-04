@@ -35,7 +35,7 @@ use crate::body_state::BodyState;
 use crate::config::{GaitConfig, KinematicsConfig, LegId, LegKinematics, VelocityCmd};
 use crate::controller::{ControllerOutput, LegOutput};
 use crate::footstep::Footstep;
-use crate::ik::{solve_leg_ik, LegIkSolution};
+use crate::ik::{foot_jacobian_body, solve_leg_ik, LegIkSolution};
 use crate::phase::{PhaseGenerator, PhaseState};
 use crate::srbd_mpc::{
     ContactSchedule, FootOffsets, MpcSolution, ReferenceTrajectory, SrbdMpc,
@@ -48,6 +48,12 @@ use crate::swing_traj::swing_position;
 /// `g = 9.81 m/s²` → ~0.175 s. The constructor uses this; runtime
 /// tuning is exposed via [`MpcGaitController::set_capture_point_gain`].
 pub const DEFAULT_CAPTURE_POINT_GAIN_S: f64 = 0.175;
+
+/// Minimum predicted GRF magnitude (Newtons) below which the WBC layer
+/// skips emitting a torque feedforward for that foot. Avoids noisy
+/// torque commands during stance/swing handover frames where the QP's
+/// numerical zero isn't quite zero.
+const STANCE_GRF_MIN_N: f64 = 1.0;
 
 /// Number of upcoming swing-step landings the horizon predictor looks
 /// at when planning the *next* foot placement. The current
@@ -117,11 +123,80 @@ impl MpcGaitController {
 
     /// Predicted ground reaction forces from the most recent MPC
     /// solve. Returns `None` until the controller has ticked at least
-    /// once with a stance leg. Used by the viewport to draw arrows;
-    /// articara doesn't currently apply these to MuJoCo (Phase 4
-    /// work).
+    /// once with a stance leg. Used by the viewport to draw arrows
+    /// and (in Phase 4) by the WBC layer to compute joint torques.
     pub fn predicted_grfs(&self) -> Option<&MpcSolution> {
         self.last_mpc_solution.as_ref()
+    }
+
+    /// Convert the MPC's predicted GRFs into joint-space torque
+    /// feedforwards via Jacobian-transpose mapping (Phase 4 WBC).
+    ///
+    /// For each leg slot (FL, FR, RL, RR):
+    /// - `Some([τ_h, τ_t, τ_c])` if the leg is in stance, the MPC has
+    ///   solved successfully, and the predicted force magnitude is
+    ///   above a noise floor.
+    /// - `None` for swing legs, before the first solve, or when CHAMP
+    ///   produced the angles (no GRFs available).
+    ///
+    /// Computes `τ = -J_body^T · R_z(yaw)^T · f_GRF_world` per stance
+    /// leg, where:
+    /// - `J_body` is the analytical body-frame foot Jacobian at the
+    ///   current `(q_hip, q_thigh, q_calf)` (IK convention),
+    /// - `R_z(yaw)^T` rotates the world-frame GRF into the yaw-aligned
+    ///   body frame (matches the SRBD MPC's yaw-only body model),
+    /// - `f_GRF_world` is the per-foot GRF from the latest MPC solve.
+    ///
+    /// The sign convention follows MIT-Cheetah / OCS2: a positive `f_z`
+    /// pushes the body up, requiring the leg to *resist* gravity; the
+    /// `τ = -J^T · f` flip captures that Newton's-3rd-law relationship.
+    ///
+    /// Caller is responsible for converting the IK-convention torques to
+    /// URDF axes (sign-flip per joint) before writing to the simulator.
+    pub fn stance_grf_torques(
+        &self,
+        output: &ControllerOutput,
+    ) -> [Option<[f64; 3]>; 4] {
+        let mut out = [None; 4];
+        let Some(sol) = self.last_mpc_solution.as_ref() else {
+            return out;
+        };
+        if !sol.solved {
+            return out;
+        }
+        let yaw = self.body_state.world_yaw;
+        let (sy, cy) = yaw.sin_cos();
+        for slot in 0..4 {
+            let leg_out = &output.legs[slot];
+            if !leg_out.phase.is_stance {
+                continue;
+            }
+            let f_world = sol.grfs_first_step[slot];
+            // Skip negligible forces — saves a Jacobian eval and avoids
+            // commanding tiny noisy torques during stance/swing handover.
+            if f_world.norm() < STANCE_GRF_MIN_N {
+                continue;
+            }
+            // Rotate world → body (yaw-only). For a yaw-aligned body
+            // frame, R_z(-yaw)·v = (cy·vx + sy·vy, -sy·vx + cy·vy, vz).
+            let f_body = Vector3::new(
+                cy * f_world.x + sy * f_world.y,
+                -sy * f_world.x + cy * f_world.y,
+                f_world.z,
+            );
+            let kin_leg = self.kin.leg(LegId::ALL[slot]);
+            let j = foot_jacobian_body(
+                kin_leg,
+                leg_out.q_hip,
+                leg_out.q_thigh,
+                leg_out.q_calf,
+            );
+            // τ = -Jᵀ·f (Newton's 3rd law: ground pushes foot up with f,
+            // joints must produce torques that resist that push).
+            let tau = -(j.transpose() * f_body);
+            out[slot] = Some([tau.x, tau.y, tau.z]);
+        }
+        out
     }
 
     /// Tune the underlying SRBD MPC weights / horizon / friction.
@@ -589,6 +664,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Phase 4 WBC: after a tick the stance-grf-torque accessor must
+    /// emit `Some` for stance legs (non-zero τ since the body weight
+    /// produces non-trivial GRFs) and `None` for swing legs. Catches
+    /// trivial breakage of the stance/swing dispatch in
+    /// `stance_grf_torques`.
+    #[test]
+    fn stance_grf_torques_nonempty_for_stance_legs() {
+        let cfg = GaitConfig::trot();
+        let kin = build_kin();
+        let mut mpc = MpcGaitController::new(cfg, kin);
+        // Hover: zero command, zero observed velocity. The MPC should
+        // distribute the body weight across all stance feet.
+        mpc.set_velocity_cmd(VelocityCmd::zero());
+        mpc.set_body_state_observed(Vector3::zeros());
+        let out = mpc.tick(0.002);
+        let taus = mpc.stance_grf_torques(&out);
+        let mut any_stance = false;
+        for slot in 0..4 {
+            if out.legs[slot].phase.is_stance {
+                any_stance = true;
+                let t = taus[slot]
+                    .unwrap_or_else(|| panic!("expected Some for stance leg {slot}"));
+                // For a vertical force (mostly +Z), the hip torque
+                // should be small but the thigh / calf must be
+                // non-trivial — they're the joints actually carrying
+                // the body weight through the leg geometry.
+                let mag = (t[0].abs() + t[1].abs() + t[2].abs()) / 3.0;
+                assert!(mag > 0.05, "stance leg {slot} τ too small: {:?}", t);
+            } else {
+                assert!(
+                    taus[slot].is_none(),
+                    "swing leg {slot} should produce None, got {:?}",
+                    taus[slot],
+                );
+            }
+        }
+        assert!(any_stance, "trot tick at t=0 should have at least one stance leg");
     }
 
     /// `set_mode` round-trip on `AnyGaitController` preserves the
