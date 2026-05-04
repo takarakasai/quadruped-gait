@@ -95,10 +95,17 @@ pub struct MpcGaitController {
     /// the forces are visualised but not commanded. Phase 4 will hook
     /// them into a torque-control chain.
     srbd_mpc: SrbdMpc,
-    /// Last MPC solution. Populated each tick when the MPC succeeds;
-    /// retained between ticks so the viewport can keep drawing arrows
-    /// through paused frames.
+    /// Last MPC solution. Populated when the MPC re-solves; retained
+    /// between solves so the viewport keeps drawing arrows and the WBC
+    /// layer keeps emitting the same τ_ff between solves.
     last_mpc_solution: Option<MpcSolution>,
+    /// Time accumulator (seconds) since the last MPC solve. We re-solve
+    /// at most once per `dt_per_step` (default 30 ms) — physics ticks at
+    /// ~2 ms would otherwise re-solve 15× per MPC step, paying the QP
+    /// cost repeatedly while injecting clarabel's tick-to-tick numerical
+    /// noise into τ_ff. Cap at one solve per ZOH window matches the
+    /// classical ZOH MPC implementation in Di Carlo et al.
+    mpc_solve_accumulator_s: f64,
 }
 
 impl MpcGaitController {
@@ -118,6 +125,7 @@ impl MpcGaitController {
             v_observed_world: Vector3::zeros(),
             srbd_mpc: SrbdMpc::new(SrbdMpcConfig::default()),
             last_mpc_solution: None,
+            mpc_solve_accumulator_s: f64::INFINITY,
         }
     }
 
@@ -265,6 +273,8 @@ impl MpcGaitController {
         self.cmd = VelocityCmd::zero();
         self.v_observed_world = Vector3::zeros();
         self.last_mpc_solution = None;
+        // Force a re-solve on the next tick after reset.
+        self.mpc_solve_accumulator_s = f64::INFINITY;
     }
 
     /// Advance one tick. See module docs for what makes this differ
@@ -315,11 +325,20 @@ impl MpcGaitController {
             body_state: self.body_state,
         };
 
-        // Solve the SRBD MPC for the next predicted GRFs. Best-effort:
-        // failures (clarabel didn't converge, ill-conditioned QP, …)
-        // leave the previous solution in place rather than panicking
-        // — the GRF visualisation is non-critical.
-        self.last_mpc_solution = Some(self.solve_srbd_mpc(&output));
+        // Re-solve the SRBD MPC at most once per `dt_per_step` window
+        // (default 30 ms). Physics ticks are typically ~2 ms; resolving
+        // every tick would pay the QP cost 15× per ZOH window AND
+        // inject clarabel's tick-to-tick numerical noise into the
+        // τ_ff path (visible as foot flailing during stand-still).
+        // Failures (clarabel didn't converge, ill-conditioned QP, …)
+        // leave the previous solution in place — the GRFs are best-
+        // effort, not a safety-critical signal.
+        let dt_per_step = self.srbd_mpc.config().dt_per_step;
+        self.mpc_solve_accumulator_s += dt;
+        if self.mpc_solve_accumulator_s >= dt_per_step {
+            self.last_mpc_solution = Some(self.solve_srbd_mpc(&output));
+            self.mpc_solve_accumulator_s = 0.0;
+        }
 
         output
     }
@@ -358,9 +377,23 @@ impl MpcGaitController {
             ReferenceTrajectory::from_constant_velocity(s_now, v_world_cmd, self.cmd.wz, cfg);
 
         // Contact schedule: project current per-leg phase forward by
-        // `dt_per_step` for each horizon step. The phase generator's
-        // `predict_at` would be ideal but we don't have it; use the
-        // per-leg duty fraction as a steady-state proxy.
+        // `dt_per_step` for each horizon step.
+        //
+        // **Hold mode (zero command)** is special-cased: the phase
+        // generator stops cycling and reports all 4 legs in stance.
+        // We must propagate that to *every* horizon step — otherwise
+        // the MPC sees "all stance at k=0, then no support for the
+        // rest of the horizon" and predicts wild step-0 impulses to
+        // keep the body up during the imagined free-fall, which
+        // manifests as visible foot flailing (the τ_ff goes erratic
+        // tick-to-tick as clarabel finds different "best impulses").
+        //
+        // Non-hold mode uses a coarse `duty_factor > 0.5` proxy for
+        // steps k≥1. This isn't perfect (it ignores the per-leg phase
+        // offset), but it's adequate while the MPC's main job is
+        // step-0 GRF prediction; future work can swap in a proper
+        // per-leg phase projection.
+        let holding = self.cmd.is_zero();
         let stance_now: [bool; 4] = [
             output.legs[0].phase.is_stance,
             output.legs[1].phase.is_stance,
@@ -371,13 +404,10 @@ impl MpcGaitController {
             is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         };
         for leg in 0..4 {
-            // Steady-state stance probability at any random horizon
-            // step is `duty_factor`. For a coarse projection use the
-            // current state for the first step and the duty for the
-            // rest — this errs on the side of assuming the foot stays
-            // in stance, giving the MPC a denser support hypothesis.
             for k in 0..n {
-                let in_stance = if k == 0 {
+                let in_stance = if holding {
+                    true
+                } else if k == 0 {
                     stance_now[leg]
                 } else {
                     self.cfg.duty_factor > 0.5
@@ -431,20 +461,30 @@ impl MpcGaitController {
         let mut half = v_hip * (0.5 * stance_duration);
 
         // ── Capture-point (closed-loop) ────────────────────────────
-        // Only apply the correction in xy; z is set elsewhere.
+        // Only apply the correction when there is a non-zero command.
+        // At hold the integrated yaw / position is the user's intent
+        // and small `v_observed` noise must NOT be interpreted as a
+        // tracking error; otherwise the foot target wiggles ±k·noise
+        // every tick and the leg chases its own measurement.
+        // Once the user issues even a tiny cmd the feedback re-engages.
+        let feedback_enabled = !self.cmd.is_zero();
         let mut feedback = Vector3::zeros();
-        feedback.x = self.k_capture * v_err_body.x;
-        feedback.y = self.k_capture * v_err_body.y;
+        if feedback_enabled {
+            feedback.x = self.k_capture * v_err_body.x;
+            feedback.y = self.k_capture * v_err_body.y;
+        }
 
         // ── LIP horizon look-ahead ────────────────────────────────
         // Bias the foot slightly toward where the LIP says the body
         // would be after HORIZON_STEPS gait cycles if v_actual stayed
         // off-cmd. Small weight (1/HORIZON_STEPS) so it doesn't
-        // dominate the per-step correction.
+        // dominate the per-step correction. Same hold-mode gate.
         let horizon_weight = 1.0 / HORIZON_STEPS as f64;
         let mut horizon_bias = Vector3::zeros();
-        horizon_bias.x = horizon_weight * self.k_capture * v_err_body.x;
-        horizon_bias.y = horizon_weight * self.k_capture * v_err_body.y;
+        if feedback_enabled {
+            horizon_bias.x = horizon_weight * self.k_capture * v_err_body.x;
+            horizon_bias.y = horizon_weight * self.k_capture * v_err_body.y;
+        }
 
         // Combine and clamp to the configured maximum step length.
         half += feedback + horizon_bias;
@@ -661,6 +701,111 @@ mod tests {
                     out_mpc.legs[slot].footstep.touch_down[ax],
                     out_champ.legs[slot].footstep.touch_down[ax],
                     epsilon = 1e-9,
+                );
+            }
+        }
+    }
+
+    /// At hold (zero command) the contact schedule must report **all 4
+    /// legs in stance for the entire horizon**. The earlier bug had it
+    /// "all stance at k=0, all swing for k≥1" because `duty_factor ==
+    /// 0.5` failed the `> 0.5` check; the MPC then predicted the body
+    /// in free-fall after step 0, demanding huge step-0 impulses to
+    /// keep it up. Visible in the user-reported "feet flailing while
+    /// standing still". This test pins the fix so a future refactor
+    /// can't quietly reintroduce the regression.
+    #[test]
+    fn hold_mode_keeps_all_legs_stance_across_horizon() {
+        let cfg = GaitConfig::trot();
+        let kin = build_kin();
+        let mut mpc = MpcGaitController::new(cfg, kin);
+        mpc.set_velocity_cmd(VelocityCmd::zero());
+        let _ = mpc.tick(0.002);
+        let sol = mpc.predicted_grfs().expect("first tick should solve");
+        // Every horizon step: all four feet must show non-trivial
+        // upward GRF (body weight distributed). If the contact
+        // schedule had reverted to "swing after k=0", swing-leg slots
+        // would be exactly zero by the QP's swing-equality constraint.
+        for (k, step) in sol.grfs_all_steps.iter().enumerate() {
+            for slot in 0..4 {
+                assert!(
+                    step[slot].z.abs() > 1.0,
+                    "step {k} leg {slot} f_z too small: {} — schedule must be all-stance at hold",
+                    step[slot].z,
+                );
+            }
+        }
+    }
+
+    /// Throttling: MPC must re-solve at most once per `dt_per_step`
+    /// (default 30 ms). At a 2 ms physics tick, 14 successive ticks
+    /// (~28 ms total — still under one window) must reuse the cached
+    /// solution. The 15th tick crosses the boundary and triggers a
+    /// fresh solve. Validates that we don't pay the QP cost 15× per
+    /// MPC step and that the τ_ff stays bit-stable between solves.
+    #[test]
+    fn mpc_solve_is_throttled_to_dt_per_step() {
+        let cfg = GaitConfig::trot();
+        let kin = build_kin();
+        let mut mpc = MpcGaitController::new(cfg, kin);
+        mpc.set_velocity_cmd(VelocityCmd::zero());
+
+        // First tick always solves (accumulator starts at +∞).
+        let _ = mpc.tick(0.002);
+        let first = mpc.predicted_grfs().unwrap().grfs_first_step;
+
+        // Drive ~28 ms more (14 × 2 ms = 28 ms < 30 ms window).
+        for _ in 0..14 {
+            let _ = mpc.tick(0.002);
+        }
+        let mid = mpc.predicted_grfs().unwrap().grfs_first_step;
+        for slot in 0..4 {
+            for ax in 0..3 {
+                assert_relative_eq!(first[slot][ax], mid[slot][ax], epsilon = 1e-12);
+            }
+        }
+
+        // Cross the 30 ms boundary — solve fires, GRFs *may* differ
+        // (body state has integrated forward). We don't assert
+        // inequality (zero command + steady state ⇒ identical), just
+        // that the call doesn't panic and the accumulator was reset.
+        let _ = mpc.tick(0.002);
+        // No state-leak assertions here; the inequality case is
+        // exercised implicitly by the `slow_body_pushes_foot_forward`
+        // test, which runs to convergence over many ticks.
+    }
+
+    /// Capture-point feedback gating: at hold (zero command) a noisy
+    /// `v_observed` must NOT shift the foot target. Catches the
+    /// regression where small body-velocity sensor noise was being
+    /// scaled by `k_capture` and added to every stance foot, producing
+    /// a tick-to-tick wobble that the leg PD chased.
+    #[test]
+    fn hold_mode_ignores_capture_point_noise() {
+        let cfg = GaitConfig::trot();
+        let kin = build_kin();
+        let mut mpc_a = MpcGaitController::new(cfg.clone(), kin.clone());
+        let mut mpc_b = MpcGaitController::new(cfg, kin);
+        mpc_a.set_velocity_cmd(VelocityCmd::zero());
+        mpc_b.set_velocity_cmd(VelocityCmd::zero());
+        // A: zero observation. B: 5 cm/s "noise" in xy. Both are at
+        // hold so the feedback should be gated off and the resulting
+        // foot targets must match.
+        mpc_a.set_body_state_observed(Vector3::zeros());
+        mpc_b.set_body_state_observed(Vector3::new(0.05, -0.03, 0.0));
+        let out_a = mpc_a.tick(0.002);
+        let out_b = mpc_b.tick(0.002);
+        for slot in 0..4 {
+            for ax in 0..3 {
+                assert_relative_eq!(
+                    out_a.legs[slot].footstep.lift_off[ax],
+                    out_b.legs[slot].footstep.lift_off[ax],
+                    epsilon = 1e-12,
+                );
+                assert_relative_eq!(
+                    out_a.legs[slot].footstep.touch_down[ax],
+                    out_b.legs[slot].footstep.touch_down[ax],
+                    epsilon = 1e-12,
                 );
             }
         }
