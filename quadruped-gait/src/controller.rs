@@ -106,6 +106,38 @@ pub struct GaitController {
     knee_forward: [bool; 4],
 }
 
+/// Reduce the effective swing height when the command contains
+/// significant yaw / lateral content. Per-leg stride amplitudes
+/// become asymmetric in those modes (outer-radius leg sweeps further
+/// than inner) and a tall swing amplifies the asymmetric body
+/// reaction at touchdown / lift-off. A multiplicative knockdown is
+/// blunt but cheap and predictable; the user tunes the *base*
+/// `swing_height_m` and this function preserves that baseline for
+/// pure forward motion (the common case).
+///
+/// Mapping (by `r = (|wz|/wz_ref + |vy|/vy_ref) / 2`, clamped 0..1):
+/// - `r = 0` → 1.0 × base height (pure forward / stationary)
+/// - `r = 1` → 0.4 × base height (full turn or full strafe)
+/// - linear interpolation in between
+///
+/// `wz_ref = 1.0 rad/s` and `vy_ref = 0.3 m/s` are reasonable
+/// "moderate" thresholds for namiashi-class quadrupeds; constants
+/// here rather than gait config so a future refactor can promote
+/// them to [`crate::config::GaitConfig`] if real robots disagree.
+fn effective_swing_height(base_h: f64, cmd: &VelocityCmd) -> f64 {
+    const WZ_REF: f64 = 1.0;     // rad/s
+    const VY_REF: f64 = 0.3;     // m/s
+    const MIN_FACTOR: f64 = 0.4; // never drop swing below 40% of base
+
+    let r_yaw = (cmd.wz.abs() / WZ_REF).min(1.0);
+    let r_lat = (cmd.vy.abs() / VY_REF).min(1.0);
+    // Combine — average so a moderate yaw + moderate strafe doesn't
+    // cancel the reduction. Clamp 0..1.
+    let r = ((r_yaw + r_lat) * 0.5).clamp(0.0, 1.0);
+    let factor = 1.0 - (1.0 - MIN_FACTOR) * r;
+    base_h * factor
+}
+
 fn slot_of(id: LegId) -> usize {
     match id {
         LegId::FL => 0,
@@ -202,6 +234,17 @@ impl GaitController {
         //    foot position via Raibert footstep + Bezier swing curve,
         //    and run the IK.
         let phases = self.phase_gen.legs();
+        // Effective swing height for this tick. Reduce when the
+        // command has significant turn / lateral content — those modes
+        // make the per-leg stride amplitudes asymmetric, so a tall
+        // swing combined with the asymmetric loading rocks the trunk
+        // visibly even with the C¹-continuous swing curve.
+        //
+        // Scaling factor: 1.0 for pure forward, dropping toward
+        // `min_factor` (40%) when |wz| or |vy| dominates. This is a
+        // pragmatic dampening rather than a derived optimum — tuned so
+        // namiashi turns smoothly without dragging the foot.
+        let swing_h = effective_swing_height(self.cfg.swing_height_m, &self.cmd);
         // Pre-compute leg outputs in canonical order, then assemble.
         let mut legs: [Option<LegOutput>; 4] = [None, None, None, None];
         for ps in phases.iter() {
@@ -213,7 +256,7 @@ impl GaitController {
                 swing_position(
                     footstep.lift_off,
                     footstep.touch_down,
-                    self.cfg.swing_height_m,
+                    swing_h,
                     ps.sub_fraction,
                 )
             };
@@ -444,5 +487,66 @@ mod tests {
         }
         // 0.3 m/s for 1s → ~0.3 m
         assert_relative_eq!(ctrl.body_state().world_position.x, 0.3, epsilon = 1e-9);
+    }
+
+    /// `effective_swing_height` preserves the base value for pure
+    /// forward / stationary commands (the common case) so users who
+    /// haven't tuned for turn / strafe see the same gait as before.
+    #[test]
+    fn effective_swing_height_unchanged_for_forward_motion() {
+        let base = 0.04;
+        let h = effective_swing_height(
+            base,
+            &VelocityCmd { vx: 0.5, vy: 0.0, wz: 0.0 },
+        );
+        assert_relative_eq!(h, base);
+        let h_stand =
+            effective_swing_height(base, &VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+        assert_relative_eq!(h_stand, base);
+    }
+
+    /// Strong yaw → swing height reduced toward the floor (40% min).
+    #[test]
+    fn effective_swing_height_reduced_under_yaw() {
+        let base = 0.04;
+        let h_full_yaw = effective_swing_height(
+            base,
+            &VelocityCmd { vx: 0.0, vy: 0.0, wz: 1.0 },
+        );
+        // r = (1/1 + 0/0.3) / 2 = 0.5 → factor = 1 - 0.6·0.5 = 0.7
+        assert_relative_eq!(h_full_yaw, base * 0.7, epsilon = 1e-9);
+
+        // Combined full yaw + full strafe → r = 1 → factor = 0.4
+        let h_extreme = effective_swing_height(
+            base,
+            &VelocityCmd { vx: 0.0, vy: 0.5, wz: 2.0 },
+        );
+        assert_relative_eq!(h_extreme, base * 0.4, epsilon = 1e-9);
+    }
+
+    /// Strong lateral motion alone → swing height reduced.
+    #[test]
+    fn effective_swing_height_reduced_under_strafe() {
+        let base = 0.04;
+        let h = effective_swing_height(
+            base,
+            &VelocityCmd { vx: 0.0, vy: 0.3, wz: 0.0 },
+        );
+        // r = (0 + 0.3/0.3) / 2 = 0.5 → factor = 0.7
+        assert_relative_eq!(h, base * 0.7, epsilon = 1e-9);
+    }
+
+    /// Reduction never drops the swing below the 40% floor regardless
+    /// of how aggressive the command is. Below ~30% the foot starts to
+    /// scrape the ground.
+    #[test]
+    fn effective_swing_height_floor_at_40pct() {
+        let base = 0.04;
+        let h = effective_swing_height(
+            base,
+            &VelocityCmd { vx: 0.0, vy: 100.0, wz: 100.0 }, // absurd
+        );
+        assert!(h >= base * 0.4 - 1e-9);
+        assert!(h <= base * 0.4 + 1e-9);
     }
 }

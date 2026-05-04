@@ -1,8 +1,38 @@
-//! Foot trajectory generators: linear stance + Bezier swing.
+//! Foot trajectory generators: linear stance + smoothstep / sin² swing.
 //!
 //! Both functions return the foot position in the body frame at a given
 //! sub-phase fraction in [0, 1]. The gait controller drives them per-leg
 //! based on whether the leg is currently in stance or swing.
+//!
+//! # Why not a single cubic Bezier for swing?
+//!
+//! The first cut of [`swing_position`] used a cubic Bezier with control
+//! points `[lift_off, lift_off + 4/3·h·ẑ, touch_down + 4/3·h·ẑ,
+//! touch_down]`. That guaranteed the right peak height **and** zero
+//! xy-velocity at the endpoints (so stance↔swing handoffs were smooth in
+//! the horizontal plane), but it landed with a non-zero **vertical**
+//! velocity:
+//!
+//! ```text
+//! B'(1) = 3·(P3 − P2) = (0, 0, −4·h)
+//! ```
+//!
+//! Per swing cycle that's ~0.8 m/s downward at touchdown for the
+//! defaults (h = 4 cm, T_swing = 0.2 s). Real-world: trunk visibly
+//! bobs every cycle, especially when turning or strafing — the
+//! asymmetric stride amplitudes between inner / outer legs amplify the
+//! per-foot impact unevenly and the body bounces.
+//!
+//! The replacement decouples xy from z so we can pick smooth-end
+//! profiles for both:
+//!
+//! - **xy**: smoothstep `S(t) = 3t² − 2t³` (zero velocity at 0 and 1)
+//! - **z**:  raised-cosine bump `B(t) = sin²(π·t) · h` (zero velocity
+//!   at 0 and 1, peak `h` at t = 0.5)
+//!
+//! Touchdown vertical velocity is now *exactly* zero. The bump is
+//! C¹-continuous to the stance line at both ends, so the handoff
+//! still introduces no torque transient.
 
 use nalgebra::Vector3;
 
@@ -19,22 +49,17 @@ pub fn stance_position(
     lift_off * (1.0 - f) + touch_down * f
 }
 
-/// Swing foot trajectory: a 4-point Bezier curve in the body frame.
+/// Swing foot trajectory: smoothstep in xy, sin² bump in z.
 ///
-/// Control points are placed so that:
-/// - the curve starts exactly at `lift_off` (stance end),
-/// - reaches its maximum z at `frac = 0.5`, exactly `swing_height` above
-///   the lift-off / touch-down line,
-/// - lands exactly on `touch_down` (next stance start),
-/// - has zero horizontal velocity at both endpoints (smooth blend with
-///   the stance line).
+/// Both axes start and end with zero velocity, so handing over to
+/// [`stance_position`] generates no impulsive torque on the leg. The
+/// **vertical** zero-velocity property is the change from the
+/// historical cubic-Bezier curve and is what kills the trunk-bobbing
+/// previously seen on touchdown (see module docs).
 ///
-/// Cubic-Bezier midpoint sits at `0.5·P0 + 0.125·P1 + 0.125·P2 + 0.5·P3`
-/// of the position weights — wait, that's wrong; the binomial weights at
-/// `t=0.5` are `(1/8, 3/8, 3/8, 1/8)`. So if we lift the two middle
-/// control points by `H` above the endpoints, the midpoint rise is
-/// `(3/8 + 3/8) · H = 0.75 · H`. To make the **peak** equal to
-/// `swing_height`, we therefore lift by `4/3 · swing_height`.
+/// - `frac = 0` → returns `lift_off` exactly.
+/// - `frac = 1` → returns `touch_down` exactly.
+/// - `frac = 0.5` → peak z is `swing_height` above the chord.
 pub fn swing_position(
     lift_off: Vector3<f64>,
     touch_down: Vector3<f64>,
@@ -42,21 +67,25 @@ pub fn swing_position(
     frac: f64,
 ) -> Vector3<f64> {
     let t = frac.clamp(0.0, 1.0);
-    // Cubic Bezier control points P0..P3.
-    let p0 = lift_off;
-    let p3 = touch_down;
-    // 4/3 lift puts the curve's true peak at exactly `swing_height` above
-    // the chord — see derivation in the doc comment.
-    let lift = Vector3::new(0.0, 0.0, swing_height * 4.0 / 3.0);
-    let p1 = lift_off + lift;
-    let p2 = touch_down + lift;
 
-    let one_t = 1.0 - t;
-    let b0 = one_t * one_t * one_t;
-    let b1 = 3.0 * one_t * one_t * t;
-    let b2 = 3.0 * one_t * t * t;
-    let b3 = t * t * t;
-    p0 * b0 + p1 * b1 + p2 * b2 + p3 * b3
+    // ── xy: smoothstep S(t) = 3t² − 2t³ ───────────────────────────────
+    // Maps [0, 1] → [0, 1] with S(0) = S(1) = 0 derivative. Linear in
+    // value at t = 0.5 (S(0.5) = 0.5), so the foot's mean horizontal
+    // speed equals the chord length / swing duration as expected.
+    let s = (3.0 - 2.0 * t) * t * t;
+    let xy_chord = touch_down - lift_off;
+    let mut p = lift_off + xy_chord * s;
+    // The xy formula above also moves z linearly between lift_off.z
+    // and touch_down.z (it scales the whole chord vector). That part
+    // is fine — it's the chord baseline. We add the swing bump on top.
+
+    // ── z bump: sin²(π·t) · swing_height ───────────────────────────────
+    // sin² has zero derivative at t = 0 and t = 1 → soft landing AND
+    // soft lift-off. Peak `swing_height` at t = 0.5. C¹-continuous to
+    // the stance line on both ends.
+    let bump = (std::f64::consts::PI * t).sin().powi(2) * swing_height;
+    p.z += bump;
+    p
 }
 
 #[cfg(test)]
@@ -107,7 +136,83 @@ mod tests {
             }
         }
         assert!(p_mid.z > 0.0, "swing midpoint should rise above ground");
-        // Peak of a cubic Bezier with control points at 2h is exactly h.
-        assert_relative_eq!(peak, h, epsilon = 1e-2);
+        // Peak should be exactly `h` (sin² at t=0.5 is 1).
+        assert_relative_eq!(peak, h, epsilon = 1e-3);
+        assert_relative_eq!(p_mid.z, h, epsilon = 1e-9);
+    }
+
+    /// Critical regression: the swing curve must hit touchdown with
+    /// **zero** vertical velocity. Prior cubic-Bezier curve had ~−4·h
+    /// per unit time, which translated to ~0.8 m/s downward at default
+    /// settings — that's the source of trunk bobbing during turn /
+    /// strafe. The replacement uses sin² so dz/dt vanishes at both
+    /// ends.
+    #[test]
+    fn swing_zero_vertical_velocity_at_endpoints() {
+        let a = Vector3::new(0.0, 0.0, 0.0);
+        let b = Vector3::new(0.10, 0.02, 0.0);
+        let h = 0.04;
+        let eps = 1e-5;
+        // Numerical derivative just inside each endpoint.
+        let p0 = swing_position(a, b, h, 0.0);
+        let p_eps = swing_position(a, b, h, eps);
+        let p1 = swing_position(a, b, h, 1.0);
+        let p_one_minus_eps = swing_position(a, b, h, 1.0 - eps);
+
+        let vz_lift = (p_eps.z - p0.z) / eps;
+        let vz_land = (p1.z - p_one_minus_eps.z) / eps;
+        // sin²'(π·0) = 0 and sin²'(π·1) = 0 → derivative is exactly
+        // zero in the limit, but our finite-difference probe is O(eps).
+        assert!(
+            vz_lift.abs() < 1e-3,
+            "lift-off vertical velocity should be ~0, got {vz_lift}"
+        );
+        assert!(
+            vz_land.abs() < 1e-3,
+            "touchdown vertical velocity should be ~0, got {vz_land}"
+        );
+    }
+
+    /// Horizontal velocity at the endpoints must also be zero so the
+    /// stance↔swing handoff is C¹ in xy too.
+    #[test]
+    fn swing_zero_horizontal_velocity_at_endpoints() {
+        let a = Vector3::new(0.0, 0.0, 0.0);
+        let b = Vector3::new(0.10, 0.02, 0.0);
+        let h = 0.04;
+        let eps = 1e-5;
+        let p0 = swing_position(a, b, h, 0.0);
+        let p_eps = swing_position(a, b, h, eps);
+        let p1 = swing_position(a, b, h, 1.0);
+        let p_one_minus_eps = swing_position(a, b, h, 1.0 - eps);
+
+        let vxy_lift = ((p_eps - p0) / eps).xy().norm();
+        let vxy_land = ((p1 - p_one_minus_eps) / eps).xy().norm();
+        // smoothstep S'(0) = S'(1) = 0 exactly.
+        assert!(vxy_lift < 1e-3, "lift-off xy velocity should be ~0, got {vxy_lift}");
+        assert!(vxy_land < 1e-3, "touchdown xy velocity should be ~0, got {vxy_land}");
+    }
+
+    /// Swing curve should monotonically traverse the chord in xy
+    /// (smoothstep is monotone non-decreasing), so the foot doesn't
+    /// loop back during swing.
+    #[test]
+    fn swing_xy_monotone() {
+        let a = Vector3::new(0.0, 0.0, 0.0);
+        let b = Vector3::new(0.10, 0.02, 0.0);
+        let h = 0.04;
+        let mut prev_proj = f64::NEG_INFINITY;
+        let chord = b - a;
+        let chord_len = chord.norm();
+        for k in 0..=100 {
+            let t = k as f64 / 100.0;
+            let p = swing_position(a, b, h, t);
+            let proj = (p - a).xy().dot(&chord.xy()) / chord_len;
+            assert!(
+                proj >= prev_proj - 1e-9,
+                "xy projection must be monotone non-decreasing (t={t}, prev={prev_proj}, now={proj})"
+            );
+            prev_proj = proj;
+        }
     }
 }
