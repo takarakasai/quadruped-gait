@@ -213,6 +213,26 @@ impl AnyGaitController {
             AnyGaitController::Mpc(c) => c.stance_grf_torques(output),
         }
     }
+
+    /// Override the SRBD MPC's body-mass / inertia / weight matrices.
+    /// No-op when the active mode is CHAMP. Hosts that know their
+    /// robot's actual mass should call this once at construction —
+    /// the default 9 kg / Cheetah-3 inertia is wildly off for many
+    /// robots and produces grossly over- or under-scaled τ_ff.
+    pub fn set_srbd_mpc_config(&mut self, cfg: crate::srbd_mpc::SrbdMpcConfig) {
+        if let AnyGaitController::Mpc(c) = self {
+            c.set_srbd_mpc_config(cfg);
+        }
+    }
+
+    /// Read back the active SRBD MPC config (mass / inertia / weights /
+    /// horizon). Returns `None` for CHAMP — it has no MPC state.
+    pub fn srbd_mpc_config(&self) -> Option<&crate::srbd_mpc::SrbdMpcConfig> {
+        match self {
+            AnyGaitController::Champ(_) => None,
+            AnyGaitController::Mpc(c) => Some(c.srbd_mpc_config()),
+        }
+    }
 }
 
 impl GaitGenerator for AnyGaitController {
