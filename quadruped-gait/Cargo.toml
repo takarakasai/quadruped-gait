@@ -9,6 +9,12 @@ license = "MIT OR Apache-2.0"
 nalgebra = "0.34.2"
 misarta = { path = "../misarta" }
 serde = { version = "1.0", features = ["derive"], optional = true }
+# Convex MPC backend: clarabel solves the SRBD QP that
+# `mpc_controller::SrbdMpc` builds each tick (Di Carlo et al. 2018).
+# Already a transitive dep through misarta when its `clarabel` feature
+# is on; we depend directly so the SRBD MPC works regardless of how
+# misarta is configured.
+clarabel = { version = "0.11", features = ["serde"] }
 
 [features]
 default = []

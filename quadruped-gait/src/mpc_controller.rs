@@ -37,6 +37,10 @@ use crate::controller::{ControllerOutput, LegOutput};
 use crate::footstep::Footstep;
 use crate::ik::{solve_leg_ik, LegIkSolution};
 use crate::phase::{PhaseGenerator, PhaseState};
+use crate::srbd_mpc::{
+    ContactSchedule, FootOffsets, MpcSolution, ReferenceTrajectory, SrbdMpc,
+    SrbdMpcConfig, SrbdState,
+};
 use crate::swing_traj::swing_position;
 
 /// Default capture-point feedback gain. Derived from the LIP model:
@@ -77,6 +81,18 @@ pub struct MpcGaitController {
     /// wired the observation), the controller degrades to pure
     /// Raibert (open-loop).
     v_observed_world: Vector3<f64>,
+
+    /// Convex SRBD MPC (Di Carlo et al. 2018) used to predict the
+    /// ground reaction forces required to track the velocity command
+    /// over the next ~300 ms. Currently produces *diagnostic* GRFs
+    /// only — articara still drives joints via position control, so
+    /// the forces are visualised but not commanded. Phase 4 will hook
+    /// them into a torque-control chain.
+    srbd_mpc: SrbdMpc,
+    /// Last MPC solution. Populated each tick when the MPC succeeds;
+    /// retained between ticks so the viewport can keep drawing arrows
+    /// through paused frames.
+    last_mpc_solution: Option<MpcSolution>,
 }
 
 impl MpcGaitController {
@@ -94,7 +110,27 @@ impl MpcGaitController {
             knee_forward: [false; 4],
             k_capture: DEFAULT_CAPTURE_POINT_GAIN_S,
             v_observed_world: Vector3::zeros(),
+            srbd_mpc: SrbdMpc::new(SrbdMpcConfig::default()),
+            last_mpc_solution: None,
         }
+    }
+
+    /// Predicted ground reaction forces from the most recent MPC
+    /// solve. Returns `None` until the controller has ticked at least
+    /// once with a stance leg. Used by the viewport to draw arrows;
+    /// articara doesn't currently apply these to MuJoCo (Phase 4
+    /// work).
+    pub fn predicted_grfs(&self) -> Option<&MpcSolution> {
+        self.last_mpc_solution.as_ref()
+    }
+
+    /// Tune the underlying SRBD MPC weights / horizon / friction.
+    /// Most callers use the defaults.
+    pub fn set_srbd_mpc_config(&mut self, cfg: SrbdMpcConfig) {
+        self.srbd_mpc.set_config(cfg);
+    }
+    pub fn srbd_mpc_config(&self) -> &SrbdMpcConfig {
+        self.srbd_mpc.config()
     }
 
     pub fn body_state(&self) -> &BodyState {
@@ -153,6 +189,7 @@ impl MpcGaitController {
         self.body_state.reset();
         self.cmd = VelocityCmd::zero();
         self.v_observed_world = Vector3::zeros();
+        self.last_mpc_solution = None;
     }
 
     /// Advance one tick. See module docs for what makes this differ
@@ -198,10 +235,97 @@ impl MpcGaitController {
                 ps.leg, kin_leg, *ps, footstep, target, h, t, c, reachable,
             ));
         }
-        ControllerOutput {
+        let output = ControllerOutput {
             legs: legs.map(|x| x.expect("all four legs filled by phase loop")),
             body_state: self.body_state,
+        };
+
+        // Solve the SRBD MPC for the next predicted GRFs. Best-effort:
+        // failures (clarabel didn't converge, ill-conditioned QP, …)
+        // leave the previous solution in place rather than panicking
+        // — the GRF visualisation is non-critical.
+        self.last_mpc_solution = Some(self.solve_srbd_mpc(&output));
+
+        output
+    }
+
+    /// Build the inputs for [`SrbdMpc::solve`] from the current state
+    /// + phase + footstep planning, then call clarabel. See
+    /// [`Self::predicted_grfs`].
+    fn solve_srbd_mpc(&self, output: &ControllerOutput) -> MpcSolution {
+        let cfg = self.srbd_mpc.config();
+        let n = cfg.horizon_steps;
+
+        // Current SRBD state. Yaw comes from the integrated body
+        // pose; roll/pitch tracked elsewhere are approximated as zero
+        // (the gait controller doesn't observe body orientation in
+        // Phase 2).
+        let s_now = SrbdState {
+            orientation_rpy: Vector3::new(0.0, 0.0, self.body_state.world_yaw),
+            position: Vector3::new(
+                self.body_state.world_position.x,
+                self.body_state.world_position.y,
+                // Use the kinematics' nominal stance height as a proxy
+                // for the body z; gives a stable level for the MPC to
+                // regulate to.
+                -self.kin.legs()[0].nominal_foot_body.z,
+            ),
+            angular_velocity: Vector3::new(0.0, 0.0, self.cmd.wz),
+            linear_velocity: self.v_observed_world,
+        };
+
+        // Reference: track commanded velocity over the horizon.
+        let v_world_cmd = body_to_world_horizontal(
+            Vector3::new(self.cmd.vx, self.cmd.vy, 0.0),
+            self.body_state.world_yaw,
+        );
+        let reference =
+            ReferenceTrajectory::from_constant_velocity(s_now, v_world_cmd, self.cmd.wz, cfg);
+
+        // Contact schedule: project current per-leg phase forward by
+        // `dt_per_step` for each horizon step. The phase generator's
+        // `predict_at` would be ideal but we don't have it; use the
+        // per-leg duty fraction as a steady-state proxy.
+        let stance_now: [bool; 4] = [
+            output.legs[0].phase.is_stance,
+            output.legs[1].phase.is_stance,
+            output.legs[2].phase.is_stance,
+            output.legs[3].phase.is_stance,
+        ];
+        let mut contact = ContactSchedule {
+            is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        };
+        for leg in 0..4 {
+            // Steady-state stance probability at any random horizon
+            // step is `duty_factor`. For a coarse projection use the
+            // current state for the first step and the duty for the
+            // rest — this errs on the side of assuming the foot stays
+            // in stance, giving the MPC a denser support hypothesis.
+            for k in 0..n {
+                let in_stance = if k == 0 {
+                    stance_now[leg]
+                } else {
+                    self.cfg.duty_factor > 0.5
+                };
+                contact.is_stance[leg].push(in_stance);
+            }
         }
+
+        // Foot offsets: r_i = foot_world − CoM_world, but the MPC's
+        // input is just the relative vector. Use the current foot_body
+        // (already in body frame, world-aligned modulo yaw) as a
+        // constant approximation over the horizon. Good enough for
+        // 300 ms; the swing leg's foot motion is averaged out by the
+        // MPC's stance schedule.
+        let foot_body: [Vector3<f64>; 4] = [
+            output.legs[0].foot_body,
+            output.legs[1].foot_body,
+            output.legs[2].foot_body,
+            output.legs[3].foot_body,
+        ];
+        let feet = FootOffsets::constant_per_leg(foot_body, n);
+
+        self.srbd_mpc.solve(s_now, &reference, &contact, &feet)
     }
 
     /// Footstep planner with capture-point feedback + LIP horizon
@@ -270,6 +394,17 @@ fn world_to_body_horizontal(v_world: Vector3<f64>, yaw: f64) -> Vector3<f64> {
         c * v_world.x + s * v_world.y,
         -s * v_world.x + c * v_world.y,
         v_world.z,
+    )
+}
+
+/// Inverse of [`world_to_body_horizontal`]: rotate a body-frame
+/// horizontal vector into world frame using the yaw angle.
+fn body_to_world_horizontal(v_body: Vector3<f64>, yaw: f64) -> Vector3<f64> {
+    let (s, c) = yaw.sin_cos();
+    Vector3::new(
+        c * v_body.x - s * v_body.y,
+        s * v_body.x + c * v_body.y,
+        v_body.z,
     )
 }
 

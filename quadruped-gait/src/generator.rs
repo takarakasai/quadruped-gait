@@ -187,6 +187,18 @@ impl AnyGaitController {
     }
 }
 
+impl AnyGaitController {
+    /// SRBD MPC predicted ground reaction forces from the last tick,
+    /// when the active mode is [`GaitMode::Mpc`]. CHAMP variant
+    /// always returns `None` (it has no MPC state).
+    pub fn predicted_grfs(&self) -> Option<&crate::srbd_mpc::MpcSolution> {
+        match self {
+            AnyGaitController::Champ(_) => None,
+            AnyGaitController::Mpc(c) => c.predicted_grfs(),
+        }
+    }
+}
+
 impl GaitGenerator for AnyGaitController {
     fn tick(&mut self, dt: f64) -> ControllerOutput {
         match self {

@@ -60,6 +60,7 @@ pub mod generator;
 pub mod ik;
 pub mod mpc_controller;
 pub mod phase;
+pub mod srbd_mpc;
 pub mod swing_traj;
 
 pub use body_state::BodyState;
@@ -76,4 +77,8 @@ pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
 pub use ik::{solve_leg_ik, LegIkSolution};
 pub use mpc_controller::MpcGaitController;
 pub use phase::{PhaseGenerator, PhaseState};
+pub use srbd_mpc::{
+    ContactSchedule, FootOffsets, MpcSolution, ReferenceTrajectory, SrbdMpc,
+    SrbdMpcConfig, SrbdState,
+};
 pub use swing_traj::{stance_position, swing_position};
