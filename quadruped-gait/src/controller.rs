@@ -138,7 +138,7 @@ fn effective_swing_height(base_h: f64, cmd: &VelocityCmd) -> f64 {
     base_h * factor
 }
 
-fn slot_of(id: LegId) -> usize {
+pub(crate) fn slot_of(id: LegId) -> usize {
     match id {
         LegId::FL => 0,
         LegId::FR => 1,

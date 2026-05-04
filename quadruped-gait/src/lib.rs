@@ -56,7 +56,9 @@ pub mod body_state;
 pub mod config;
 pub mod controller;
 pub mod footstep;
+pub mod generator;
 pub mod ik;
+pub mod mpc_controller;
 pub mod phase;
 pub mod swing_traj;
 
@@ -65,8 +67,13 @@ pub use config::{
     GaitConfig, GaitType, KinematicsConfig, KneePattern, LegId, LegKinematics,
     VelocityCmd, DEFAULT_FOOT_LINKS,
 };
-pub use controller::{ControllerOutput, GaitController, LegOutput};
+// Existing CHAMP-derived controller. Re-exported under both the legacy
+// name (`GaitController`) and the new explicit name (`ChampGaitController`)
+// so older callers keep working while new code can name the choice.
+pub use controller::{ControllerOutput, GaitController, GaitController as ChampGaitController, LegOutput};
 pub use footstep::{compute_footstep, Footstep};
+pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
 pub use ik::{solve_leg_ik, LegIkSolution};
+pub use mpc_controller::MpcGaitController;
 pub use phase::{PhaseGenerator, PhaseState};
 pub use swing_traj::{stance_position, swing_position};
