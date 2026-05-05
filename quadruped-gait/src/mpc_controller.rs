@@ -87,6 +87,15 @@ pub struct MpcGaitController {
     /// wired the observation), the controller degrades to pure
     /// Raibert (open-loop).
     v_observed_world: Vector3<f64>,
+    /// Last reported observed body angular velocity in world frame.
+    /// Only the z-component (yaw rate) is used by the SRBD MPC, but we
+    /// store the full vector for symmetry with `v_observed_world`. When
+    /// the host hasn't wired it, the SRBD MPC's `s_now.angular_velocity`
+    /// falls back to the commanded `wz`, which makes the MPC believe the
+    /// body is already turning at the commanded rate — that suppresses
+    /// any yaw-corrective GRFs and breaks in-place rotation. Wiring the
+    /// observed gyro / `body cvel` here closes the angular loop.
+    omega_observed_world: Vector3<f64>,
 
     /// Convex SRBD MPC (Di Carlo et al. 2018) used to predict the
     /// ground reaction forces required to track the velocity command
@@ -123,6 +132,7 @@ impl MpcGaitController {
             knee_forward: [false; 4],
             k_capture: DEFAULT_CAPTURE_POINT_GAIN_S,
             v_observed_world: Vector3::zeros(),
+            omega_observed_world: Vector3::zeros(),
             srbd_mpc: SrbdMpc::new(SrbdMpcConfig::default()),
             last_mpc_solution: None,
             mpc_solve_accumulator_s: f64::INFINITY,
@@ -261,10 +271,19 @@ impl MpcGaitController {
         self.k_capture = k.max(0.0);
     }
 
-    /// Feed observed body linear velocity (world frame). Called by
-    /// the host every sim tick from MuJoCo / state estimator output.
-    pub fn set_body_state_observed(&mut self, v_world: Vector3<f64>) {
+    /// Feed observed body linear and angular velocity (both in world
+    /// frame). Called by the host every sim tick from MuJoCo / state
+    /// estimator output. Pass `Vector3::zeros()` for the angular term
+    /// when the host hasn't wired a gyro yet — but note that doing so
+    /// silently breaks in-place rotation tracking (see
+    /// [`Self::omega_observed_world`]).
+    pub fn set_body_state_observed(
+        &mut self,
+        v_world: Vector3<f64>,
+        omega_world: Vector3<f64>,
+    ) {
         self.v_observed_world = v_world;
+        self.omega_observed_world = omega_world;
     }
 
     pub fn reset(&mut self) {
@@ -272,6 +291,7 @@ impl MpcGaitController {
         self.body_state.reset();
         self.cmd = VelocityCmd::zero();
         self.v_observed_world = Vector3::zeros();
+        self.omega_observed_world = Vector3::zeros();
         self.last_mpc_solution = None;
         // Force a re-solve on the next tick after reset.
         self.mpc_solve_accumulator_s = f64::INFINITY;
@@ -364,7 +384,13 @@ impl MpcGaitController {
                 // regulate to.
                 -self.kin.legs()[0].nominal_foot_body.z,
             ),
-            angular_velocity: Vector3::new(0.0, 0.0, self.cmd.wz),
+            // Use the observed yaw rate (world frame) so the MPC sees
+            // a real angular-velocity error against the reference and
+            // generates the GRFs needed to spin the body up to the
+            // commanded `wz`. Falling back to `self.cmd.wz` here would
+            // make the MPC think it's already turning at the commanded
+            // rate — see `omega_observed_world` field doc.
+            angular_velocity: self.omega_observed_world,
             linear_velocity: self.v_observed_world,
         };
 
@@ -416,19 +442,21 @@ impl MpcGaitController {
             }
         }
 
-        // Foot offsets: r_i = foot_world − CoM_world, but the MPC's
-        // input is just the relative vector. Use the current foot_body
-        // (already in body frame, world-aligned modulo yaw) as a
-        // constant approximation over the horizon. Good enough for
-        // 300 ms; the swing leg's foot motion is averaged out by the
-        // MPC's stance schedule.
-        let foot_body: [Vector3<f64>; 4] = [
-            output.legs[0].foot_body,
-            output.legs[1].foot_body,
-            output.legs[2].foot_body,
-            output.legs[3].foot_body,
+        // Foot offsets: r_i = foot_world − CoM_world. The SRBD MPC's
+        // dynamics use `[r_i]× · f_i` with `f_i` in world frame, so
+        // `r_i` must be in world frame too. `output.legs[*].foot_body`
+        // is in body frame — yaw-rotate it before handing to the MPC.
+        // For yaw=0 body=world so the bug is invisible at start, but
+        // any integrated yaw makes the cross product mix frames and
+        // breaks in-place rotation tracking.
+        let yaw = self.body_state.world_yaw;
+        let foot_world: [Vector3<f64>; 4] = [
+            body_to_world_horizontal(output.legs[0].foot_body, yaw),
+            body_to_world_horizontal(output.legs[1].foot_body, yaw),
+            body_to_world_horizontal(output.legs[2].foot_body, yaw),
+            body_to_world_horizontal(output.legs[3].foot_body, yaw),
         ];
-        let feet = FootOffsets::constant_per_leg(foot_body, n);
+        let feet = FootOffsets::constant_per_leg(foot_world, n);
 
         self.srbd_mpc.solve(s_now, &reference, &contact, &feet)
     }
@@ -486,8 +514,32 @@ impl MpcGaitController {
             horizon_bias.y = horizon_weight * self.k_capture * v_err_body.y;
         }
 
+        // ── Direction-preserving clamp ─────────────────────────────
+        // The capture-point + horizon-bias terms can have magnitude
+        // larger than the Raibert term when |v_err| is large (typical
+        // at startup: `v_obs = 0`, `v_cmd = 0.3` → feedback magnitude
+        // 0.0525 m vs Raibert magnitude 0.03 m for the default trot).
+        // Without a guard, that flips the sign of `half` so
+        // `touch_down` lands on the **opposite** side of the nominal
+        // foot from what the user commanded. The position-target
+        // trajectory then sweeps the foot the wrong way during stance
+        // and propels the body in the *opposite* direction of the
+        // command.
+        //
+        // Cap |feedback + horizon_bias| per-axis to ≤ |Raibert| per-
+        // axis. In the small-perturbation regime (|v_err| ≪ |v_cmd|)
+        // the clamp is inactive and behaviour is identical to plain
+        // Raibert + capture-point; at startup it pins the half-step to
+        // the Raibert direction so the body always accelerates *toward*
+        // the command, not away from it.
+        let mut closed_loop = feedback + horizon_bias;
+        let cap_x = half.x.abs();
+        let cap_y = half.y.abs();
+        closed_loop.x = closed_loop.x.clamp(-cap_x, cap_x);
+        closed_loop.y = closed_loop.y.clamp(-cap_y, cap_y);
+
         // Combine and clamp to the configured maximum step length.
-        half += feedback + horizon_bias;
+        half += closed_loop;
         let max_half = 0.5 * self.cfg.max_step_length_m;
         let mag = half.norm();
         if mag > max_half && mag > 0.0 {
@@ -608,7 +660,7 @@ mod tests {
         let mut mpc = MpcGaitController::new(cfg, kin);
         mpc.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
         // Body velocity matches command → zero error → no feedback.
-        mpc.set_body_state_observed(Vector3::new(0.3, 0.0, 0.0));
+        mpc.set_body_state_observed(Vector3::new(0.3, 0.0, 0.0), Vector3::zeros());
 
         let out_champ = champ.tick(0.002);
         let out_mpc = mpc.tick(0.002);
@@ -639,7 +691,7 @@ mod tests {
         let mut mpc = MpcGaitController::new(cfg, kin);
         mpc.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
         // Observed velocity is half of commanded → error = -0.15 m/s.
-        mpc.set_body_state_observed(Vector3::new(0.15, 0.0, 0.0));
+        mpc.set_body_state_observed(Vector3::new(0.15, 0.0, 0.0), Vector3::zeros());
 
         let out_mpc = mpc.tick(0.002);
         // CHAMP reference (no feedback)
@@ -679,6 +731,93 @@ mod tests {
         }
     }
 
+    /// Regression: at startup `v_observed` is zero (host hasn't wired
+    /// the feedback yet, or sim just started). With the default
+    /// `k_capture = 0.175 s` and trot's `T_stance = 0.2 s`, the
+    /// capture-point term `k·(v_obs − v_cmd) = -k·v_cmd` (magnitude
+    /// 0.0525 m for `v_cmd = 0.3 m/s`) **exceeds** the open-loop
+    /// Raibert term `0.5·T_stance·v_cmd` (magnitude 0.03 m). Without a
+    /// guard, the resulting `half.x` flips sign and `touch_down`
+    /// lands BEHIND the nominal foot. The position-target trajectory
+    /// then sweeps the foot front-to-back during stance, which pushes
+    /// the body BACKWARD when the user commanded forward — the exact
+    /// "MPC mode reverses the move direction" bug the user reported.
+    #[test]
+    fn forward_command_does_not_invert_touchdown_at_startup() {
+        let cfg = GaitConfig::trot();
+        let kin = build_kin();
+        let mut mpc = MpcGaitController::new(cfg, kin.clone());
+        mpc.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
+        // Deliberately leave v_observed at zero — that's the failure mode.
+        let out = mpc.tick(0.002);
+        for slot in 0..4 {
+            let nom_x = kin.legs()[slot].nominal_foot_body.x;
+            let td_x = out.legs[slot].footstep.touch_down.x;
+            let lo_x = out.legs[slot].footstep.lift_off.x;
+            assert!(
+                td_x >= nom_x - 1e-9,
+                "leg {slot}: forward command must not push touch_down behind \
+                 nominal at startup (v_obs=0). Got td.x={td_x}, nominal.x={nom_x}. \
+                 If touch_down ends up behind nominal, the stance phase sweeps \
+                 the foot front-to-back relative to the body, which propels the \
+                 body BACKWARD — i.e. the move direction is inverted."
+            );
+            // Symmetric check on lift_off so the test fires on either
+            // mis-clamping the (lift_off, touch_down) pair.
+            assert!(
+                lo_x <= nom_x + 1e-9,
+                "leg {slot}: forward command must keep lift_off behind nominal \
+                 (got lo.x={lo_x}, nominal.x={nom_x})."
+            );
+        }
+    }
+
+    /// Same regression as `forward_command_does_not_invert_touchdown_at_startup`
+    /// but for backward command. Symmetric: at startup with v_obs = 0
+    /// and v_cmd.x = -0.3, the capture-point term flips touchdown to
+    /// land FORWARD of nominal, sweeping the body forward when the user
+    /// commanded reverse. Catches a one-sided fix that only handles the
+    /// vx > 0 case.
+    #[test]
+    fn backward_command_does_not_invert_touchdown_at_startup() {
+        let cfg = GaitConfig::trot();
+        let kin = build_kin();
+        let mut mpc = MpcGaitController::new(cfg, kin.clone());
+        mpc.set_velocity_cmd(VelocityCmd { vx: -0.3, ..Default::default() });
+        let out = mpc.tick(0.002);
+        for slot in 0..4 {
+            let nom_x = kin.legs()[slot].nominal_foot_body.x;
+            let td_x = out.legs[slot].footstep.touch_down.x;
+            assert!(
+                td_x <= nom_x + 1e-9,
+                "leg {slot}: backward command must not push touch_down forward \
+                 of nominal at startup (got td.x={td_x}, nominal.x={nom_x})."
+            );
+        }
+    }
+
+    /// Same regression for lateral (vy) commands. Strafing left at
+    /// startup with v_obs = 0 must not flip touch_down to land on the
+    /// right side of nominal (which would push the body right when
+    /// commanded left).
+    #[test]
+    fn lateral_command_does_not_invert_touchdown_at_startup() {
+        let cfg = GaitConfig::trot();
+        let kin = build_kin();
+        let mut mpc = MpcGaitController::new(cfg, kin.clone());
+        mpc.set_velocity_cmd(VelocityCmd { vy: 0.3, ..Default::default() });
+        let out = mpc.tick(0.002);
+        for slot in 0..4 {
+            let nom_y = kin.legs()[slot].nominal_foot_body.y;
+            let td_y = out.legs[slot].footstep.touch_down.y;
+            assert!(
+                td_y >= nom_y - 1e-9,
+                "leg {slot}: +vy command must not push touch_down to negative \
+                 side at startup (got td.y={td_y}, nominal.y={nom_y})."
+            );
+        }
+    }
+
     /// Setting the gain to 0 disables feedback → identical to CHAMP
     /// regardless of velocity error.
     #[test]
@@ -688,7 +827,7 @@ mod tests {
         let mut mpc = MpcGaitController::new(cfg.clone(), kin.clone());
         mpc.set_capture_point_gain(0.0);
         mpc.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
-        mpc.set_body_state_observed(Vector3::new(0.0, 0.5, 0.0)); // huge error
+        mpc.set_body_state_observed(Vector3::new(0.0, 0.5, 0.0), Vector3::zeros()); // huge error
 
         let mut champ = crate::ChampGaitController::new(cfg, kin);
         champ.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
@@ -791,8 +930,8 @@ mod tests {
         // A: zero observation. B: 5 cm/s "noise" in xy. Both are at
         // hold so the feedback should be gated off and the resulting
         // foot targets must match.
-        mpc_a.set_body_state_observed(Vector3::zeros());
-        mpc_b.set_body_state_observed(Vector3::new(0.05, -0.03, 0.0));
+        mpc_a.set_body_state_observed(Vector3::zeros(), Vector3::zeros());
+        mpc_b.set_body_state_observed(Vector3::new(0.05, -0.03, 0.0), Vector3::zeros());
         let out_a = mpc_a.tick(0.002);
         let out_b = mpc_b.tick(0.002);
         for slot in 0..4 {
@@ -824,7 +963,7 @@ mod tests {
         // Hover: zero command, zero observed velocity. The MPC should
         // distribute the body weight across all stance feet.
         mpc.set_velocity_cmd(VelocityCmd::zero());
-        mpc.set_body_state_observed(Vector3::zeros());
+        mpc.set_body_state_observed(Vector3::zeros(), Vector3::zeros());
         let out = mpc.tick(0.002);
         let taus = mpc.stance_grf_torques(&out);
         let mut any_stance = false;

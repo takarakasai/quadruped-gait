@@ -56,13 +56,14 @@ pub trait GaitGenerator {
     fn knee_pattern(&self) -> KneePattern;
     fn knee_forward(&self) -> [bool; 4];
 
-    /// Feed the **observed** body state (linear velocity in world
-    /// frame) so closed-loop generators can compute the capture-point
-    /// feedback term. Default impl ignores it — open-loop controllers
-    /// don't need it.
+    /// Feed the **observed** body state (linear + angular velocity in
+    /// world frame) so closed-loop generators can compute the capture-
+    /// point feedback term and the SRBD MPC's angular tracking. Default
+    /// impl ignores it — open-loop controllers don't need it.
     fn set_body_state_observed(
         &mut self,
         _world_linear_velocity: Vector3<f64>,
+        _world_angular_velocity: Vector3<f64>,
     ) {
     }
 }
@@ -302,10 +303,14 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.knee_forward(),
         }
     }
-    fn set_body_state_observed(&mut self, v_world: Vector3<f64>) {
+    fn set_body_state_observed(
+        &mut self,
+        v_world: Vector3<f64>,
+        omega_world: Vector3<f64>,
+    ) {
         match self {
-            AnyGaitController::Champ(c) => c.set_body_state_observed(v_world),
-            AnyGaitController::Mpc(c) => c.set_body_state_observed(v_world),
+            AnyGaitController::Champ(c) => c.set_body_state_observed(v_world, omega_world),
+            AnyGaitController::Mpc(c) => c.set_body_state_observed(v_world, omega_world),
         }
     }
 }
