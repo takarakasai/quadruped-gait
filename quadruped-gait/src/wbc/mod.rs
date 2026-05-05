@@ -26,9 +26,13 @@
 //! See [`doc/mpc_wbc_gait_control.md`](../../../doc/mpc_wbc_gait_control.md)
 //! for the full design doc.
 
+pub mod dims;
 pub mod ho_qp;
 pub mod task;
 pub mod tasks;
+mod wbc;
 
+pub use dims::WbcDims;
 pub use ho_qp::HoQp;
 pub use task::Task;
+pub use wbc::{solve, WbcInputs, WbcSolution};
