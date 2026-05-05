@@ -62,6 +62,14 @@ const STANCE_GRF_MIN_N: f64 = 1.0;
 /// ahead at default duty_factor.
 pub const HORIZON_STEPS: usize = 4;
 
+/// Minimum fraction of the Raibert open-loop term retained in the
+/// final `half` step after the capture-point + horizon-bias closed-
+/// loop terms are added. Acts as an asymmetric floor in the commanded
+/// direction (amplification still has no cap). 0.5 = half the Raibert
+/// step survives even under maximum cancellation, guaranteeing a
+/// forward push at startup so the body can accelerate up to `v_cmd`.
+const MIN_HALF_FRACTION: f64 = 0.5;
+
 /// Stateful MPC-flavoured gait controller. Same construction inputs
 /// as [`crate::ChampGaitController`] so the host can swap them via
 /// [`crate::AnyGaitController::set_mode`] without re-providing the
@@ -533,32 +541,51 @@ impl MpcGaitController {
             horizon_bias.y = horizon_weight * self.k_capture * v_err_body.y;
         }
 
-        // ── Direction-preserving clamp ─────────────────────────────
+        // ── Direction-preserving floor ─────────────────────────────
         // The capture-point + horizon-bias terms can have magnitude
         // larger than the Raibert term when |v_err| is large (typical
         // at startup: `v_obs = 0`, `v_cmd = 0.3` → feedback magnitude
         // 0.0525 m vs Raibert magnitude 0.03 m for the default trot).
-        // Without a guard, that flips the sign of `half` so
+        // Without a guard the resulting `half` flips sign and
         // `touch_down` lands on the **opposite** side of the nominal
-        // foot from what the user commanded. The position-target
-        // trajectory then sweeps the foot the wrong way during stance
-        // and propels the body in the *opposite* direction of the
-        // command.
+        // foot from what the user commanded — propelling the body
+        // backward.
         //
-        // Cap |feedback + horizon_bias| per-axis to ≤ |Raibert| per-
-        // axis. In the small-perturbation regime (|v_err| ≪ |v_cmd|)
-        // the clamp is inactive and behaviour is identical to plain
-        // Raibert + capture-point; at startup it pins the half-step to
-        // the Raibert direction so the body always accelerates *toward*
-        // the command, not away from it.
-        let mut closed_loop = feedback + horizon_bias;
-        let cap_x = half.x.abs();
-        let cap_y = half.y.abs();
-        closed_loop.x = closed_loop.x.clamp(-cap_x, cap_x);
-        closed_loop.y = closed_loop.y.clamp(-cap_y, cap_y);
-
-        // Combine and clamp to the configured maximum step length.
-        half += closed_loop;
+        // Naive symmetric clamp `|closed_loop| ≤ |raibert|` prevented
+        // the inversion but allowed perfect cancellation (`half = 0`),
+        // which collapsed the stance amplitude to nothing and produced
+        // a "marching in place" gait — the body had no friction shear
+        // to accelerate against and the controller bobbed in place.
+        //
+        // Asymmetric floor: amplification (closed_loop same sign as
+        // raibert — capture-point wants larger steps to brake an
+        // overshoot) is **unrestricted**; cancellation (closed_loop
+        // opposing raibert) is capped so half retains at least
+        // [`MIN_HALF_FRACTION`] of the Raibert magnitude in the
+        // commanded direction. Result:
+        // - Steady state (small v_err): no clamp, identical to plain
+        //   Raibert + capture-point.
+        // - Overshoot (v_obs > v_cmd): amplifies forward step to
+        //   brake. No clamp.
+        // - Startup (v_obs = 0): half = MIN_HALF_FRACTION · raibert,
+        //   guaranteeing a forward step every cycle so the body can
+        //   accelerate up to v_cmd.
+        let closed_loop = feedback + horizon_bias;
+        let raw_half = half + closed_loop;
+        let mut combined = raw_half;
+        let min_x = MIN_HALF_FRACTION * half.x;
+        let min_y = MIN_HALF_FRACTION * half.y;
+        if half.x > 0.0 && combined.x < min_x {
+            combined.x = min_x;
+        } else if half.x < 0.0 && combined.x > min_x {
+            combined.x = min_x;
+        }
+        if half.y > 0.0 && combined.y < min_y {
+            combined.y = min_y;
+        } else if half.y < 0.0 && combined.y > min_y {
+            combined.y = min_y;
+        }
+        half = combined;
         let max_half = 0.5 * self.cfg.max_step_length_m;
         let mag = half.norm();
         if mag > max_half && mag > 0.0 {
@@ -755,12 +782,17 @@ mod tests {
     /// `k_capture = 0.175 s` and trot's `T_stance = 0.2 s`, the
     /// capture-point term `k·(v_obs − v_cmd) = -k·v_cmd` (magnitude
     /// 0.0525 m for `v_cmd = 0.3 m/s`) **exceeds** the open-loop
-    /// Raibert term `0.5·T_stance·v_cmd` (magnitude 0.03 m). Without a
-    /// guard, the resulting `half.x` flips sign and `touch_down`
-    /// lands BEHIND the nominal foot. The position-target trajectory
-    /// then sweeps the foot front-to-back during stance, which pushes
-    /// the body BACKWARD when the user commanded forward — the exact
-    /// "MPC mode reverses the move direction" bug the user reported.
+    /// Raibert term `0.5·T_stance·v_cmd` (magnitude 0.03 m). Without
+    /// a guard the resulting `half.x` flips sign and `touch_down`
+    /// lands BEHIND the nominal foot, propelling the body backward.
+    ///
+    /// A naive symmetric clamp `|closed_loop| ≤ |raibert|` prevents
+    /// the inversion but lets `closed_loop` perfectly cancel the open
+    /// loop term, leaving `half = 0`. That keeps the foot pinned to
+    /// nominal during stance — the body has no friction shear to
+    /// accelerate against and the controller bobs in place ("足踏み").
+    /// This test asserts a **strict forward step** (`half > 0`) at
+    /// startup so neither failure mode is reachable.
     #[test]
     fn forward_command_does_not_invert_touchdown_at_startup() {
         let cfg = GaitConfig::trot();
@@ -769,24 +801,34 @@ mod tests {
         mpc.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
         // Deliberately leave v_observed at zero — that's the failure mode.
         let out = mpc.tick(0.002);
+        // Raibert open-loop magnitude for the default trot at vx=0.3:
+        //   0.5 * T_stance * v_cmd = 0.5 * 0.2 * 0.3 = 0.030 m.
+        // Half must keep at least 50% of that (per the asymmetric
+        // direction-preserving clamp); use 25% as a conservative test
+        // floor so a future tuning of the clamp fraction doesn't
+        // immediately break the test.
+        const MIN_HALF_X: f64 = 0.25 * 0.5 * 0.2 * 0.3;
         for slot in 0..4 {
             let nom_x = kin.legs()[slot].nominal_foot_body.x;
             let td_x = out.legs[slot].footstep.touch_down.x;
             let lo_x = out.legs[slot].footstep.lift_off.x;
             assert!(
-                td_x >= nom_x - 1e-9,
-                "leg {slot}: forward command must not push touch_down behind \
-                 nominal at startup (v_obs=0). Got td.x={td_x}, nominal.x={nom_x}. \
-                 If touch_down ends up behind nominal, the stance phase sweeps \
-                 the foot front-to-back relative to the body, which propels the \
-                 body BACKWARD — i.e. the move direction is inverted."
+                td_x >= nom_x + MIN_HALF_X,
+                "leg {slot}: forward command must produce a strict forward \
+                 step at startup (v_obs=0). Got td.x={td_x}, nominal.x={nom_x}, \
+                 expected td.x ≥ {expected}. If half collapses to zero the \
+                 stance phase has no propulsive component — the body bobs in \
+                 place instead of moving forward.",
+                expected = nom_x + MIN_HALF_X,
             );
             // Symmetric check on lift_off so the test fires on either
             // mis-clamping the (lift_off, touch_down) pair.
             assert!(
-                lo_x <= nom_x + 1e-9,
-                "leg {slot}: forward command must keep lift_off behind nominal \
-                 (got lo.x={lo_x}, nominal.x={nom_x})."
+                lo_x <= nom_x - MIN_HALF_X,
+                "leg {slot}: forward command must keep lift_off strictly \
+                 behind nominal (got lo.x={lo_x}, nominal.x={nom_x}, \
+                 expected ≤ {expected}).",
+                expected = nom_x - MIN_HALF_X,
             );
         }
     }
@@ -804,13 +846,16 @@ mod tests {
         let mut mpc = MpcGaitController::new(cfg, kin.clone());
         mpc.set_velocity_cmd(VelocityCmd { vx: -0.3, ..Default::default() });
         let out = mpc.tick(0.002);
+        const MIN_HALF_X: f64 = 0.25 * 0.5 * 0.2 * 0.3;
         for slot in 0..4 {
             let nom_x = kin.legs()[slot].nominal_foot_body.x;
             let td_x = out.legs[slot].footstep.touch_down.x;
             assert!(
-                td_x <= nom_x + 1e-9,
-                "leg {slot}: backward command must not push touch_down forward \
-                 of nominal at startup (got td.x={td_x}, nominal.x={nom_x})."
+                td_x <= nom_x - MIN_HALF_X,
+                "leg {slot}: backward command must produce a strict backward \
+                 step at startup (got td.x={td_x}, nominal.x={nom_x}, \
+                 expected td.x ≤ {expected}).",
+                expected = nom_x - MIN_HALF_X,
             );
         }
     }
@@ -826,13 +871,16 @@ mod tests {
         let mut mpc = MpcGaitController::new(cfg, kin.clone());
         mpc.set_velocity_cmd(VelocityCmd { vy: 0.3, ..Default::default() });
         let out = mpc.tick(0.002);
+        const MIN_HALF_Y: f64 = 0.25 * 0.5 * 0.2 * 0.3;
         for slot in 0..4 {
             let nom_y = kin.legs()[slot].nominal_foot_body.y;
             let td_y = out.legs[slot].footstep.touch_down.y;
             assert!(
-                td_y >= nom_y - 1e-9,
-                "leg {slot}: +vy command must not push touch_down to negative \
-                 side at startup (got td.y={td_y}, nominal.y={nom_y})."
+                td_y >= nom_y + MIN_HALF_Y,
+                "leg {slot}: +vy command must produce a strict +y step at \
+                 startup (got td.y={td_y}, nominal.y={nom_y}, expected td.y ≥ \
+                 {expected}).",
+                expected = nom_y + MIN_HALF_Y,
             );
         }
     }
