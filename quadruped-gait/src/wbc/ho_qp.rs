@@ -268,6 +268,13 @@ fn right_null_space(m: &DMatrix<f64>) -> DMatrix<f64> {
     if rows == 0 {
         return DMatrix::identity(cols, cols);
     }
+    if cols == 0 {
+        // No columns → no null space directions to span. Returns a
+        // (0 × 0) matrix so the caller's Z update collapses cleanly to
+        // an empty matrix (the next priority level inherits zero
+        // freedom, which is correct).
+        return DMatrix::zeros(0, 0);
+    }
     let g = m.transpose() * m;
     let eig = g.symmetric_eigen();
     // Eigenvalues are singular-values-squared. Threshold using the
