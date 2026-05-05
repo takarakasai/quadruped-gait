@@ -66,6 +66,17 @@ pub trait GaitGenerator {
         _world_angular_velocity: Vector3<f64>,
     ) {
     }
+
+    /// Feed the **observed** body pose (world-frame yaw + position) so
+    /// closed-loop generators can replace their command-integrated
+    /// `body_state` with the real one. Default impl ignores — open-loop
+    /// controllers don't reference body_state externally.
+    fn set_body_pose_observed(
+        &mut self,
+        _world_yaw: f64,
+        _world_position: Vector3<f64>,
+    ) {
+    }
 }
 
 // ─── Trait impl for the existing CHAMP controller ─────────────────────
@@ -311,6 +322,19 @@ impl GaitGenerator for AnyGaitController {
         match self {
             AnyGaitController::Champ(c) => c.set_body_state_observed(v_world, omega_world),
             AnyGaitController::Mpc(c) => c.set_body_state_observed(v_world, omega_world),
+        }
+    }
+    fn set_body_pose_observed(
+        &mut self,
+        world_yaw: f64,
+        world_position: Vector3<f64>,
+    ) {
+        match self {
+            // CHAMP doesn't reference body_state externally — keep its
+            // diagnostics in sync anyway so the panel reads the real
+            // pose if the host queries it later.
+            AnyGaitController::Champ(_) => {}
+            AnyGaitController::Mpc(c) => c.set_body_pose_observed(world_yaw, world_position),
         }
     }
 }

@@ -286,6 +286,25 @@ impl MpcGaitController {
         self.omega_observed_world = omega_world;
     }
 
+    /// Feed observed body pose (yaw + world-frame position). When the
+    /// host wires this, the MPC's `s_now.position` and the body→world
+    /// rotation used by `solve_srbd_mpc` and `compute_mpc_footstep`
+    /// reflect the *real* state instead of integrating the velocity
+    /// command (which drifts whenever the robot can't perfectly track
+    /// the cmd — i.e., always). Sources:
+    /// - **Sim ground truth**: `MujocoSim::body_world_yaw` /
+    ///   `body_world_position` (oracle).
+    /// - **Real-robot stack**: Madgwick / EKF for yaw, leg-odometry +
+    ///   IMU for position.
+    pub fn set_body_pose_observed(
+        &mut self,
+        world_yaw: f64,
+        world_position: Vector3<f64>,
+    ) {
+        self.body_state.world_yaw = world_yaw;
+        self.body_state.world_position = world_position;
+    }
+
     pub fn reset(&mut self) {
         self.phase_gen.reset();
         self.body_state.reset();
