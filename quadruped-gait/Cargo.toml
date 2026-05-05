@@ -6,8 +6,9 @@ description = "Quadruped gait generation library (CHAMP-equivalent), built on mi
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+log = "0.4"
 nalgebra = "0.34.2"
-misarta = { path = "../misarta" }
+misarta = { path = "../misarta", features = ["clarabel"] }
 serde = { version = "1.0", features = ["derive"], optional = true }
 # Convex MPC backend: clarabel solves the SRBD QP that
 # `mpc_controller::SrbdMpc` builds each tick (Di Carlo et al. 2018).

@@ -62,6 +62,7 @@ pub mod mpc_controller;
 pub mod phase;
 pub mod srbd_mpc;
 pub mod swing_traj;
+pub mod wbc;
 
 pub use body_state::BodyState;
 pub use config::{
