@@ -127,7 +127,17 @@ impl Default for SrbdMpcConfig {
                 // g
                 0.0,
             ],
-            r_diag: 1e-6,
+            // Input cost. Di Carlo 2018 §V uses 1e-6 for Cheetah-3,
+            // but with smaller robots (~2.4 kg namiashi) the
+            // dynamics constraint has a wide null space, so an
+            // essentially-zero r_diag lets clarabel's interior point
+            // pick wildly different optima on consecutive solves
+            // (13 → 80 N at static stand). 1e-3 narrows the optimal
+            // set without distorting the cost balance — Cheetah-3
+            // hover test still passes (Σf_z ≈ m·g = 88 N within 15%)
+            // and namiashi static stand settles at GRF ≈ 25 N
+            // (m·g = 23.5 N expected).
+            r_diag: 1e-3,
         }
     }
 }
