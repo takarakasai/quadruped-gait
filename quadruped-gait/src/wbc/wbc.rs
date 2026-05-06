@@ -44,9 +44,15 @@ pub struct WbcInputs<'a> {
     /// Reference base acceleration from MPC (6: linear + angular,
     /// world frame).
     pub a_base_des: &'a DVector<f64>,
-    /// Reference Cartesian swing-foot acceleration in world frame
-    /// (length `3·nc`; stance entries are ignored).
-    pub a_swing_des: &'a DVector<f64>,
+    /// Joint-space swing-leg PD reference: `q̈_des[a]` per actuator,
+    /// length `na`. Active only where `swing_actuator_flag[a]` is
+    /// true; rows for stance / arm actuators are skipped. Computed
+    /// by the host as `kp·(q*−q) + kd·(q̇*−q̇)` using the same `q*`
+    /// that Position-PD tracks (the gait controller's IK output).
+    pub swing_q_ddot_des: &'a DVector<f64>,
+    /// Per-actuator swing flag (length `na`). True when this actuator
+    /// belongs to a leg currently in swing phase.
+    pub swing_actuator_flag: &'a [bool],
     /// MPC-predicted GRF (length `3·nc`, world frame).
     pub f_grf_des: &'a DVector<f64>,
     /// Static gravity-compensation torque per actuator (length `na`).
@@ -136,7 +142,7 @@ pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
     // up — heavily weighted so it dominates the priority-1 LSQ.
     //
     // swing_leg is intentionally low-weight (1.0) because the WBC's
-    // a_swing_des (Cartesian PD on body-frame foot targets) is a
+    // swing_q_ddot_des (joint-space PD per actuator) is a
     // different representation than the gait controller's joint-space
     // q* tracked by Position-PD. legged_control sources both from
     // OCS2's predicted joint state, but our SRBD MPC doesn't produce
@@ -181,10 +187,8 @@ pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
     let task_1 = base_accel::formulate(dims, inputs.a_base_des).weight(W_BASE_ACCEL)
         + swing_leg::formulate(
             dims,
-            inputs.j_contact,
-            inputs.dj_v,
-            inputs.a_swing_des,
-            inputs.contact_flag,
+            inputs.swing_q_ddot_des,
+            inputs.swing_actuator_flag,
         )
         .weight(W_SWING_LEG);
 
@@ -233,8 +237,9 @@ mod tests {
         let torque_max = DVector::from_vec(vec![100.0; 4]);
         // Base accel reference: hold still (zero accel).
         let a_base_des = DVector::zeros(6);
-        // Stance, no swing motion.
-        let a_swing_des = DVector::zeros(12);
+        // Stance, no swing motion → swing flag all false, q̈_des all 0.
+        let swing_q_ddot_des = DVector::zeros(4);
+        let swing_actuator_flag = [false; 4];
         // MPC says: distribute weight evenly across 4 feet.
         let mut f_grf_des = DVector::zeros(12);
         for i in 0..4 {
@@ -256,7 +261,8 @@ mod tests {
             friction_mu: 0.5,
             torque_max: &torque_max,
             a_base_des: &a_base_des,
-            a_swing_des: &a_swing_des,
+            swing_q_ddot_des: &swing_q_ddot_des,
+            swing_actuator_flag: &swing_actuator_flag,
             f_grf_des: &f_grf_des,
             tau_gravity: &tau_gravity,
         };

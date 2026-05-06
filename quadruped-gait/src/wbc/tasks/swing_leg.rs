@@ -1,66 +1,73 @@
-//! Swing-leg PD tracking task.
+//! Joint-space swing-leg PD tracking task.
 //!
-//! Soft equality (priority 1, only for legs **not** in contact):
-//!
-//! ```text
-//! a_foot_world = a_swing_des
-//! ```
-//!
-//! where the desired swing-foot acceleration comes from a Cartesian
-//! PD on the planned swing trajectory (computed by the host before
-//! calling the WBC):
+//! Soft equality (priority 1, only for actuators belonging to legs
+//! that are **not** in contact):
 //!
 //! ```text
-//! a_swing_des = K_p · (p_des − p_meas)  +  K_d · (v_des − v_meas)
+//! q̈[6 + a]  =  q̈_des_swing[a]
 //! ```
 //!
-//! Using the same kinematic identity as
-//! [`super::no_contact_motion`] (`a_foot = J·q̈ + J̇·q̇`):
+//! where `q̈_des_swing[a] = K_p · (q*[a] − q[a]) + K_d · (q̇*[a] − q̇[a])`
+//! is the joint-space PD computed by the host before calling the WBC,
+//! using the **same `q*` that Position-PD tracks** (the gait
+//! controller's IK output of the swing trajectory).
 //!
-//! ```text
-//! J_foot · q̈ = a_swing_des − J̇·q̇
-//! ```
+//! ## Why joint-space rather than Cartesian
 //!
-//! Stance feet are skipped (their stance constraint is in
+//! `legged_control`'s WBC sources both the swing-leg target and the
+//! Position-PD reference from OCS2's predicted joint state, so the
+//! two paths are intrinsically consistent. articara's SRBD MPC only
+//! emits base + GRF — no joint-level reference — and the gait
+//! controller produces a Cartesian foot trajectory + an IK-derived
+//! `q*`. Computing the WBC swing target from the Cartesian path
+//! (forward kinematics + a Cartesian PD) introduces a parallel
+//! representation that doesn't quite agree with what Position-PD is
+//! tracking; the resulting torque conflict was empirically
+//! observed to drag the body **backward** under a forward command
+//! (see [`tests/wbc_walk.rs`]'s `wbc_forward_command_advances_body`).
+//!
+//! Tracking `q*` directly in joint space makes the WBC's swing
+//! reference identical to Position-PD's reference, so the two
+//! cooperate instead of fighting.
+//!
+//! Stance feet are skipped (the stance constraint lives in
 //! `no_contact_motion` at priority 0).
 
 use nalgebra::{DMatrix, DVector};
 
 use super::super::{Task, WbcDims};
 
-/// `a_swing_des` is a stacked `(3·nc)`-vector: per-foot Cartesian
-/// acceleration target in the world frame. Entries for stance feet
-/// are ignored (those rows are skipped in the output Task).
+/// Build the joint-space swing-leg tracking task.
+///
+/// `swing_q_ddot_des` has length `na` (one entry per actuator). Only
+/// rows where `swing_actuator_flag[i]` is true contribute — others
+/// are skipped. The flag is true for actuators whose leg is currently
+/// in **swing**; the host sets this from
+/// [`crate::ControllerOutput`]'s per-leg `phase.is_stance` together
+/// with the actuator-to-leg mapping.
 pub fn formulate(
     dims: WbcDims,
-    j_contact: &DMatrix<f64>,
-    dj_v: &DVector<f64>,
-    a_swing_des: &DVector<f64>,
-    contact_flag: [bool; 4],
+    swing_q_ddot_des: &DVector<f64>,
+    swing_actuator_flag: &[bool],
 ) -> Task {
-    debug_assert_eq!(j_contact.shape(), (3 * dims.nc, dims.nv));
-    debug_assert_eq!(dj_v.len(), 3 * dims.nc);
-    debug_assert_eq!(a_swing_des.len(), 3 * dims.nc);
+    debug_assert_eq!(swing_q_ddot_des.len(), dims.na, "length must be na");
+    debug_assert_eq!(swing_actuator_flag.len(), dims.na, "length must be na");
 
-    let n_swing = dims.nc - contact_flag.iter().filter(|&&b| b).count();
+    let n_swing = swing_actuator_flag.iter().filter(|&&b| b).count();
     let n = dims.n_decision();
-
-    let mut a = DMatrix::zeros(3 * n_swing, n);
-    let mut b = DVector::zeros(3 * n_swing);
+    let mut a = DMatrix::zeros(n_swing, n);
+    let mut b = DVector::zeros(n_swing);
     let mut row = 0;
-    for i in 0..dims.nc {
-        if contact_flag[i] {
+    for i in 0..dims.na {
+        if !swing_actuator_flag[i] {
             continue;
         }
-        let j_block = j_contact.view((3 * i, 0), (3, dims.nv));
-        a.view_mut((row, dims.q_offset()), (3, dims.nv))
-            .copy_from(&j_block);
-        for k in 0..3 {
-            b[row + k] = a_swing_des[3 * i + k] - dj_v[3 * i + k];
-        }
-        row += 3;
+        // q̈ for actuated joint i lives at decision-vector index
+        // `q_offset + 6 + i` (the 6 base-DoF entries come first).
+        a[(row, dims.q_offset() + 6 + i)] = 1.0;
+        b[row] = swing_q_ddot_des[i];
+        row += 1;
     }
-
     Task::equality(a, b)
 }
 
@@ -71,35 +78,40 @@ mod tests {
     #[test]
     fn empty_when_all_stance() {
         let dims = WbcDims { nv: 18, nc: 4, na: 12 };
-        let j = DMatrix::zeros(12, 18);
-        let djv = DVector::zeros(12);
-        let a_des = DVector::zeros(12);
-        let task = formulate(dims, &j, &djv, &a_des, [true; 4]);
+        let q_dd_des = DVector::zeros(12);
+        let task = formulate(dims, &q_dd_des, &[false; 12]);
         assert_eq!(task.n_eq(), 0);
     }
 
+    /// One actuator marked swing → one equality row picking that
+    /// actuator's q̈ = q_dd_des[i] (with the right `q_offset + 6 + i`
+    /// column index).
     #[test]
-    fn one_swing_picks_target_minus_dj_v() {
-        let dims = WbcDims { nv: 6, nc: 4, na: 0 };
-        let mut j = DMatrix::zeros(12, 6);
-        for r in 3..6 {
-            for c in 0..6 {
-                j[(r, c)] = ((r + 1) * 100 + c) as f64;
-            }
+    fn one_swing_picks_actuator_row() {
+        let dims = WbcDims { nv: 9, nc: 4, na: 3 };
+        let q_dd_des = DVector::from_vec(vec![1.0, 2.0, 3.0]);
+        let task = formulate(dims, &q_dd_des, &[false, true, false]);
+        assert_eq!(task.n_eq(), 1);
+        // The single row picks q̈[q_offset + 6 + 1] (actuator 1).
+        for j in 0..dims.n_decision() {
+            let expected = if j == dims.q_offset() + 6 + 1 { 1.0 } else { 0.0 };
+            assert_eq!(task.a[(0, j)], expected);
         }
-        let mut djv = DVector::zeros(12);
-        djv[3] = 0.5;
-        djv[4] = 0.6;
-        djv[5] = 0.7;
-        let mut a_des = DVector::zeros(12);
-        a_des[3] = 1.0;
-        a_des[4] = 2.0;
-        a_des[5] = 3.0;
-        let task = formulate(dims, &j, &djv, &a_des, [true, false, true, true]);
-        assert_eq!(task.n_eq(), 3);
-        // b = a_des - dJ·v
-        assert_eq!(task.b[0], 0.5);
-        assert_eq!(task.b[1], 1.4);
-        assert_eq!(task.b[2], 2.3);
+        assert_eq!(task.b[0], 2.0);
+    }
+
+    /// Multiple swing actuators stack their rows in actuator order.
+    #[test]
+    fn multiple_swing_actuators_stack() {
+        let dims = WbcDims { nv: 9, nc: 4, na: 3 };
+        let q_dd_des = DVector::from_vec(vec![1.0, 2.0, 3.0]);
+        let task = formulate(dims, &q_dd_des, &[true, false, true]);
+        assert_eq!(task.n_eq(), 2);
+        // Row 0 picks actuator 0 → b = 1.0
+        assert_eq!(task.b[0], 1.0);
+        assert_eq!(task.a[(0, dims.q_offset() + 6 + 0)], 1.0);
+        // Row 1 picks actuator 2 → b = 3.0
+        assert_eq!(task.b[1], 3.0);
+        assert_eq!(task.a[(1, dims.q_offset() + 6 + 2)], 1.0);
     }
 }
