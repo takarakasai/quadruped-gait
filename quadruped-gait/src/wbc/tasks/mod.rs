@@ -15,3 +15,4 @@ pub mod no_contact_motion;
 pub mod base_accel;
 pub mod swing_leg;
 pub mod contact_force;
+pub mod tau_gravity;

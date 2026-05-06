@@ -15,7 +15,7 @@ use nalgebra::{DMatrix, DVector};
 
 use super::tasks::{
     base_accel, contact_force, floating_base_eom, friction_cone, no_contact_motion,
-    swing_leg, torque_limits,
+    swing_leg, tau_gravity, torque_limits,
 };
 use super::{HoQp, WbcDims};
 
@@ -48,6 +48,14 @@ pub struct WbcInputs<'a> {
     pub a_swing_des: &'a DVector<f64>,
     /// MPC-predicted GRF (length `3·nc`, world frame).
     pub f_grf_des: &'a DVector<f64>,
+    /// Static gravity-compensation torque per actuator (length `na`).
+    /// Used as a soft τ reference at the lowest priority so the QP
+    /// can't collapse to τ ≈ 0 — a failure mode observed when the
+    /// EoM constraint allowed (f balancing gravity, τ = 0) as a
+    /// feasible solution. Compute via `misarta::rnea::compute_gravity`
+    /// at the current `q` (with `q̇ = 0`, `q̈ = 0`) and project to
+    /// the actuated rows. Pass an all-zero vector to disable.
+    pub tau_gravity: &'a DVector<f64>,
 }
 
 /// Decoded WBC solution.
@@ -102,8 +110,17 @@ pub fn solve(inputs: &WbcInputs) -> WbcSolution {
             inputs.contact_flag,
         );
 
-    // ── Priority 2: GRF regularisation ─────────────────────────────
-    let task_2 = contact_force::formulate(dims, inputs.f_grf_des);
+    // ── Priority 2: GRF + τ_grav joint regularisation ─────────────
+    // contact_force tracks the MPC's predicted GRFs. tau_gravity
+    // anchors τ near static gravity-comp so the QP can't collapse to
+    // (f balances gravity, τ ≈ 0). Combining them at the SAME
+    // priority means the inner QP minimises both residuals jointly —
+    // putting tau_gravity at a separate, lower priority would have
+    // zero null space to work with after task 0+1+2 already constrain
+    // 49 / 44 dims (verified empirically: the priority-3 anchor had
+    // identical output to having no anchor).
+    let task_2 = contact_force::formulate(dims, inputs.f_grf_des)
+        + tau_gravity::formulate(dims, inputs.tau_gravity);
 
     let l0 = HoQp::new(task_0);
     let l1 = HoQp::new_with_higher(task_1, Some(&l0));
@@ -149,6 +166,11 @@ mod tests {
         for i in 0..4 {
             f_grf_des[3 * i + 2] = 5.0 * 9.81 / 4.0;
         }
+        // Smoke test: τ_grav reference is irrelevant for the symbolic
+        // hover scenario (decoupled M, J on a synthetic robot), so
+        // pass zero to verify the new task plumbing doesn't break
+        // the existing hover.
+        let tau_gravity = DVector::zeros(4);
 
         let inputs = WbcInputs {
             dims,
@@ -162,6 +184,7 @@ mod tests {
             a_base_des: &a_base_des,
             a_swing_des: &a_swing_des,
             f_grf_des: &f_grf_des,
+            tau_gravity: &tau_gravity,
         };
 
         let sol = solve(&inputs);
