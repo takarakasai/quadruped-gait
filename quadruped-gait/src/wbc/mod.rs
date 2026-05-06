@@ -33,6 +33,6 @@ pub mod tasks;
 mod wbc;
 
 pub use dims::WbcDims;
-pub use ho_qp::HoQp;
+pub use ho_qp::{HoQp, WarmStart};
 pub use task::Task;
-pub use wbc::{solve, WbcInputs, WbcSolution};
+pub use wbc::{solve, solve_warm, WbcInputs, WbcSolution, WbcWarmStart};

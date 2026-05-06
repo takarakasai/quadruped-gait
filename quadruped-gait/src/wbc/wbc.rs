@@ -13,6 +13,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
+use super::ho_qp::WarmStart;
 use super::tasks::{
     base_accel, contact_force, floating_base_eom, friction_cone, no_contact_motion,
     swing_leg, tau_gravity, torque_limits,
@@ -64,6 +65,10 @@ pub struct WbcSolution {
     pub q_ddot: DVector<f64>,
     pub f_grf: DVector<f64>,
     pub tau: DVector<f64>,
+    /// Full decision-space solution `x = [q̈; f_GRF; τ]` (length
+    /// `nv + 3·nc + na`). The host caches this and feeds it back as
+    /// the next tick's [`WbcWarmStart::x_prev`] to dampen QP jitter.
+    pub x_full: DVector<f64>,
 }
 
 impl WbcSolution {
@@ -72,18 +77,73 @@ impl WbcSolution {
             q_ddot: x.rows(dims.q_offset(), dims.nv).into_owned(),
             f_grf: x.rows(dims.f_offset(), 3 * dims.nc).into_owned(),
             tau: x.rows(dims.tau_offset(), dims.na).into_owned(),
+            x_full: x.clone(),
         }
     }
 }
 
-/// Assemble + solve one tick of the hierarchical WBC.
+/// Warm-start hint carried across WBC ticks.
 ///
-/// Returns `Some` when every level's inner QP converged. Returns
-/// `None` when a level fails (the host should fall back to a safe
-/// command — typically the previous tick's torques or pure
-/// position-PD without `τ_ff`).
+/// The host (typically [`crate::WbcPipeline`]) caches the previous
+/// tick's [`WbcSolution::x_full`] and feeds it back here. Each
+/// priority level then adds a `(prox_weight / 2)·‖v − v_target‖²` term
+/// where `v_target = prev.zᵀ · (x_prev − prev.x)` — the full-space
+/// anchor reprojected into that level's null-space basis. Anchors
+/// stay valid even when `prev.z` rotates between ticks (which it does:
+/// it's built from a `q`-dependent equality matrix).
+///
+/// Single shared `prox_weight` across levels — the per-level
+/// objectives are already on comparable (residual²) units and one knob
+/// is easier to tune.
+#[derive(Clone, Debug, Default)]
+pub struct WbcWarmStart<'a> {
+    /// Full-space anchor (length `nv + 3·nc + na`). `None` = cold.
+    pub x_prev: Option<&'a DVector<f64>>,
+    /// Proximal regularisation weight. 0.0 = no anchoring (cold).
+    /// Recommended starting value: ~1e-3.
+    pub prox_weight: f64,
+}
+
+/// Assemble + solve one tick of the hierarchical WBC (cold start).
+///
+/// Equivalent to [`solve_warm`] with [`WbcWarmStart::default()`].
 pub fn solve(inputs: &WbcInputs) -> WbcSolution {
+    solve_warm(inputs, &WbcWarmStart::default())
+}
+
+/// Like [`solve`] but with a [`WbcWarmStart`] hint to dampen tick-to-
+/// tick jitter.
+pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
     let dims = inputs.dims;
+
+    // ── Per-task LSQ weights (Phase 1.4) ──────────────────────────
+    // The HoQp inner cost ½‖A·v − b‖² stacks every task at the same
+    // priority into one matrix; without per-task weighting, every row
+    // gets equal vote regardless of physical importance. We bias each
+    // task explicitly so the most important physics wins when same-
+    // priority tasks conflict.
+    //
+    // Priority 0 (hard constraints): EoM and no_contact_motion are
+    // both physically mandatory. Boosting them strongly inside the
+    // priority-0 block makes the QP reach near-zero residual on
+    // those rows, leaving torque-limit / friction-cone slack to
+    // absorb only what's mathematically infeasible.
+    const W_FLOATING_BASE_EOM: f64 = 1000.0;
+    const W_NO_CONTACT_MOTION: f64 = 1000.0;
+    // Priority 1 (motion tracking): the gravity-feedforward term
+    // baked into a_base_des MUST win against the priority-2
+    // contact_force / tau_gravity references inside the priority-0
+    // null space. swing_leg at the same priority can lose to
+    // base_accel during stance contention because base_accel is what
+    // keeps the trunk up.
+    const W_BASE_ACCEL: f64 = 200.0;
+    const W_SWING_LEG: f64 = 1.0;
+    // Priority 2 (regularisation): contact_force tracks MPC's GRF
+    // prediction (a soft hint, dialled down so it doesn't fight the
+    // base_accel-driven gravity-comp resolution above), tau_gravity
+    // anchors τ near static gravity-comp.
+    const W_CONTACT_FORCE: f64 = 0.1;
+    const W_TAU_GRAVITY: f64 = 5.0;
 
     // ── Priority 0: hard constraints ───────────────────────────────
     let task_0 = floating_base_eom::formulate(
@@ -91,53 +151,40 @@ pub fn solve(inputs: &WbcInputs) -> WbcSolution {
         inputs.mass,
         inputs.nle,
         inputs.j_contact,
-    ) + torque_limits::formulate(dims, inputs.torque_max)
+    )
+    .weight(W_FLOATING_BASE_EOM)
+        + torque_limits::formulate(dims, inputs.torque_max)
         + friction_cone::formulate(dims, inputs.contact_flag, inputs.friction_mu)
         + no_contact_motion::formulate(
             dims,
             inputs.j_contact,
             inputs.dj_v,
             inputs.contact_flag,
-        );
+        )
+        .weight(W_NO_CONTACT_MOTION);
 
     // ── Priority 1: motion tracking ────────────────────────────────
-    let task_1 = base_accel::formulate(dims, inputs.a_base_des)
+    let task_1 = base_accel::formulate(dims, inputs.a_base_des).weight(W_BASE_ACCEL)
         + swing_leg::formulate(
             dims,
             inputs.j_contact,
             inputs.dj_v,
             inputs.a_swing_des,
             inputs.contact_flag,
-        );
+        )
+        .weight(W_SWING_LEG);
 
     // ── Priority 2: GRF + τ_grav joint regularisation ─────────────
-    // contact_force tracks the MPC's predicted GRFs. tau_gravity
-    // anchors τ near static gravity-comp so the QP can't collapse to
-    // (f balances gravity, τ ≈ 0). Combining them at the SAME
-    // priority means the inner QP minimises both residuals jointly —
-    // putting tau_gravity at a separate, lower priority would have
-    // zero null space to work with after task 0+1+2 already constrain
-    // 49 / 44 dims (verified empirically: the priority-3 anchor had
-    // identical output to having no anchor).
-    //
-    // `TAU_GRAVITY_WEIGHT > 1` emphasises τ tracking relative to GRF
-    // tracking. With equal weight both have 12 rows but contact_force's
-    // residual is dominated by the wide MPC-prediction range
-    // (15–60 N for namiashi) while τ_grav's residual is small but
-    // critically determines whether the legs hold up. 5× weighting
-    // leans the QP toward "joints support the body" when there's a
-    // conflict.
-    const TAU_GRAVITY_WEIGHT: f64 = 5.0;
-    let task_2 = contact_force::formulate(dims, inputs.f_grf_des)
-        + tau_gravity::formulate_weighted(
-            dims,
-            inputs.tau_gravity,
-            TAU_GRAVITY_WEIGHT,
-        );
+    let task_2 = contact_force::formulate(dims, inputs.f_grf_des).weight(W_CONTACT_FORCE)
+        + tau_gravity::formulate(dims, inputs.tau_gravity).weight(W_TAU_GRAVITY);
 
-    let l0 = HoQp::new(task_0);
-    let l1 = HoQp::new_with_higher(task_1, Some(&l0));
-    let l2 = HoQp::new_with_higher(task_2, Some(&l1));
+    let warm_inner = WarmStart {
+        x_prev: warm.x_prev,
+        prox_weight: warm.prox_weight,
+    };
+    let l0 = HoQp::new_with_higher_warm(task_0, None, &warm_inner);
+    let l1 = HoQp::new_with_higher_warm(task_1, Some(&l0), &warm_inner);
+    let l2 = HoQp::new_with_higher_warm(task_2, Some(&l1), &warm_inner);
 
     WbcSolution::from_x(l2.solution(), dims)
 }

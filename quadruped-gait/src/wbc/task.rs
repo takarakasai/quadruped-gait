@@ -76,6 +76,29 @@ impl Task {
     pub fn n_iq(&self) -> usize {
         self.d.nrows()
     }
+
+    /// Scale the equality residual at this task by `weight`. The HoQp
+    /// inner cost ½‖A·x − b‖² becomes ½ weight²·‖A·x − b‖², making
+    /// this task's residual `weight²` more expensive than an
+    /// unweighted one stacked at the same priority level.
+    ///
+    /// Use to bias which task "wins" inside a single priority level
+    /// when several conflict (e.g. base_accel vs swing_leg). Equivalent
+    /// to multiplying both `A` and `b` by `√weight` so the LSQ scales
+    /// quadratically.
+    ///
+    /// `weight` must be ≥ 0. Inequalities are not scaled — they are
+    /// already feasibility-only, and scaling their slack would just
+    /// renormalise the slack-cost block to no effect.
+    pub fn weight(mut self, weight: f64) -> Self {
+        assert!(weight >= 0.0, "Task::weight: weight must be ≥ 0");
+        let s = weight.sqrt();
+        if (s - 1.0).abs() > 1e-15 {
+            self.a *= s;
+            self.b *= s;
+        }
+        self
+    }
 }
 
 impl std::ops::Add for Task {
@@ -156,6 +179,47 @@ mod tests {
         assert_eq!(s.n_eq(), 2);
         assert_eq!(s.n_iq(), 1);
         assert_eq!(s.n_decision(), 3);
+    }
+
+    /// `weight(w)` scales `A` and `b` by `√w` so the LSQ cost
+    /// ½‖A·x − b‖² ends up multiplied by `w`.
+    #[test]
+    fn weight_scales_a_and_b_by_sqrt() {
+        let a = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        let b = DVector::from_vec(vec![5.0, 6.0]);
+        let t = Task::equality(a.clone(), b.clone()).weight(4.0);
+        // weight 4 → scale = 2.
+        for i in 0..a.nrows() {
+            for j in 0..a.ncols() {
+                assert!((t.a[(i, j)] - 2.0 * a[(i, j)]).abs() < 1e-15);
+            }
+            assert!((t.b[i] - 2.0 * b[i]).abs() < 1e-15);
+        }
+    }
+
+    /// `weight(1.0)` must be a no-op so call sites that don't want
+    /// scaling can chain it harmlessly.
+    #[test]
+    fn weight_one_is_a_noop() {
+        let a = DMatrix::from_row_slice(1, 2, &[1.5, -2.5]);
+        let b = DVector::from_vec(vec![3.5]);
+        let t = Task::equality(a.clone(), b.clone()).weight(1.0);
+        for j in 0..2 {
+            assert!((t.a[(0, j)] - a[(0, j)]).abs() < 1e-15);
+        }
+        assert!((t.b[0] - b[0]).abs() < 1e-15);
+    }
+
+    /// Inequality side is left untouched by `weight()`.
+    #[test]
+    fn weight_does_not_scale_inequalities() {
+        let d = DMatrix::from_row_slice(1, 2, &[1.0, 1.0]);
+        let f = DVector::from_vec(vec![10.0]);
+        let t = Task::inequality(d.clone(), f.clone()).weight(9.0);
+        // D, f unchanged.
+        assert!((t.d[(0, 0)] - 1.0).abs() < 1e-15);
+        assert!((t.d[(0, 1)] - 1.0).abs() < 1e-15);
+        assert!((t.f[0] - 10.0).abs() < 1e-15);
     }
 
     #[test]

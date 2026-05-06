@@ -58,17 +58,70 @@ struct LevelState {
 #[derive(Clone, Debug)]
 pub struct HoQp {
     state: LevelState,
+    /// The raw inner-QP decision vector `y = [v; w]` solved at this
+    /// level. Cached so the host can persist it between ticks and pass
+    /// it back as the next tick's warm-start anchor (see
+    /// [`WarmStart`]). Length = `n_v + n_slack` for this level.
+    y_solution: DVector<f64>,
+}
+
+/// Warm-start hint for [`HoQp::new_with_higher_warm`].
+///
+/// `x_prev` is a previous tick's **full decision-space** solution
+/// (length `n_decision_total`, the same as the current level's
+/// final `state.x`). The inner QP at this level is augmented with
+/// `(prox_weight / 2) · ‖v − v_target‖²` where
+/// `v_target = prev.zᵀ · (x_prev − prev.x)` — i.e. the projection
+/// of `(x_prev − prev.x)` into the current level's null-space basis.
+///
+/// Why project at all: at levels k>0 the inner variable `v` lives in
+/// the basis `prev.z`, which is rebuilt every tick from a `q`-dependent
+/// equality matrix. A naive per-level `y_prev` cache would compare
+/// coordinates across DIFFERENT bases — meaningless and observed
+/// empirically to AMPLIFY jitter rather than damp it. Persisting only
+/// the full-space `x_prev` and reprojecting fixes this: even when
+/// `prev.z` rotates between ticks, `v_target` follows.
+///
+/// Slack rows are anchored at 0 (a healthy WBC has slack ≈ 0 anyway),
+/// so the prox cost cleanly biases the equality residual without
+/// pinning slack to a stale value.
+///
+/// Pass `None` on the first tick (no history yet) or when
+/// `prox_weight ≤ 0` — the constructor silently falls back to a cold
+/// start in either case.
+#[derive(Clone, Debug)]
+pub struct WarmStart<'a> {
+    pub x_prev: Option<&'a DVector<f64>>,
+    pub prox_weight: f64,
+}
+
+impl<'a> WarmStart<'a> {
+    /// Cold start (no warm-start hint, no prox term).
+    pub const COLD: WarmStart<'static> = WarmStart {
+        x_prev: None,
+        prox_weight: 0.0,
+    };
 }
 
 impl HoQp {
     /// Solve a single-priority problem (no higher tasks).
     pub fn new(task: Task) -> Self {
-        Self::new_with_higher(task, None)
+        Self::new_with_higher_warm(task, None, &WarmStart::COLD)
     }
 
     /// Solve `task` at the priority level immediately below `higher`.
     /// `higher` may be `None` (this is the top level).
     pub fn new_with_higher(task: Task, higher: Option<&HoQp>) -> Self {
+        Self::new_with_higher_warm(task, higher, &WarmStart::COLD)
+    }
+
+    /// Like [`HoQp::new_with_higher`] but with a warm-start hint for
+    /// the inner QP. See [`WarmStart`].
+    pub fn new_with_higher_warm(
+        task: Task,
+        higher: Option<&HoQp>,
+        warm: &WarmStart<'_>,
+    ) -> Self {
         let (n_decision_total, prev) = match higher {
             Some(h) => (h.state.x.len(), h.state.clone()),
             None => {
@@ -180,8 +233,42 @@ impl HoQp {
         // Solve the inner QP. Use Clarabel via misarta — robust on the
         // moderately-sized (~30 var) problems each level produces, and
         // already a transitive dep through the SRBD MPC.
+        //
+        // Warm-start: project `warm.x_prev` from the full decision space
+        // into this level's basis: `v_target = prev.zᵀ · (x_prev − prev.x)`.
+        // misarta's solve_qp then adds a (ρ/2)·‖y − y_target‖² term,
+        // anchoring the inner optimum toward `(v_target, 0_slack)`.
+        // Re-projecting every tick keeps the anchor valid even though
+        // `prev.z` is rebuilt from a `q`-dependent equality matrix.
+        let warm_y_owned: Option<DVector<f64>> =
+            if warm.prox_weight > 0.0 && n_y > 0 {
+                warm.x_prev.and_then(|x_prev| {
+                    if x_prev.len() != n_decision_total {
+                        return None;
+                    }
+                    let mut y = DVector::zeros(n_y);
+                    if n_v > 0 {
+                        let delta = x_prev - &prev.x;
+                        let v_target = prev.z.transpose() * delta;
+                        for i in 0..n_v {
+                            y[i] = v_target[i];
+                        }
+                    }
+                    // Slack rows stay at 0 — a converged WBC has slack ≈ 0
+                    // and we don't want to anchor toward a transient
+                    // violation from the previous tick.
+                    Some(y)
+                })
+            } else {
+                None
+            };
         let cfg = QpConfig {
             solver: QpSolver::Clarabel,
+            prox_weight: if warm_y_owned.is_some() {
+                warm.prox_weight
+            } else {
+                0.0
+            },
             ..Default::default()
         };
         let qp_a_iq = (m_total > 0).then(|| d_total.clone());
@@ -193,7 +280,7 @@ impl HoQp {
             None,
             qp_a_iq.as_ref(),
             qp_b_iq.as_ref(),
-            None,
+            warm_y_owned.as_ref(),
             &cfg,
         );
         if !matches!(sol.status, QpStatus::Optimal) {
@@ -207,12 +294,16 @@ impl HoQp {
         // Extract `v` and `w` from the solver result. If the QP failed
         // we still return `state.x = prev.x` (no progress) so the
         // overall WBC degrades gracefully rather than panicking.
-        let (v_step, slack_curr) = if matches!(sol.status, QpStatus::Optimal) {
+        let (v_step, slack_curr, y_full) = if matches!(sol.status, QpStatus::Optimal) {
             let v = sol.x.rows(0, n_v).into_owned();
             let w = sol.x.rows(n_v, n_slack).into_owned();
-            (v, w)
+            (v, w, sol.x.clone())
         } else {
-            (DVector::zeros(n_v), DVector::zeros(n_slack))
+            (
+                DVector::zeros(n_v),
+                DVector::zeros(n_slack),
+                DVector::zeros(n_y),
+            )
         };
 
         // Update cumulative solution: x_k = x_{k-1} + Z_{k-1} · v.
@@ -247,6 +338,7 @@ impl HoQp {
                 stacked_f,
                 stacked_slack,
             },
+            y_solution: y_full,
         }
     }
 
@@ -258,6 +350,14 @@ impl HoQp {
     /// Null-space basis after all levels (for diagnostic / chaining).
     pub fn null_space(&self) -> &DMatrix<f64> {
         &self.state.z
+    }
+
+    /// Inner-QP decision vector `y = [v; w]` solved at this level.
+    /// Caller passes this back to the **same** level on the next tick
+    /// (via [`WarmStart::y_prev`]) to anchor the optimum and dampen
+    /// jitter.
+    pub fn y_solution(&self) -> &DVector<f64> {
+        &self.y_solution
     }
 }
 
@@ -413,6 +513,66 @@ mod tests {
             "x[0] = {} should be ≤ 1 (hard ineq)",
             l1.solution()[0],
         );
+    }
+
+    /// Warm-start: a single-priority QP with a wide null space (rank-
+    /// deficient task) should prefer solutions close to `x_prev` when
+    /// a positive `prox_weight` is supplied.
+    #[test]
+    fn warm_start_anchors_solution_in_null_space() {
+        // Task with a rank-1 equality on 3 variables: `x[0] + x[1] = 2`.
+        // Solutions form the 2-D plane (1-α, 1+α, anything). Without
+        // warm-start the lowest-norm solution has x[2] = 0; with warm-
+        // start anchored at (1, 1, 5) the optimum should snap to that.
+        let a = DMatrix::from_row_slice(1, 3, &[1.0, 1.0, 0.0]);
+        let b = DVector::from_vec(vec![2.0]);
+        let task = || Task::equality(a.clone(), b.clone());
+
+        // Cold: minimum-norm solution sits near (1, 1, 0).
+        let cold = HoQp::new(task());
+        assert_relative_eq!(cold.solution()[0], 1.0, epsilon = 1e-4);
+        assert_relative_eq!(cold.solution()[1], 1.0, epsilon = 1e-4);
+        assert_relative_eq!(cold.solution()[2], 0.0, epsilon = 1e-4);
+
+        // Warm-anchored at (1, 1, 5): equality satisfied, x[2] free →
+        // pulled to 5.
+        let x_prev = DVector::from_vec(vec![1.0, 1.0, 5.0]);
+        let warm = WarmStart {
+            x_prev: Some(&x_prev),
+            prox_weight: 1.0, // strong: we want a measurable shift
+        };
+        let warm_sol = HoQp::new_with_higher_warm(task(), None, &warm);
+        // Equality is hard at this priority — must still be satisfied.
+        assert_relative_eq!(
+            warm_sol.solution()[0] + warm_sol.solution()[1],
+            2.0,
+            epsilon = 1e-4,
+        );
+        // x[2] (orthogonal to the equality row) follows the anchor.
+        assert_relative_eq!(warm_sol.solution()[2], 5.0, epsilon = 1e-2);
+    }
+
+    /// Warm-start with `prox_weight = 0` must produce identical results
+    /// to a cold start (backward compat).
+    #[test]
+    fn warm_start_zero_prox_is_a_noop() {
+        let a = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let b = DVector::from_vec(vec![3.0, 4.0]);
+        let cold = HoQp::new(Task::equality(a.clone(), b.clone()));
+        let x_prev = DVector::from_vec(vec![100.0, 100.0]); // far anchor
+        let warm = WarmStart {
+            x_prev: Some(&x_prev),
+            prox_weight: 0.0,
+        };
+        let warm_sol =
+            HoQp::new_with_higher_warm(Task::equality(a, b), None, &warm);
+        for i in 0..2 {
+            assert_relative_eq!(
+                cold.solution()[i],
+                warm_sol.solution()[i],
+                epsilon = 1e-6,
+            );
+        }
     }
 
     /// Lower-priority task that's compatible with the higher one is
