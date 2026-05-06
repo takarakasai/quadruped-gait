@@ -112,24 +112,20 @@ pub struct MpcGaitController {
     /// the forces are visualised but not commanded. Phase 4 will hook
     /// them into a torque-control chain.
     srbd_mpc: SrbdMpc,
-    /// Last MPC solution. Populated when the MPC re-solves; retained
-    /// between solves so the viewport keeps drawing arrows and the WBC
-    /// layer keeps emitting the same τ_ff between solves.
+    /// Last MPC solution (raw QP output). Populated when the MPC
+    /// re-solves; retained between solves so the viewport keeps
+    /// drawing arrows and the WBC layer keeps emitting the same τ_ff
+    /// between solves.
     ///
-    /// **GRFs are EMA-smoothed** before being stored here (see
-    /// [`Self::grf_smoothing_alpha`]). The SRBD QP cost has a tiny
-    /// `r_diag = 1e-6` on input magnitude, which leaves a wide
-    /// optimal set; clarabel's interior-point method picks slightly
-    /// different optima on consecutive solves, producing visible
-    /// jitter (e.g. 13 → 68 → 47 N at static stand for namiashi
-    /// where m·g ≈ 23 N expected). Smoothing the OUTPUT in time
-    /// damps this without changing the QP formulation.
+    /// **No smoothing here.** The earlier design EMA-smoothed
+    /// `grfs_first_step` to damp clarabel's tick-to-tick interior-
+    /// point jitter, but that delayed the τ_ff response in the
+    /// position-PD path (`stance_grf_torques`) enough to break the
+    /// `gait_walk_stability::mpc_walks_stable` test (trunk fell to
+    /// 0.09 m). Smoothing now lives in `WbcPipeline` (host side),
+    /// where it can be applied to the WBC's reference without
+    /// affecting the τ_ff feedforward used by Position-PD modes.
     last_mpc_solution: Option<MpcSolution>,
-    /// EMA factor applied to `last_mpc_solution.grfs_first_step` on
-    /// each new solve: `f_smoothed = α·f_new + (1-α)·f_prev`. Default
-    /// 0.3 → ~3-solve smoothing window (≈ 90 ms at default 30 ms ZOH).
-    /// Set to 1.0 to disable smoothing (raw QP output).
-    grf_smoothing_alpha: f64,
     /// Time accumulator (seconds) since the last MPC solve. We re-solve
     /// at most once per `dt_per_step` (default 30 ms) — physics ticks at
     /// ~2 ms would otherwise re-solve 15× per MPC step, paying the QP
@@ -157,7 +153,6 @@ impl MpcGaitController {
             omega_observed_world: Vector3::zeros(),
             srbd_mpc: SrbdMpc::new(SrbdMpcConfig::default()),
             last_mpc_solution: None,
-            grf_smoothing_alpha: 0.3,
             mpc_solve_accumulator_s: f64::INFINITY,
         }
     }
@@ -294,16 +289,6 @@ impl MpcGaitController {
         self.k_capture = k.max(0.0);
     }
 
-    /// EMA blending factor for the first-step GRF that the WBC
-    /// consumes (see field doc on `last_mpc_solution`). 1.0 = no
-    /// smoothing (raw QP output), 0.0 = freeze on the first solve.
-    /// Default 0.3 ≈ 3-solve window. Clamped to [0, 1].
-    pub fn set_grf_smoothing_alpha(&mut self, alpha: f64) {
-        self.grf_smoothing_alpha = alpha.clamp(0.0, 1.0);
-    }
-    pub fn grf_smoothing_alpha(&self) -> f64 {
-        self.grf_smoothing_alpha
-    }
 
     /// Feed observed body linear and angular velocity (both in world
     /// frame). Called by the host every sim tick from MuJoCo / state
@@ -409,30 +394,7 @@ impl MpcGaitController {
         let dt_per_step = self.srbd_mpc.config().dt_per_step;
         self.mpc_solve_accumulator_s += dt;
         if self.mpc_solve_accumulator_s >= dt_per_step {
-            let raw = self.solve_srbd_mpc(&output);
-            // Temporal EMA on `grfs_first_step` to damp the QP's
-            // interior-point jitter (see field doc on
-            // `last_mpc_solution`). Only applied to the value the
-            // host actually consumes (`grfs_first_step`); the full
-            // horizon (`grfs_all_steps`) is kept raw for plotting.
-            let alpha = self.grf_smoothing_alpha;
-            let smoothed_first = match self.last_mpc_solution.as_ref() {
-                Some(prev) if raw.solved && alpha < 1.0 => {
-                    let mut out = [Vector3::zeros(); 4];
-                    for slot in 0..4 {
-                        out[slot] = alpha * raw.grfs_first_step[slot]
-                            + (1.0 - alpha) * prev.grfs_first_step[slot];
-                    }
-                    out
-                }
-                _ => raw.grfs_first_step,
-            };
-            self.last_mpc_solution = Some(MpcSolution {
-                grfs_first_step: smoothed_first,
-                grfs_all_steps: raw.grfs_all_steps,
-                objective: raw.objective,
-                solved: raw.solved,
-            });
+            self.last_mpc_solution = Some(self.solve_srbd_mpc(&output));
             self.mpc_solve_accumulator_s = 0.0;
         }
 
