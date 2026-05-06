@@ -244,6 +244,73 @@ pub struct MpcSolution {
     pub solved: bool,
 }
 
+/// SRBD physics: predict the floating-base linear and angular
+/// acceleration **the MPC's GRFs would produce** at the current state.
+///
+/// Mirrors `legged_control`'s `formulateBaseAccelTask`, which derives
+/// `a_base_des` from the OCS2 NMPC's centroidal momentum rate via
+/// `A_base⁻¹ · momentum_rate`. We don't have OCS2's centroidal model
+/// here, but for a Single Rigid Body the equivalent reduces to the
+/// SRBD's own continuous dynamics:
+///
+/// ```text
+/// p̈_world = (Σ f_GRF_i) / m  +  g_world          (Newton)
+/// α_world = I_world⁻¹ · (Σ (r_i − p_body) × f_GRF_i  −  ω × (I_world · ω))
+/// ```
+///
+/// The result is the WBC's `a_base_des` reference: feeding it directly
+/// (in place of a hand-tuned PD on body velocity) makes the WBC track
+/// **the MPC's own predicted body motion**, eliminating the systemic
+/// MPC-vs-WBC mismatch that otherwise excites the floating base into
+/// joint-velocity divergence.
+///
+/// Returns `(a_lin_world, alpha_world)` — both world frame. The host
+/// rotates them into the WBC's body-frame motion subspace.
+///
+/// Approximations:
+/// - `I_world ≈ R(rpy) · diag(I_body) · R(rpy)ᵀ` (full Euler rotation,
+///   matching the body's actual orientation rather than SRBD's
+///   yaw-only linearisation, since the WBC sees the true tilt).
+/// - Foot positions are taken in world frame (caller passes them).
+pub fn predicted_base_accel_world(
+    cfg: &SrbdMpcConfig,
+    state: &SrbdState,
+    grfs: &[Vector3<f64>; 4],
+    foot_positions_world: &[Vector3<f64>; 4],
+) -> (Vector3<f64>, Vector3<f64>) {
+    use nalgebra::{Matrix3, Rotation3};
+    let g_world = Vector3::new(0.0, 0.0, -9.81);
+
+    // Linear: p̈ = Σf/m + g (g points down → static stand has Σf = m·g·ẑ → p̈ = 0).
+    let total_f: Vector3<f64> = grfs.iter().sum();
+    let a_lin_world = total_f / cfg.mass_kg.max(1e-9) + g_world;
+
+    // Angular: α = I_world⁻¹ · (Σ r_i × f_i  −  ω × (I·ω))
+    let r_world_body = Rotation3::from_euler_angles(
+        state.orientation_rpy.x,
+        state.orientation_rpy.y,
+        state.orientation_rpy.z,
+    );
+    let i_body = Matrix3::from_diagonal(&cfg.inertia_diag_body);
+    let i_world = r_world_body.matrix() * i_body * r_world_body.matrix().transpose();
+    // SrbdState stores ω in body frame; the τ × f cross-product needs world frame.
+    let omega_world = r_world_body * state.angular_velocity;
+    let body_pos = state.position;
+    let mut tau_world = Vector3::zeros();
+    for slot in 0..4 {
+        let r = foot_positions_world[slot] - body_pos;
+        tau_world += r.cross(&grfs[slot]);
+    }
+    let i_omega = i_world * omega_world;
+    let coriolis = omega_world.cross(&i_omega);
+    let alpha_world = i_world
+        .try_inverse()
+        .unwrap_or_else(Matrix3::identity)
+        * (tau_world - coriolis);
+
+    (a_lin_world, alpha_world)
+}
+
 /// Stateful MPC solver. Holds the cached `SrbdMpcConfig` so the host
 /// can rebuild the QP each tick without re-allocating tuning data.
 #[derive(Clone, Debug)]
@@ -737,6 +804,72 @@ mod tests {
             Vector3::new(-0.18, 0.10, -0.30),
             Vector3::new(-0.18, -0.10, -0.30),
         ]
+    }
+
+    /// Static stand: GRFs that exactly balance gravity (Σf_z = m·g, all
+    /// horizontal components zero) must yield zero predicted base
+    /// acceleration. This is the key sanity check for
+    /// `predicted_base_accel_world`: the function is the heart of the
+    /// MPC→WBC reference pipeline and must agree with Newton's laws on
+    /// the trivial case before we trust the rest.
+    #[test]
+    fn predicted_base_accel_zero_under_balanced_grfs() {
+        let cfg = SrbdMpcConfig::default();
+        let mut s = SrbdState::default();
+        s.position.z = 0.30;
+        let feet_world = [
+            Vector3::new(0.18, 0.10, 0.0),
+            Vector3::new(0.18, -0.10, 0.0),
+            Vector3::new(-0.18, 0.10, 0.0),
+            Vector3::new(-0.18, -0.10, 0.0),
+        ];
+        // Balance gravity exactly: each foot pushes up m·g/4.
+        let f_each = cfg.mass_kg * 9.81 / 4.0;
+        let grfs = [Vector3::new(0.0, 0.0, f_each); 4];
+
+        let (a_lin, a_ang) = predicted_base_accel_world(&cfg, &s, &grfs, &feet_world);
+        for i in 0..3 {
+            assert!(a_lin[i].abs() < 1e-9, "a_lin[{i}] = {} should be ≈0", a_lin[i]);
+            assert!(a_ang[i].abs() < 1e-9, "a_ang[{i}] = {} should be ≈0", a_ang[i]);
+        }
+    }
+
+    /// Asymmetric vertical load: front feet carry double the rear feet.
+    /// Linear z-acceleration must still match Σf/m + g, and the
+    /// resulting torque about the body y-axis (pitch) must be non-zero
+    /// in the expected direction (front-up → nose-up pitch torque).
+    #[test]
+    fn predicted_base_accel_pitch_torque_sign() {
+        let cfg = SrbdMpcConfig::default();
+        let s = SrbdState {
+            position: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        let feet_world = [
+            Vector3::new(0.18, 0.10, 0.0),  // FL (front)
+            Vector3::new(0.18, -0.10, 0.0), // FR (front)
+            Vector3::new(-0.18, 0.10, 0.0), // RL (rear)
+            Vector3::new(-0.18, -0.10, 0.0),// RR (rear)
+        ];
+        let f_total = cfg.mass_kg * 9.81;
+        let f_front = f_total * 2.0 / 6.0; // 2/6 each front
+        let f_rear = f_total * 1.0 / 6.0;  // 1/6 each rear
+        let grfs = [
+            Vector3::new(0.0, 0.0, f_front),
+            Vector3::new(0.0, 0.0, f_front),
+            Vector3::new(0.0, 0.0, f_rear),
+            Vector3::new(0.0, 0.0, f_rear),
+        ];
+
+        let (a_lin, a_ang) = predicted_base_accel_world(&cfg, &s, &grfs, &feet_world);
+        // Total Σf_z = 2·f_front + 2·f_rear = 2·(2/6 + 1/6)·m·g = m·g → a_lin_z = 0.
+        assert!(a_lin.z.abs() < 1e-9, "a_lin_z = {} should be ≈0", a_lin.z);
+        // Torque about body y-axis: front feet pull body forward-up, rear
+        // pull less. Cross product r × f for a front foot at +x with f_z > 0
+        // yields τ in -y direction; rear at -x yields +y direction. Net is
+        // (f_rear − f_front) summed pairs → negative y (nose-down pitch
+        // torque) because front feet push harder. So α_y < 0.
+        assert!(a_ang.y < -1e-3, "α_y = {} should be < 0 (nose-down pitch)", a_ang.y);
     }
 
     /// Stationary all-stance hover: total z-force across all four feet

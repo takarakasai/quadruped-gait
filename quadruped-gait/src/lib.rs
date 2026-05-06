@@ -79,7 +79,7 @@ pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolu
 pub use mpc_controller::MpcGaitController;
 pub use phase::{PhaseGenerator, PhaseState};
 pub use srbd_mpc::{
-    ContactSchedule, FootOffsets, MpcSolution, ReferenceTrajectory, SrbdMpc,
-    SrbdMpcConfig, SrbdState,
+    predicted_base_accel_world, ContactSchedule, FootOffsets, MpcSolution,
+    ReferenceTrajectory, SrbdMpc, SrbdMpcConfig, SrbdState,
 };
 pub use swing_traj::{stance_position, swing_position};
