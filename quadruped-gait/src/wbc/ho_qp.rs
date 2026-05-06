@@ -109,6 +109,14 @@ impl HoQp {
             let mut top = a_z.transpose() * &a_z;
             // Tiny ridge on the equality block so a degenerate Hessian
             // doesn't break the inner QP. Matches legged_control's 1e-12.
+            //
+            // NOTE: tested bumping this to 1e-4 to suppress tick-to-tick
+            // QP jitter (min-norm v preference). It works mathematically
+            // but penalises ALL variables equally — including τ — so the
+            // solver picks (f balancing gravity, τ = 0) and the joint
+            // torque collapses. The right fix is per-variable-type
+            // weighting (cheap reg on q̈/f, none on τ) or warm-start;
+            // both are TODO at the host wiring level.
             for i in 0..n_v {
                 top[(i, i)] += 1e-12;
             }
