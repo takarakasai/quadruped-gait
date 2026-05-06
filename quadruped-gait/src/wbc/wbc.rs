@@ -130,19 +130,33 @@ pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
     // absorb only what's mathematically infeasible.
     const W_FLOATING_BASE_EOM: f64 = 1000.0;
     const W_NO_CONTACT_MOTION: f64 = 1000.0;
-    // Priority 1 (motion tracking): the gravity-feedforward term
-    // baked into a_base_des MUST win against the priority-2
-    // contact_force / tau_gravity references inside the priority-0
-    // null space. swing_leg at the same priority can lose to
-    // base_accel during stance contention because base_accel is what
-    // keeps the trunk up.
+    // Priority 1 (motion tracking): the base-accel reference comes
+    // from `predicted_base_accel_world` (the MPC's GRF run through
+    // SRBD physics) and is the primary mechanism keeping the trunk
+    // up — heavily weighted so it dominates the priority-1 LSQ.
+    //
+    // swing_leg is intentionally low-weight (1.0) because the WBC's
+    // a_swing_des (Cartesian PD on body-frame foot targets) is a
+    // different representation than the gait controller's joint-space
+    // q* tracked by Position-PD. legged_control sources both from
+    // OCS2's predicted joint state, but our SRBD MPC doesn't produce
+    // joint-level references, so Position-PD ends up driving the
+    // swing in joint space and WBC's swing_leg adds dynamic
+    // compensation in Cartesian space. Keep the weight modest so the
+    // two paths cooperate without one fighting the other; bumping
+    // either swing_leg to 0 or up to 100 both empirically degrade
+    // forward locomotion.
     const W_BASE_ACCEL: f64 = 200.0;
     const W_SWING_LEG: f64 = 1.0;
     // Priority 2 (regularisation): contact_force tracks MPC's GRF
-    // prediction (a soft hint, dialled down so it doesn't fight the
-    // base_accel-driven gravity-comp resolution above), tau_gravity
-    // anchors τ near static gravity-comp.
-    const W_CONTACT_FORCE: f64 = 0.1;
+    // prediction. Higher weight tightens the WBC's f_GRF to the MPC's
+    // predicted values, which matters during trot stance windows
+    // (~0.2 s) — if the WBC under-applies the predicted f_z the body
+    // drops a few mm per cycle and accumulates downward drift over
+    // the walking window. tau_gravity anchors τ near static gravity-
+    // comp so the τ block doesn't collapse to zero in degenerate
+    // null-space directions.
+    const W_CONTACT_FORCE: f64 = 1.0;
     const W_TAU_GRAVITY: f64 = 5.0;
 
     // ── Priority 0: hard constraints ───────────────────────────────
