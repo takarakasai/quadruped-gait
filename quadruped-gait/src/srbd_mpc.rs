@@ -237,6 +237,17 @@ pub struct MpcSolution {
     /// GRF for every leg at every horizon step. Useful for diagnostic
     /// plots; the full vector is what clarabel returned.
     pub grfs_all_steps: Vec<[Vector3<f64>; 4]>,
+    /// **Predicted body states** at every horizon step `k = 1..=n`
+    /// (i.e. step 0 is the *current* state, step 1 is one `dt_per_step`
+    /// in the future, …, step n is the end of the horizon).
+    ///
+    /// Computed from the closed-form propagation `x_{k+1} = A_k·x_k +
+    /// B_k·u_k` using the linearised dynamics + the QP-optimal `U`.
+    /// Used by [`crate::mpc_reference`] to plan joint-space references
+    /// (q*/q̇*) per horizon step — the missing piece that lets the
+    /// WBC swing_leg task share its target with Position-PD instead
+    /// of fighting it (the typical OCS2 NMPC role in legged_control).
+    pub predicted_body_states: Vec<SrbdState>,
     /// Solver-reported objective value at the optimum.
     pub objective: f64,
     /// Whether clarabel converged (otherwise `grfs_*` are best-effort
@@ -482,6 +493,9 @@ impl SrbdMpc {
                 return MpcSolution {
                     grfs_first_step: [Vector3::zeros(); 4],
                     grfs_all_steps: vec![[Vector3::zeros(); 4]; n],
+                    // Best-effort predicted state on solver failure:
+                    // hold current state for the entire horizon.
+                    predicted_body_states: vec![state_now; n],
                     objective: f64::NAN,
                     solved: false,
                 };
@@ -509,9 +523,42 @@ impl SrbdMpc {
             grfs_all_steps.push(g);
         }
 
+        // Decode predicted body states by propagating the SRBD
+        // dynamics with the QP-optimal U: X = A_x · x_0 + B_u · U.
+        // X is laid out [x_1; x_2; …; x_n] (each 13-dim).
+        let u_dvec = DVector::from_vec(u_opt.clone());
+        let x_horizon = &a_x * &x_now + &b_u * &u_dvec;
+        let mut predicted_body_states = Vec::with_capacity(n);
+        for k in 0..n {
+            let row0 = k * nx;
+            predicted_body_states.push(SrbdState {
+                orientation_rpy: Vector3::new(
+                    x_horizon[row0],
+                    x_horizon[row0 + 1],
+                    x_horizon[row0 + 2],
+                ),
+                position: Vector3::new(
+                    x_horizon[row0 + 3],
+                    x_horizon[row0 + 4],
+                    x_horizon[row0 + 5],
+                ),
+                angular_velocity: Vector3::new(
+                    x_horizon[row0 + 6],
+                    x_horizon[row0 + 7],
+                    x_horizon[row0 + 8],
+                ),
+                linear_velocity: Vector3::new(
+                    x_horizon[row0 + 9],
+                    x_horizon[row0 + 10],
+                    x_horizon[row0 + 11],
+                ),
+            });
+        }
+
         MpcSolution {
             grfs_first_step: grfs_all_steps[0],
             grfs_all_steps,
+            predicted_body_states,
             objective,
             solved,
         }

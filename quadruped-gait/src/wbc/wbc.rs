@@ -155,14 +155,15 @@ pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
     const W_BASE_ACCEL: f64 = 200.0;
     const W_SWING_LEG: f64 = 1.0;
     // Priority 2 (regularisation): contact_force tracks MPC's GRF
-    // prediction. Higher weight tightens the WBC's f_GRF to the MPC's
-    // predicted values, which matters during trot stance windows
-    // (~0.2 s) — if the WBC under-applies the predicted f_z the body
-    // drops a few mm per cycle and accumulates downward drift over
-    // the walking window. tau_gravity anchors τ near static gravity-
-    // comp so the τ block doesn't collapse to zero in degenerate
-    // null-space directions.
-    const W_CONTACT_FORCE: f64 = 1.0;
+    // prediction. Higher weight tightens WBC's f_GRF (and via the
+    // floating-base EoM constraint, the stance leg τ) to the MPC's
+    // predicted forces. Critical for trotting forward thrust: the
+    // MPC predicts a small +x component on the stance feet and the
+    // body's net x-translation depends on WBC carrying that thrust
+    // through to the joint torque. Empirically W=5 lets sol.f_grf
+    // reach ~80 % of MPC reference (vs ~45 % at W=1) which is enough
+    // for forward locomotion.
+    const W_CONTACT_FORCE: f64 = 5.0;
     const W_TAU_GRAVITY: f64 = 5.0;
 
     // ── Priority 0: hard constraints ───────────────────────────────
