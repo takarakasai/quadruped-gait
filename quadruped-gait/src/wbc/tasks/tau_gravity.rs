@@ -26,19 +26,41 @@ use nalgebra::{DMatrix, DVector};
 
 use super::super::{Task, WbcDims};
 
-/// Build the τ ≈ τ_grav equality task.
-pub fn formulate(dims: WbcDims, tau_gravity: &DVector<f64>) -> Task {
+/// Build the τ ≈ τ_grav equality task with row scaling.
+///
+/// `weight` controls how strongly the QP prefers τ ≈ τ_grav
+/// **relative to other tasks at the same priority level** (e.g.
+/// `contact_force` — both have 12 rows that compete for the residual
+/// budget). The cost contribution is `weight · ||τ − τ_grav||²` —
+/// internally we scale `(A, b)` by √weight so the same minimisation
+/// inside HoQp gives weighted least squares.
+///
+/// `weight = 1.0` is the un-scaled default. Bumping to 5–10 is a
+/// reasonable starting point on smaller robots where the
+/// contact_force task otherwise dominates and the QP allows τ to
+/// drift to zero.
+pub fn formulate_weighted(
+    dims: WbcDims,
+    tau_gravity: &DVector<f64>,
+    weight: f64,
+) -> Task {
     debug_assert_eq!(
         tau_gravity.len(),
         dims.na,
         "tau_gravity length must match na"
     );
-
+    let scale = weight.max(0.0).sqrt();
     let mut a = DMatrix::zeros(dims.na, dims.n_decision());
     for i in 0..dims.na {
-        a[(i, dims.tau_offset() + i)] = 1.0;
+        a[(i, dims.tau_offset() + i)] = scale;
     }
-    Task::equality(a, tau_gravity.clone())
+    let b = tau_gravity * scale;
+    Task::equality(a, b)
+}
+
+/// Convenience wrapper for the common case `weight = 1.0`.
+pub fn formulate(dims: WbcDims, tau_gravity: &DVector<f64>) -> Task {
+    formulate_weighted(dims, tau_gravity, 1.0)
 }
 
 #[cfg(test)]

@@ -119,8 +119,21 @@ pub fn solve(inputs: &WbcInputs) -> WbcSolution {
     // zero null space to work with after task 0+1+2 already constrain
     // 49 / 44 dims (verified empirically: the priority-3 anchor had
     // identical output to having no anchor).
+    //
+    // `TAU_GRAVITY_WEIGHT > 1` emphasises τ tracking relative to GRF
+    // tracking. With equal weight both have 12 rows but contact_force's
+    // residual is dominated by the wide MPC-prediction range
+    // (15–60 N for namiashi) while τ_grav's residual is small but
+    // critically determines whether the legs hold up. 5× weighting
+    // leans the QP toward "joints support the body" when there's a
+    // conflict.
+    const TAU_GRAVITY_WEIGHT: f64 = 5.0;
     let task_2 = contact_force::formulate(dims, inputs.f_grf_des)
-        + tau_gravity::formulate(dims, inputs.tau_gravity);
+        + tau_gravity::formulate_weighted(
+            dims,
+            inputs.tau_gravity,
+            TAU_GRAVITY_WEIGHT,
+        );
 
     let l0 = HoQp::new(task_0);
     let l1 = HoQp::new_with_higher(task_1, Some(&l0));
