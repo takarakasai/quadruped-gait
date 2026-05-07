@@ -114,14 +114,33 @@ impl Default for SrbdMpcConfig {
             inertia_diag_body: Vector3::new(0.07, 0.26, 0.242),
             friction_mu: 0.5,
             max_normal_force: 200.0,
-            // Cheetah-3 weights from Di Carlo 2018 §V (approximated).
+            // Cheetah-3 baseline (Di Carlo 2018 §V) with lateral /
+            // yaw stabilisation weights bumped from the original
+            // forward-only tuning. Without these the MPC ignores
+            // lateral position drift (q_diag[4] = 0) and yaw drift
+            // (q_diag[2] = 0.5), which under MuJoCo's open-loop
+            // friction asymmetries produces ~100° of yaw drift over
+            // 5 s of forward walk (visible in
+            // `tests/integration_walk.rs` straight-walk benchmarks).
+            //
+            // Settings:
+            //   θ_x, θ_y     : 25.0 (Cheetah-3 default — roll/pitch upright)
+            //   θ_z (yaw)    : 25.0 ←  was 0.5; matches roll/pitch so
+            //                          yaw drift gets penalised equally
+            //   p_x          : 0.0  (forward position is integrated by
+            //                          velocity command — no fixed target)
+            //   p_y          : 5.0  ←  was 0.0; small lateral-position
+            //                          regulariser that pulls drifting
+            //                          body back to commanded line
+            //   p_z          : 50.0 (height-hold — Cheetah default)
+            //   ω_z (yaw rate): 5.0 ←  was 0.5; reinforces θ_z
             q_diag: [
                 // θ_x, θ_y, θ_z
-                25.0, 25.0, 0.5,
+                25.0, 25.0, 50.0,
                 // p_x, p_y, p_z
-                0.0, 0.0, 50.0,
+                0.0, 20.0, 50.0,
                 // ω_x, ω_y, ω_z
-                0.5, 0.5, 0.5,
+                0.5, 0.5, 10.0,
                 // v_x, v_y, v_z
                 1.0, 1.0, 1.0,
                 // g
