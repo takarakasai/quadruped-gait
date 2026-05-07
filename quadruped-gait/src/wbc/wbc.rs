@@ -88,6 +88,60 @@ impl WbcSolution {
     }
 }
 
+/// Per-task LSQ weights applied inside the priority levels of the
+/// hierarchical QP. These default to the values empirically tuned
+/// for the namiashi quadruped and are exposed as a `pub` struct so
+/// tests / hosts can override individual entries to study how each
+/// task contributes to the final torque (= the P5a sign-flip
+/// diagnostic in `tests/integration_walk.rs`).
+///
+/// Setting any weight to `0.0` cleanly **disables** that task at the
+/// LSQ level; the priority-0 hard-equality structure of the HoQp
+/// guarantees the `floating_base_eom` and `no_contact_motion` tasks
+/// stay enforced through the null-space chain even if their LSQ
+/// weight is small (so they're safe to leave at default).
+#[derive(Clone, Copy, Debug)]
+pub struct WbcWeights {
+    /// Priority 0 — floating-base equation of motion. Weighted ≥ 100
+    /// so the EoM residual is driven near machine zero inside the
+    /// priority-0 LSQ; lower weights show as small but visible body
+    /// drift over long runs.
+    pub floating_base_eom: f64,
+    /// Priority 0 — stance feet must not slide / leave the ground
+    /// (`J_c · q̈ + J̇·v = 0`). Same scale as `floating_base_eom`.
+    pub no_contact_motion: f64,
+    /// Priority 1 — body acceleration tracks the MPC-predicted
+    /// `predicted_base_accel_world`. The dominant mechanism that
+    /// keeps the trunk upright + drives forward thrust.
+    pub base_accel: f64,
+    /// Priority 1 — joint-space PD on the swing legs (`q̈_swing =
+    /// kp·(q*−q) + kd·(q̇*−q̇)`). Low weight by default because
+    /// Position-PD already tracks `q*` at the actuator level; the
+    /// WBC's swing-leg term adds Cartesian compensation only.
+    pub swing_leg: f64,
+    /// Priority 2 — contact forces track the MPC's predicted GRFs.
+    /// Bumping this above ~1 lets the WBC tighten `sol.f_grf` to
+    /// the MPC reference (= forward thrust flows through to joint τ).
+    pub contact_force: f64,
+    /// Priority 2 — joint torques anchored toward the static
+    /// gravity-comp value. Stops degenerate `(τ ≈ 0, f balances g)`
+    /// solutions in the null space.
+    pub tau_gravity: f64,
+}
+
+impl Default for WbcWeights {
+    fn default() -> Self {
+        Self {
+            floating_base_eom: 1000.0,
+            no_contact_motion: 1000.0,
+            base_accel: 200.0,
+            swing_leg: 1.0,
+            contact_force: 5.0,
+            tau_gravity: 5.0,
+        }
+    }
+}
+
 /// Warm-start hint carried across WBC ticks.
 ///
 /// The host (typically [`crate::WbcPipeline`]) caches the previous
@@ -118,53 +172,20 @@ pub fn solve(inputs: &WbcInputs) -> WbcSolution {
 }
 
 /// Like [`solve`] but with a [`WbcWarmStart`] hint to dampen tick-to-
-/// tick jitter.
+/// tick jitter. Uses [`WbcWeights::default`] for per-task LSQ weights.
 pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
-    let dims = inputs.dims;
+    solve_warm_with_weights(inputs, warm, &WbcWeights::default())
+}
 
-    // ── Per-task LSQ weights (Phase 1.4) ──────────────────────────
-    // The HoQp inner cost ½‖A·v − b‖² stacks every task at the same
-    // priority into one matrix; without per-task weighting, every row
-    // gets equal vote regardless of physical importance. We bias each
-    // task explicitly so the most important physics wins when same-
-    // priority tasks conflict.
-    //
-    // Priority 0 (hard constraints): EoM and no_contact_motion are
-    // both physically mandatory. Boosting them strongly inside the
-    // priority-0 block makes the QP reach near-zero residual on
-    // those rows, leaving torque-limit / friction-cone slack to
-    // absorb only what's mathematically infeasible.
-    const W_FLOATING_BASE_EOM: f64 = 1000.0;
-    const W_NO_CONTACT_MOTION: f64 = 1000.0;
-    // Priority 1 (motion tracking): the base-accel reference comes
-    // from `predicted_base_accel_world` (the MPC's GRF run through
-    // SRBD physics) and is the primary mechanism keeping the trunk
-    // up — heavily weighted so it dominates the priority-1 LSQ.
-    //
-    // swing_leg is intentionally low-weight (1.0) because the WBC's
-    // swing_q_ddot_des (joint-space PD per actuator) is a
-    // different representation than the gait controller's joint-space
-    // q* tracked by Position-PD. legged_control sources both from
-    // OCS2's predicted joint state, but our SRBD MPC doesn't produce
-    // joint-level references, so Position-PD ends up driving the
-    // swing in joint space and WBC's swing_leg adds dynamic
-    // compensation in Cartesian space. Keep the weight modest so the
-    // two paths cooperate without one fighting the other; bumping
-    // either swing_leg to 0 or up to 100 both empirically degrade
-    // forward locomotion.
-    const W_BASE_ACCEL: f64 = 200.0;
-    const W_SWING_LEG: f64 = 1.0;
-    // Priority 2 (regularisation): contact_force tracks MPC's GRF
-    // prediction. Higher weight tightens WBC's f_GRF (and via the
-    // floating-base EoM constraint, the stance leg τ) to the MPC's
-    // predicted forces. Critical for trotting forward thrust: the
-    // MPC predicts a small +x component on the stance feet and the
-    // body's net x-translation depends on WBC carrying that thrust
-    // through to the joint torque. Empirically W=5 lets sol.f_grf
-    // reach ~80 % of MPC reference (vs ~45 % at W=1) which is enough
-    // for forward locomotion.
-    const W_CONTACT_FORCE: f64 = 5.0;
-    const W_TAU_GRAVITY: f64 = 5.0;
+/// Like [`solve_warm`] but the caller supplies per-task LSQ
+/// [`WbcWeights`]. Used by tests / diagnostic harnesses to study
+/// each task's contribution by zeroing it out.
+pub fn solve_warm_with_weights(
+    inputs: &WbcInputs,
+    warm: &WbcWarmStart<'_>,
+    w: &WbcWeights,
+) -> WbcSolution {
+    let dims = inputs.dims;
 
     // ── Priority 0: hard constraints ───────────────────────────────
     let task_0 = floating_base_eom::formulate(
@@ -173,7 +194,7 @@ pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
         inputs.nle,
         inputs.j_contact,
     )
-    .weight(W_FLOATING_BASE_EOM)
+    .weight(w.floating_base_eom)
         + torque_limits::formulate(dims, inputs.torque_max)
         + friction_cone::formulate(dims, inputs.contact_flag, inputs.friction_mu)
         + no_contact_motion::formulate(
@@ -182,20 +203,20 @@ pub fn solve_warm(inputs: &WbcInputs, warm: &WbcWarmStart<'_>) -> WbcSolution {
             inputs.dj_v,
             inputs.contact_flag,
         )
-        .weight(W_NO_CONTACT_MOTION);
+        .weight(w.no_contact_motion);
 
     // ── Priority 1: motion tracking ────────────────────────────────
-    let task_1 = base_accel::formulate(dims, inputs.a_base_des).weight(W_BASE_ACCEL)
+    let task_1 = base_accel::formulate(dims, inputs.a_base_des).weight(w.base_accel)
         + swing_leg::formulate(
             dims,
             inputs.swing_q_ddot_des,
             inputs.swing_actuator_flag,
         )
-        .weight(W_SWING_LEG);
+        .weight(w.swing_leg);
 
     // ── Priority 2: GRF + τ_grav joint regularisation ─────────────
-    let task_2 = contact_force::formulate(dims, inputs.f_grf_des).weight(W_CONTACT_FORCE)
-        + tau_gravity::formulate(dims, inputs.tau_gravity).weight(W_TAU_GRAVITY);
+    let task_2 = contact_force::formulate(dims, inputs.f_grf_des).weight(w.contact_force)
+        + tau_gravity::formulate(dims, inputs.tau_gravity).weight(w.tau_gravity);
 
     let warm_inner = WarmStart {
         x_prev: warm.x_prev,
