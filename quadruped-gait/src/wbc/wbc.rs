@@ -142,6 +142,50 @@ impl Default for WbcWeights {
     }
 }
 
+impl WbcWeights {
+    /// Per-cmd-direction weight scheduling.
+    ///
+    /// Empirical sweep (see `tests/integration_walk.rs::diag_swing_leg_sweep_*`)
+    /// shows the `swing_leg` task **flips sign** between forward and
+    /// non-forward commands:
+    ///
+    /// | swing_leg | forward Δx | lateral Δy (cmd +0.1) | yaw Δyaw |
+    /// |-----------|------------|------------------------|----------|
+    /// | 1.0 (fwd best) | +0.12 ✓ | -0.90 ✗ (reversed)   | -1.83 ✗  |
+    /// | 0.1 (lat best) | +0.20 ✓ | +0.50 ✓              | -2.77 ✗  |
+    /// | 0.0           | -0.07 ✗ | -0.15                | -2.54 ✗  |
+    ///
+    /// Root cause: the joint-space PD generates fast hip q̈ during
+    /// swing, which couples into a body-frame reaction torque
+    /// (M_floating_base · q̈ at priority 0). The reaction sign matches
+    /// the **forward** stride direction (no net body lateral push),
+    /// but **opposes** the lateral / yaw stride direction (because
+    /// hip abduction reaction-torques the body back toward the
+    /// neutral pose).
+    ///
+    /// Mitigation: linearly fade `swing_leg` from `1.0` (forward-only
+    /// command) down to `0.1` as `|cmd.vy|` and `|cmd.wz|` grow.
+    /// This matches the sweep's local optima per axis without touching
+    /// the other tasks.
+    ///
+    /// Saturation thresholds (`VY_FULL = 0.10 m/s`, `WZ_FULL = 0.5 rad/s`)
+    /// match the test commands; cmds beyond them stay at the lateral-
+    /// optimal weight. Hosts that want a different schedule can
+    /// override `swing_leg` (or any other field) directly after this.
+    pub fn for_cmd(cmd: &crate::config::VelocityCmd) -> Self {
+        const VY_FULL: f64 = 0.10;
+        const WZ_FULL: f64 = 0.5;
+        const SWING_FORWARD: f64 = 1.0;
+        const SWING_LATERAL: f64 = 0.1;
+        let lat = (cmd.vy.abs() / VY_FULL).min(1.0);
+        let yaw = (cmd.wz.abs() / WZ_FULL).min(1.0);
+        let intensity = lat.max(yaw); // 0 = pure forward, 1 = full lat/yaw
+        let mut w = Self::default();
+        w.swing_leg = SWING_FORWARD * (1.0 - intensity) + SWING_LATERAL * intensity;
+        w
+    }
+}
+
 /// Warm-start hint carried across WBC ticks.
 ///
 /// The host (typically [`crate::WbcPipeline`]) caches the previous
@@ -232,6 +276,53 @@ pub fn solve_warm_with_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::VelocityCmd;
+
+    /// `for_cmd(zero)` matches the default forward-tuned weights.
+    #[test]
+    fn for_cmd_zero_returns_default() {
+        let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
+        let d = WbcWeights::default();
+        assert_eq!(w.swing_leg, d.swing_leg);
+        assert_eq!(w.base_accel, d.base_accel);
+        assert_eq!(w.contact_force, d.contact_force);
+    }
+
+    /// Pure forward command keeps the default forward-tuned swing_leg
+    /// weight (= 1.0).
+    #[test]
+    fn for_cmd_pure_forward_keeps_default_swing_leg() {
+        let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.5, vy: 0.0, wz: 0.0 });
+        assert_eq!(w.swing_leg, 1.0);
+    }
+
+    /// Pure full-rate lateral command snaps swing_leg to the lateral-
+    /// optimal value (= 0.1).
+    #[test]
+    fn for_cmd_full_lateral_snaps_to_lateral_swing_leg() {
+        let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.0, vy: 0.10, wz: 0.0 });
+        assert!((w.swing_leg - 0.1).abs() < 1e-9);
+    }
+
+    /// Pure full-rate yaw command snaps swing_leg to the lateral-
+    /// optimal value (same value as full lateral — both are non-
+    /// forward locomotion modes that share the same sign-flip
+    /// behaviour).
+    #[test]
+    fn for_cmd_full_yaw_snaps_to_lateral_swing_leg() {
+        let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.5 });
+        assert!((w.swing_leg - 0.1).abs() < 1e-9);
+    }
+
+    /// Half-intensity lateral command lands swing_leg at the linear
+    /// midpoint between forward (1.0) and lateral (0.1) — i.e. 0.55.
+    /// Sign of `cmd.vy` doesn't matter (we use `abs`).
+    #[test]
+    fn for_cmd_half_lateral_blends_linearly() {
+        let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.0, vy: -0.05, wz: 0.0 });
+        // 0.5 intensity → 0.5·1.0 + 0.5·0.1 = 0.55
+        assert!((w.swing_leg - 0.55).abs() < 1e-9);
+    }
 
     /// End-to-end sanity check: a hover scenario (4 feet on the ground,
     /// gravity holding the body up) should produce GRFs that sum to
