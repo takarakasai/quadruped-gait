@@ -267,6 +267,14 @@ impl MpcGaitController {
         &self.kin
     }
 
+    /// Replace the kinematics. Intended for late stance-baseline tweaks
+    /// (e.g. moving `nominal_foot_body` to match a seeded crouch pose) —
+    /// the mode-internal SRBD/MPC state isn't reset, so callers should
+    /// avoid changing fields that affect joint mapping or sign conventions.
+    pub fn set_kinematics(&mut self, kin: KinematicsConfig) {
+        self.kin = kin;
+    }
+
     pub fn knee_forward(&self) -> [bool; 4] {
         self.knee_forward
     }

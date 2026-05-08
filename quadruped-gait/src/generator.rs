@@ -50,6 +50,7 @@ pub trait GaitGenerator {
     fn set_config(&mut self, cfg: GaitConfig);
 
     fn kinematics(&self) -> &KinematicsConfig;
+    fn set_kinematics(&mut self, kin: KinematicsConfig);
 
     fn set_knee_forward(&mut self, leg: LegId, forward: bool);
     fn set_knee_pattern(&mut self, pattern: KneePattern);
@@ -102,6 +103,9 @@ impl GaitGenerator for ChampGaitController {
     }
     fn kinematics(&self) -> &KinematicsConfig {
         ChampGaitController::kinematics(self)
+    }
+    fn set_kinematics(&mut self, kin: KinematicsConfig) {
+        ChampGaitController::set_kinematics(self, kin);
     }
     fn set_knee_forward(&mut self, leg: LegId, forward: bool) {
         ChampGaitController::set_knee_forward(self, leg, forward);
@@ -288,6 +292,12 @@ impl GaitGenerator for AnyGaitController {
         match self {
             AnyGaitController::Champ(c) => c.kinematics(),
             AnyGaitController::Mpc(c) => c.kinematics(),
+        }
+    }
+    fn set_kinematics(&mut self, kin: KinematicsConfig) {
+        match self {
+            AnyGaitController::Champ(c) => c.set_kinematics(kin),
+            AnyGaitController::Mpc(c) => c.set_kinematics(kin),
         }
     }
     fn set_knee_forward(&mut self, leg: LegId, forward: bool) {
