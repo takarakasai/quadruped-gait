@@ -292,12 +292,16 @@ mod tests {
     use super::*;
     use crate::config::VelocityCmd;
 
-    /// `for_cmd(zero)` matches the default forward-tuned weights.
+    /// `for_cmd(zero)` returns the forward-tuned `SWING_FORWARD` weight
+    /// (currently 0.2 after the namiashi cross-coupling tune in
+    /// commit e2d29fb) for the swing_leg slot, and matches the rest of
+    /// `WbcWeights::default()` (base_accel, contact_force, etc.) for
+    /// the other slots.
     #[test]
     fn for_cmd_zero_returns_default() {
         let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.0, vy: 0.0, wz: 0.0 });
         let d = WbcWeights::default();
-        assert_eq!(w.swing_leg, d.swing_leg);
+        assert!((w.swing_leg - 0.2).abs() < 1e-9);
         assert_eq!(w.base_accel, d.base_accel);
         assert_eq!(w.contact_force, d.contact_force);
     }
@@ -329,13 +333,14 @@ mod tests {
     }
 
     /// Half-intensity lateral command lands swing_leg at the linear
-    /// midpoint between forward (1.0) and lateral (0.1) — i.e. 0.55.
-    /// Sign of `cmd.vy` doesn't matter (we use `abs`).
+    /// midpoint between SWING_FORWARD (= 0.2 after the namiashi tune)
+    /// and SWING_LATERAL (= 0.1) — i.e. 0.15. Sign of `cmd.vy` doesn't
+    /// matter (we use `abs`).
     #[test]
     fn for_cmd_half_lateral_blends_linearly() {
         let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.0, vy: -0.05, wz: 0.0 });
-        // 0.5 intensity → 0.5·1.0 + 0.5·0.1 = 0.55
-        assert!((w.swing_leg - 0.55).abs() < 1e-9);
+        // 0.5 intensity → 0.5·0.2 + 0.5·0.1 = 0.15
+        assert!((w.swing_leg - 0.15).abs() < 1e-9);
     }
 
     /// End-to-end sanity check: a hover scenario (4 feet on the ground,
