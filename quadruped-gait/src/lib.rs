@@ -57,6 +57,7 @@ pub mod config;
 pub mod controller;
 pub mod footstep;
 pub mod generator;
+pub mod centroidal_controller;
 pub mod centroidal_mpc;
 pub mod ik;
 pub mod mpc_controller;
@@ -81,6 +82,7 @@ pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolu
 pub use mpc_controller::MpcGaitController;
 pub use mpc_reference::JointReference;
 pub use phase::{ContactDrivenPhase, PhaseGenerator, PhaseState};
+pub use centroidal_controller::CentroidalMpcGaitController;
 pub use centroidal_mpc::{
     centroidal_dynamics, CentroidalContactSchedule, CentroidalFootOffsets, CentroidalInput,
     CentroidalMpc, CentroidalMpcConfig, CentroidalMpcSolution, CentroidalReference,

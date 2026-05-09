@@ -132,9 +132,16 @@ impl GaitGenerator for ChampGaitController {
 pub enum GaitMode {
     /// CHAMP-derived open-loop controller (default).
     Champ,
-    /// MPC-flavoured closed-loop controller (LIP capture-point
-    /// feedback + multi-step horizon).
+    /// MPC-flavoured closed-loop controller using the body-root SRBD
+    /// model (Di Carlo 2018, LIP capture-point + multi-step horizon).
     Mpc,
+    /// Centroidal-SRBD MPC: same convex-QP family as `Mpc` but with
+    /// the state expressed in centroidal momentum coordinates so the
+    /// robot's CoM offset is modelled exactly. Equivalent to
+    /// legged_control's `centroidalModelType = 1` (Single Rigid Body
+    /// over centroidal coordinates). Available for direct comparison
+    /// against `Mpc` — both are kept as baselines.
+    CentroidalSrbd,
 }
 
 impl Default for GaitMode {
@@ -149,9 +156,14 @@ impl GaitMode {
         match self {
             GaitMode::Champ => "CHAMP (open-loop)",
             GaitMode::Mpc => "MPC (capture-point)",
+            GaitMode::CentroidalSrbd => "MPC (centroidal-SRBD)",
         }
     }
-    pub const ALL: [GaitMode; 2] = [GaitMode::Champ, GaitMode::Mpc];
+    pub const ALL: [GaitMode; 3] = [
+        GaitMode::Champ,
+        GaitMode::Mpc,
+        GaitMode::CentroidalSrbd,
+    ];
 }
 
 /// Enum-dispatched wrapper used by `articara` to avoid a `Box<dyn
@@ -162,6 +174,7 @@ impl GaitMode {
 pub enum AnyGaitController {
     Champ(ChampGaitController),
     Mpc(crate::MpcGaitController),
+    CentroidalSrbd(crate::CentroidalMpcGaitController),
 }
 
 impl AnyGaitController {
@@ -173,6 +186,9 @@ impl AnyGaitController {
             GaitMode::Mpc => {
                 AnyGaitController::Mpc(crate::MpcGaitController::new(cfg, kin))
             }
+            GaitMode::CentroidalSrbd => AnyGaitController::CentroidalSrbd(
+                crate::CentroidalMpcGaitController::new(cfg, kin),
+            ),
         }
     }
 
@@ -180,6 +196,7 @@ impl AnyGaitController {
         match self {
             AnyGaitController::Champ(_) => GaitMode::Champ,
             AnyGaitController::Mpc(_) => GaitMode::Mpc,
+            AnyGaitController::CentroidalSrbd(_) => GaitMode::CentroidalSrbd,
         }
     }
 
@@ -204,22 +221,34 @@ impl AnyGaitController {
 }
 
 impl AnyGaitController {
-    /// SRBD MPC predicted ground reaction forces from the last tick,
-    /// when the active mode is [`GaitMode::Mpc`]. CHAMP variant
-    /// always returns `None` (it has no MPC state).
+    /// MPC predicted ground reaction forces from the last tick. Both
+    /// `Mpc` (body-root SRBD) and `CentroidalSrbd` (centroidal SRBD)
+    /// modes return GRFs via the same `MpcSolution` shape — the
+    /// numeric values reflect each mode's underlying model. CHAMP
+    /// always returns `None`.
     pub fn predicted_grfs(&self) -> Option<&crate::srbd_mpc::MpcSolution> {
         match self {
             AnyGaitController::Champ(_) => None,
             AnyGaitController::Mpc(c) => c.predicted_grfs(),
+            AnyGaitController::CentroidalSrbd(c) => c.predicted_grfs(),
+        }
+    }
+
+    /// Native centroidal MPC solution, only available in
+    /// [`GaitMode::CentroidalSrbd`]. Hosts that want the centroidal-
+    /// aware WBC integration read this directly; everyone else can
+    /// stick with [`Self::predicted_grfs`] which works in any MPC mode.
+    pub fn predicted_centroidal_solution(
+        &self,
+    ) -> Option<&crate::centroidal_mpc::CentroidalMpcSolution> {
+        match self {
+            AnyGaitController::CentroidalSrbd(c) => c.predicted_centroidal_solution(),
+            _ => None,
         }
     }
 
     /// Per-leg stance-foot torque feedforward (`τ = -J^T·f_GRF`)
-    /// computed from the last MPC solve. See
-    /// [`crate::MpcGaitController::stance_grf_torques`] for the
-    /// formulation. Returns `[None; 4]` when the active mode is CHAMP
-    /// or no solution is available yet — the caller can treat this
-    /// uniformly as "no torque feedforward".
+    /// computed from the last MPC solve.
     pub fn stance_grf_torques(
         &self,
         output: &ControllerOutput,
@@ -227,26 +256,49 @@ impl AnyGaitController {
         match self {
             AnyGaitController::Champ(_) => [None; 4],
             AnyGaitController::Mpc(c) => c.stance_grf_torques(output),
+            AnyGaitController::CentroidalSrbd(c) => c.stance_grf_torques(output),
         }
     }
 
     /// Override the SRBD MPC's body-mass / inertia / weight matrices.
-    /// No-op when the active mode is CHAMP. Hosts that know their
-    /// robot's actual mass should call this once at construction —
-    /// the default 9 kg / Cheetah-3 inertia is wildly off for many
-    /// robots and produces grossly over- or under-scaled τ_ff.
+    /// Only takes effect in [`GaitMode::Mpc`] (body-root SRBD); CHAMP
+    /// has no MPC state, and `CentroidalSrbd` uses
+    /// [`Self::set_centroidal_mpc_config`] instead.
     pub fn set_srbd_mpc_config(&mut self, cfg: crate::srbd_mpc::SrbdMpcConfig) {
         if let AnyGaitController::Mpc(c) = self {
             c.set_srbd_mpc_config(cfg);
         }
     }
 
-    /// Read back the active SRBD MPC config (mass / inertia / weights /
-    /// horizon). Returns `None` for CHAMP — it has no MPC state.
+    /// Read back the active SRBD MPC config. Returns `None` for CHAMP
+    /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
+    /// the centroidal variant).
     pub fn srbd_mpc_config(&self) -> Option<&crate::srbd_mpc::SrbdMpcConfig> {
         match self {
-            AnyGaitController::Champ(_) => None,
             AnyGaitController::Mpc(c) => Some(c.srbd_mpc_config()),
+            _ => None,
+        }
+    }
+
+    /// Override the centroidal-SRBD MPC's mass / inertia / CoM offset
+    /// / weights. Only takes effect in [`GaitMode::CentroidalSrbd`].
+    pub fn set_centroidal_mpc_config(
+        &mut self,
+        cfg: crate::centroidal_mpc::CentroidalMpcConfig,
+    ) {
+        if let AnyGaitController::CentroidalSrbd(c) = self {
+            c.set_centroidal_mpc_config(cfg);
+        }
+    }
+
+    /// Read the active centroidal MPC config. Returns `None` outside
+    /// of [`GaitMode::CentroidalSrbd`].
+    pub fn centroidal_mpc_config(
+        &self,
+    ) -> Option<&crate::centroidal_mpc::CentroidalMpcConfig> {
+        match self {
+            AnyGaitController::CentroidalSrbd(c) => Some(c.centroidal_mpc_config()),
+            _ => None,
         }
     }
 }
@@ -256,72 +308,84 @@ impl GaitGenerator for AnyGaitController {
         match self {
             AnyGaitController::Champ(c) => c.tick(dt),
             AnyGaitController::Mpc(c) => c.tick(dt),
+            AnyGaitController::CentroidalSrbd(c) => c.tick(dt),
         }
     }
     fn set_velocity_cmd(&mut self, cmd: VelocityCmd) {
         match self {
             AnyGaitController::Champ(c) => c.set_velocity_cmd(cmd),
             AnyGaitController::Mpc(c) => c.set_velocity_cmd(cmd),
+            AnyGaitController::CentroidalSrbd(c) => c.set_velocity_cmd(cmd),
         }
     }
     fn velocity_cmd(&self) -> VelocityCmd {
         match self {
             AnyGaitController::Champ(c) => c.velocity_cmd(),
             AnyGaitController::Mpc(c) => c.velocity_cmd(),
+            AnyGaitController::CentroidalSrbd(c) => c.velocity_cmd(),
         }
     }
     fn reset(&mut self) {
         match self {
             AnyGaitController::Champ(c) => c.reset(),
             AnyGaitController::Mpc(c) => c.reset(),
+            AnyGaitController::CentroidalSrbd(c) => c.reset(),
         }
     }
     fn config(&self) -> &GaitConfig {
         match self {
             AnyGaitController::Champ(c) => c.config(),
             AnyGaitController::Mpc(c) => c.config(),
+            AnyGaitController::CentroidalSrbd(c) => c.config(),
         }
     }
     fn set_config(&mut self, cfg: GaitConfig) {
         match self {
             AnyGaitController::Champ(c) => c.set_config(cfg),
             AnyGaitController::Mpc(c) => c.set_config(cfg),
+            AnyGaitController::CentroidalSrbd(c) => c.set_config(cfg),
         }
     }
     fn kinematics(&self) -> &KinematicsConfig {
         match self {
             AnyGaitController::Champ(c) => c.kinematics(),
             AnyGaitController::Mpc(c) => c.kinematics(),
+            AnyGaitController::CentroidalSrbd(c) => c.kinematics(),
         }
     }
     fn set_kinematics(&mut self, kin: KinematicsConfig) {
         match self {
             AnyGaitController::Champ(c) => c.set_kinematics(kin),
             AnyGaitController::Mpc(c) => c.set_kinematics(kin),
+            AnyGaitController::CentroidalSrbd(c) => c.set_kinematics(kin),
         }
     }
     fn set_knee_forward(&mut self, leg: LegId, forward: bool) {
         match self {
             AnyGaitController::Champ(c) => c.set_knee_forward(leg, forward),
             AnyGaitController::Mpc(c) => c.set_knee_forward(leg, forward),
+            AnyGaitController::CentroidalSrbd(c) => c.set_knee_forward(leg, forward),
         }
     }
     fn set_knee_pattern(&mut self, pattern: KneePattern) {
         match self {
             AnyGaitController::Champ(c) => c.set_knee_pattern(pattern),
             AnyGaitController::Mpc(c) => c.set_knee_pattern(pattern),
+            AnyGaitController::CentroidalSrbd(c) => c.set_knee_pattern(pattern),
         }
     }
     fn knee_pattern(&self) -> KneePattern {
         match self {
             AnyGaitController::Champ(c) => c.knee_pattern(),
             AnyGaitController::Mpc(c) => c.knee_pattern(),
+            AnyGaitController::CentroidalSrbd(c) => c.knee_pattern(),
         }
     }
     fn knee_forward(&self) -> [bool; 4] {
         match self {
             AnyGaitController::Champ(c) => c.knee_forward(),
             AnyGaitController::Mpc(c) => c.knee_forward(),
+            AnyGaitController::CentroidalSrbd(c) => c.knee_forward(),
         }
     }
     fn set_body_state_observed(
@@ -332,6 +396,9 @@ impl GaitGenerator for AnyGaitController {
         match self {
             AnyGaitController::Champ(c) => c.set_body_state_observed(v_world, omega_world),
             AnyGaitController::Mpc(c) => c.set_body_state_observed(v_world, omega_world),
+            AnyGaitController::CentroidalSrbd(c) => {
+                c.set_body_state_observed(v_world, omega_world)
+            }
         }
     }
     fn set_body_pose_observed(
@@ -345,6 +412,9 @@ impl GaitGenerator for AnyGaitController {
             // pose if the host queries it later.
             AnyGaitController::Champ(_) => {}
             AnyGaitController::Mpc(c) => c.set_body_pose_observed(world_yaw, world_position),
+            AnyGaitController::CentroidalSrbd(c) => {
+                c.set_body_pose_observed(world_yaw, world_position)
+            }
         }
     }
 }

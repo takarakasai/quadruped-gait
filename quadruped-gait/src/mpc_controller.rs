@@ -53,7 +53,7 @@ pub const DEFAULT_CAPTURE_POINT_GAIN_S: f64 = 0.175;
 /// skips emitting a torque feedforward for that foot. Avoids noisy
 /// torque commands during stance/swing handover frames where the QP's
 /// numerical zero isn't quite zero.
-const STANCE_GRF_MIN_N: f64 = 1.0;
+pub(crate) const STANCE_GRF_MIN_N: f64 = 1.0;
 
 /// Number of upcoming swing-step landings the horizon predictor looks
 /// at when planning the *next* foot placement. The current
@@ -68,7 +68,7 @@ pub const HORIZON_STEPS: usize = 4;
 /// direction (amplification still has no cap). 0.5 = half the Raibert
 /// step survives even under maximum cancellation, guaranteeing a
 /// forward push at startup so the body can accelerate up to `v_cmd`.
-const MIN_HALF_FRACTION: f64 = 0.5;
+pub(crate) const MIN_HALF_FRACTION: f64 = 0.5;
 
 /// Stateful MPC-flavoured gait controller. Same construction inputs
 /// as [`crate::ChampGaitController`] so the host can swap them via
@@ -620,7 +620,10 @@ impl MpcGaitController {
 // Helper: project a world-frame horizontal velocity into the body
 // frame by undoing the integrated yaw. Pitch / roll ignored — fine for
 // the gait operating regime (small body tilt).
-fn world_to_body_horizontal(v_world: Vector3<f64>, yaw: f64) -> Vector3<f64> {
+//
+// `pub(crate)` so the sibling centroidal-MPC controller can reuse
+// the same yaw-only frame helpers without duplicating the trig.
+pub(crate) fn world_to_body_horizontal(v_world: Vector3<f64>, yaw: f64) -> Vector3<f64> {
     let (s, c) = yaw.sin_cos();
     Vector3::new(
         c * v_world.x + s * v_world.y,
@@ -631,7 +634,7 @@ fn world_to_body_horizontal(v_world: Vector3<f64>, yaw: f64) -> Vector3<f64> {
 
 /// Inverse of [`world_to_body_horizontal`]: rotate a body-frame
 /// horizontal vector into world frame using the yaw angle.
-fn body_to_world_horizontal(v_body: Vector3<f64>, yaw: f64) -> Vector3<f64> {
+pub(crate) fn body_to_world_horizontal(v_body: Vector3<f64>, yaw: f64) -> Vector3<f64> {
     let (s, c) = yaw.sin_cos();
     Vector3::new(
         c * v_body.x - s * v_body.y,
@@ -642,7 +645,7 @@ fn body_to_world_horizontal(v_body: Vector3<f64>, yaw: f64) -> Vector3<f64> {
 
 // Reuse the same swing-height knockdown as the CHAMP controller so
 // both modes feel similar at high yaw / strafe rates.
-fn effective_swing_height(base_h: f64, cmd: &VelocityCmd) -> f64 {
+pub(crate) fn effective_swing_height(base_h: f64, cmd: &VelocityCmd) -> f64 {
     const WZ_REF: f64 = 1.0;
     const VY_REF: f64 = 0.3;
     const MIN_FACTOR: f64 = 0.4;
@@ -654,7 +657,7 @@ fn effective_swing_height(base_h: f64, cmd: &VelocityCmd) -> f64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn make_leg_output(
+pub(crate) fn make_leg_output(
     leg: LegId,
     kin: &LegKinematics,
     phase: PhaseState,

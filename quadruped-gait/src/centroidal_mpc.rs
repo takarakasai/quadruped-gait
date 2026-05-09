@@ -190,13 +190,23 @@ impl Default for CentroidalMpcConfig {
             horizon_steps: 10,
             dt_per_step: 0.030,
             q_diag: [
-                // ḣ_lin/m (= v_com): light, the primary tracking variable
+                // h_lin/m (= v_com, m/s): same scale as SRBD's `v`, weight 1.0.
                 1.0, 1.0, 1.0,
-                // ḣ_ang/m: light
-                0.5, 0.5, 5.0,
-                // base_pos: bias toward the reference path, lateral / yaw heaviest
+                // h_ang/m (m²/s, world frame at CoM): the units differ
+                // from SRBD's body-frame ω by a factor I/m. For
+                // namiashi (m=2.4 kg, I_z=0.009 kg·m²) that's 0.00375.
+                // The "unit-corrected" SRBD-equivalent weights would be
+                // 1/0.00375² ≈ 7×10⁴ × SRBD's ω weights, but that
+                // suppresses the natural angular momentum from gait
+                // swing too aggressively. Pragmatic tune: about an
+                // order of magnitude lower so swing dynamics are not
+                // crushed but yaw still tracks.
+                1e3, 1e3, 1e4,
+                // base_pos (m): same as SRBD `p` weights — lateral /
+                // yaw-heavy bias toward the reference path.
                 0.0, 20.0, 50.0,
-                // euler_zyx: keep level + track yaw
+                // euler_zyx (rad): same as SRBD `θ` weights —
+                // keep body level + track yaw.
                 25.0, 25.0, 50.0,
             ],
             r_diag: 1e-3,
@@ -369,13 +379,13 @@ impl CentroidalReference {
         // reachable target rather than a step jump).
         let mut s = s_now;
         s.h_lin_per_mass = v_world;
-        // Centroidal angular momentum reference for pure yaw rate:
-        // h_ang_world = I_world · ω where ω = (0, 0, wz).
-        // For yaw-only with body-frame I_diag, I_world.z = I_body.z.
-        // Simplification: use h_ang_per_mass.z = (I_body.z / m) · wz.
-        // (Other components stay zero.) This keeps the QP from
-        // chasing zero h_ang while the cmd asks for yawing.
-        s.h_ang_per_mass = Vector3::zeros();
+        // Centroidal angular-momentum reference for the commanded
+        // yaw rate. For yaw-only with body-frame inertia diag I_body
+        // and identity body-to-world rotation, the world-frame angular
+        // momentum is `h_ang_world = I_body · ω = (0, 0, I_zz · wz)`.
+        // Per-mass version: divide by m.
+        let i_zz = cfg.centroidal_inertia_body[(2, 2)];
+        s.h_ang_per_mass = Vector3::new(0.0, 0.0, i_zz * wz / cfg.mass_kg.max(1e-9));
         // Integrate position + yaw across the horizon.
         for k in 0..cfg.horizon_steps {
             let t = (k + 1) as f64 * cfg.dt_per_step;
