@@ -82,7 +82,9 @@ pub use mpc_controller::MpcGaitController;
 pub use mpc_reference::JointReference;
 pub use phase::{ContactDrivenPhase, PhaseGenerator, PhaseState};
 pub use centroidal_mpc::{
-    centroidal_dynamics, CentroidalInput, CentroidalMpcConfig, CentroidalState,
+    centroidal_dynamics, CentroidalContactSchedule, CentroidalFootOffsets, CentroidalInput,
+    CentroidalMpc, CentroidalMpcConfig, CentroidalMpcSolution, CentroidalReference,
+    CentroidalState,
 };
 pub use srbd_mpc::{
     predicted_base_accel_world, ContactSchedule, FootOffsets, MpcSolution,

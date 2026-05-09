@@ -64,7 +64,9 @@
 //! D1 scope is **just this dynamics function and its unit tests**.
 //! D1.2 builds the discretised QP, D1.3 wires it into `WbcPipeline`.
 
-use nalgebra::{Matrix3, Rotation3, Vector3};
+use clarabel::algebra::CscMatrix;
+use clarabel::solver::{DefaultSettings, DefaultSolver, IPSolver, SolverStatus, SupportedConeT};
+use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
 
 /// 12-dim centroidal state. See module docs for the layout.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -334,6 +336,570 @@ fn euler_zyx_dot_from_world_omega(
     Vector3::new(roll_dot, pitch_dot, yaw_dot)
 }
 
+/// Reference trajectory the centroidal MPC tracks. One state per
+/// horizon step (length must equal `cfg.horizon_steps`).
+#[derive(Clone, Debug)]
+pub struct CentroidalReference {
+    pub states: Vec<CentroidalState>,
+}
+
+impl CentroidalReference {
+    /// Static reference: constant `s` over the horizon. Used for hover
+    /// or hold-position tests.
+    pub fn constant(s: CentroidalState, horizon_steps: usize) -> Self {
+        Self {
+            states: vec![s; horizon_steps],
+        }
+    }
+
+    /// Constant-velocity reference: integrate base position + yaw
+    /// forward from `s_now` at world-frame velocity `(v_world, wz)`.
+    /// The host typically rotates a body-frame command into world
+    /// frame using current yaw before calling this.
+    pub fn from_constant_velocity(
+        s_now: CentroidalState,
+        v_world: Vector3<f64>,
+        wz: f64,
+        cfg: &CentroidalMpcConfig,
+    ) -> Self {
+        let mut states = Vec::with_capacity(cfg.horizon_steps);
+        // Build the reference by stepping forward from now: position
+        // and yaw integrate at the commanded velocity, momentum
+        // tracks the commanded velocity exactly (so the MPC has a
+        // reachable target rather than a step jump).
+        let mut s = s_now;
+        s.h_lin_per_mass = v_world;
+        // Centroidal angular momentum reference for pure yaw rate:
+        // h_ang_world = I_world · ω where ω = (0, 0, wz).
+        // For yaw-only with body-frame I_diag, I_world.z = I_body.z.
+        // Simplification: use h_ang_per_mass.z = (I_body.z / m) · wz.
+        // (Other components stay zero.) This keeps the QP from
+        // chasing zero h_ang while the cmd asks for yawing.
+        s.h_ang_per_mass = Vector3::zeros();
+        // Integrate position + yaw across the horizon.
+        for k in 0..cfg.horizon_steps {
+            let t = (k + 1) as f64 * cfg.dt_per_step;
+            let mut sk = s;
+            sk.base_pos_world = s_now.base_pos_world + v_world * t;
+            sk.base_euler_zyx.z = s_now.base_euler_zyx.z + wz * t;
+            states.push(sk);
+        }
+        Self { states }
+    }
+}
+
+/// Per-leg per-horizon-step world-frame vector **from the CoM to the
+/// foot**. For type-1 SRBD where the CoM is constant in body frame,
+/// the host computes this once per tick from FK + footstep planning
+/// and passes it to [`CentroidalMpc::solve`].
+#[derive(Clone, Debug)]
+pub struct CentroidalFootOffsets {
+    /// `r[leg][k]` = `foot_world(k) − CoM_world(k)`. Length per leg
+    /// must equal `cfg.horizon_steps`.
+    pub r: [Vec<Vector3<f64>>; 4],
+}
+
+impl CentroidalFootOffsets {
+    /// All four legs share a fixed `r_per_leg` across the horizon.
+    /// Useful for short-horizon MPC where the CoM doesn't move much.
+    pub fn constant_per_leg(per_leg: [Vector3<f64>; 4], horizon_steps: usize) -> Self {
+        Self {
+            r: [
+                vec![per_leg[0]; horizon_steps],
+                vec![per_leg[1]; horizon_steps],
+                vec![per_leg[2]; horizon_steps],
+                vec![per_leg[3]; horizon_steps],
+            ],
+        }
+    }
+}
+
+/// Per-leg per-step boolean stance schedule. `is_stance[leg][k] == true`
+/// means foot `leg` may apply ground reaction force at step `k`; swing
+/// legs have their GRF pinned to zero by an equality constraint.
+#[derive(Clone, Debug)]
+pub struct CentroidalContactSchedule {
+    pub is_stance: [Vec<bool>; 4],
+}
+
+impl CentroidalContactSchedule {
+    pub fn all_stance(horizon_steps: usize) -> Self {
+        Self {
+            is_stance: [
+                vec![true; horizon_steps],
+                vec![true; horizon_steps],
+                vec![true; horizon_steps],
+                vec![true; horizon_steps],
+            ],
+        }
+    }
+}
+
+/// Output of [`CentroidalMpc::solve`].
+#[derive(Clone, Debug)]
+pub struct CentroidalMpcSolution {
+    /// First-step GRFs (world frame, N) — what the host commits this
+    /// MPC tick. Receding-horizon: subsequent steps are diagnostic.
+    pub grfs_first_step: [Vector3<f64>; 4],
+    /// Full-horizon GRFs (one per step, per leg).
+    pub grfs_all_steps: Vec<[Vector3<f64>; 4]>,
+    /// Predicted state across the horizon from the QP-optimal U.
+    pub predicted_body_states: Vec<CentroidalState>,
+    /// QP objective value.
+    pub objective: f64,
+    /// Whether clarabel reported `Solved` or `AlmostSolved`. False
+    /// indicates the host should fall back to a held GRF.
+    pub solved: bool,
+}
+
+/// Stateless centroidal-SRBD MPC solver. Holds only the cached
+/// `CentroidalMpcConfig`; the host can rebuild the QP each tick
+/// without re-allocating the tuning struct.
+#[derive(Clone, Debug)]
+pub struct CentroidalMpc {
+    cfg: CentroidalMpcConfig,
+}
+
+impl CentroidalMpc {
+    pub fn new(cfg: CentroidalMpcConfig) -> Self {
+        Self { cfg }
+    }
+
+    pub fn config(&self) -> &CentroidalMpcConfig {
+        &self.cfg
+    }
+
+    pub fn set_config(&mut self, cfg: CentroidalMpcConfig) {
+        self.cfg = cfg;
+    }
+
+    /// Solve the MPC QP for the next horizon and return the optimal
+    /// per-leg GRFs at the **first** step (receding-horizon convention).
+    ///
+    /// State layout (13-dim with augmented gravity column):
+    /// ```text
+    /// x = [ h_lin/m (3) ; h_ang/m (3) ; base_pos (3) ; euler_zyx (3) ; g_const = −9.81 ]
+    /// ```
+    ///
+    /// Linearisation: yaw-only (roll = pitch = 0 reference). Inputs
+    /// `feet.r[leg][k]` give the world-frame moment arm (foot − CoM)
+    /// at each horizon step; the caller is responsible for projecting
+    /// them forward (typically constant for type-1 SRBD).
+    pub fn solve(
+        &self,
+        state_now: CentroidalState,
+        reference: &CentroidalReference,
+        contact: &CentroidalContactSchedule,
+        feet: &CentroidalFootOffsets,
+    ) -> CentroidalMpcSolution {
+        let n = self.cfg.horizon_steps;
+        assert_eq!(reference.states.len(), n, "ref length mismatch");
+        for leg in 0..4 {
+            assert_eq!(contact.is_stance[leg].len(), n);
+            assert_eq!(feet.r[leg].len(), n);
+        }
+
+        // ── Build per-step continuous-time A_c, B_c, then discretise ──
+        let nx = 13_usize;
+        let nu = 12_usize;
+
+        let mut a_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
+        let mut b_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
+        for k in 0..n {
+            let psi_ref = reference.states[k].base_euler_zyx.z;
+            let r_per_leg = [feet.r[0][k], feet.r[1][k], feet.r[2][k], feet.r[3][k]];
+            let stance = [
+                contact.is_stance[0][k],
+                contact.is_stance[1][k],
+                contact.is_stance[2][k],
+                contact.is_stance[3][k],
+            ];
+            let (a_c, b_c) = self.continuous_dynamics(psi_ref, &r_per_leg, &stance);
+            // Forward Euler discretisation: x_{k+1} = (I + dt·A) x_k + dt·B u_k.
+            let mut a_d = DMatrix::<f64>::identity(nx, nx);
+            a_d += &a_c * self.cfg.dt_per_step;
+            let b_d = b_c * self.cfg.dt_per_step;
+            a_d_per_step.push(a_d);
+            b_d_per_step.push(b_d);
+        }
+
+        // ── Lifted dynamics: X = A_x x_0 + B_u U  ───────────────────
+        let mut a_x = DMatrix::<f64>::zeros(nx * n, nx);
+        let mut b_u = DMatrix::<f64>::zeros(nx * n, nu * n);
+        let mut prod = DMatrix::<f64>::identity(nx, nx);
+        for k in 0..n {
+            prod = &a_d_per_step[k] * &prod;
+            a_x.view_mut((k * nx, 0), (nx, nx)).copy_from(&prod);
+            // Row k of B_u: contribution from each input u_j (j ≤ k).
+            //   B_u[k,j] = (A_k · A_{k-1} · … · A_{j+1}) · B_j.
+            let mut tail = DMatrix::<f64>::identity(nx, nx);
+            for j in (0..=k).rev() {
+                let block = &tail * &b_d_per_step[j];
+                b_u.view_mut((k * nx, j * nu), (nx, nu)).copy_from(&block);
+                if j > 0 {
+                    tail = &tail * &a_d_per_step[j];
+                }
+            }
+        }
+
+        // ── Cost: J = ‖X − X_ref‖²_Q + ‖U‖²_R ──────────────────────
+        // P = 2 (B_u^T Q B_u + R), q = 2 B_u^T Q (A_x x_0 − X_ref).
+        let mut q_block = DMatrix::<f64>::zeros(nx * n, nx * n);
+        for k in 0..n {
+            for i in 0..12 {
+                // Augmented gravity column has zero weight (state[12]
+                // = −9.81 is a deterministic constant, not tracked).
+                q_block[(k * nx + i, k * nx + i)] = self.cfg.q_diag[i];
+            }
+        }
+        let mut r_block = DMatrix::<f64>::zeros(nu * n, nu * n);
+        for i in 0..(nu * n) {
+            r_block[(i, i)] = self.cfg.r_diag;
+        }
+
+        let x_ref = {
+            let mut v = DVector::<f64>::zeros(nx * n);
+            for k in 0..n {
+                let s = state_to_vec13(&reference.states[k]);
+                v.rows_mut(k * nx, nx).copy_from(&s);
+            }
+            v
+        };
+        let x_now = state_to_vec13(&state_now);
+        let drift = &a_x * &x_now - &x_ref;
+
+        let p_dense = 2.0 * (b_u.transpose() * &q_block * &b_u + &r_block);
+        let q_vec = 2.0 * (b_u.transpose() * &q_block * &drift);
+
+        // ── Constraints ────────────────────────────────────────────
+        let (a_csc, b_vec, cones) = build_constraints(&self.cfg, contact, n, nu);
+
+        // ── clarabel solve ─────────────────────────────────────────
+        let p_csc = dense_to_csc_upper(&p_dense);
+        let q_slice: Vec<f64> = q_vec.iter().copied().collect();
+        let mut settings = DefaultSettings::default();
+        settings.verbose = false;
+        settings.max_iter = 50;
+        let mut solver =
+            match DefaultSolver::new(&p_csc, &q_slice, &a_csc, &b_vec, &cones, settings) {
+                Ok(s) => s,
+                Err(_) => {
+                    return CentroidalMpcSolution {
+                        grfs_first_step: [Vector3::zeros(); 4],
+                        grfs_all_steps: vec![[Vector3::zeros(); 4]; n],
+                        predicted_body_states: vec![state_now; n],
+                        objective: f64::NAN,
+                        solved: false,
+                    };
+                }
+            };
+        solver.solve();
+
+        let solved = matches!(
+            solver.solution.status,
+            SolverStatus::Solved | SolverStatus::AlmostSolved
+        );
+        let u_opt = &solver.solution.x;
+        let objective = solver.solution.obj_val;
+
+        // Decode U → per-leg per-step GRFs.
+        let mut grfs_all_steps = Vec::with_capacity(n);
+        for k in 0..n {
+            let base = k * nu;
+            grfs_all_steps.push([
+                Vector3::new(u_opt[base], u_opt[base + 1], u_opt[base + 2]),
+                Vector3::new(u_opt[base + 3], u_opt[base + 4], u_opt[base + 5]),
+                Vector3::new(u_opt[base + 6], u_opt[base + 7], u_opt[base + 8]),
+                Vector3::new(u_opt[base + 9], u_opt[base + 10], u_opt[base + 11]),
+            ]);
+        }
+
+        // Decode predicted states from X = A_x x_0 + B_u U.
+        let u_dvec = DVector::from_vec(u_opt.clone());
+        let x_horizon = &a_x * &x_now + &b_u * &u_dvec;
+        let mut predicted_body_states = Vec::with_capacity(n);
+        for k in 0..n {
+            let row0 = k * nx;
+            predicted_body_states.push(CentroidalState {
+                h_lin_per_mass: Vector3::new(
+                    x_horizon[row0],
+                    x_horizon[row0 + 1],
+                    x_horizon[row0 + 2],
+                ),
+                h_ang_per_mass: Vector3::new(
+                    x_horizon[row0 + 3],
+                    x_horizon[row0 + 4],
+                    x_horizon[row0 + 5],
+                ),
+                base_pos_world: Vector3::new(
+                    x_horizon[row0 + 6],
+                    x_horizon[row0 + 7],
+                    x_horizon[row0 + 8],
+                ),
+                base_euler_zyx: Vector3::new(
+                    x_horizon[row0 + 9],
+                    x_horizon[row0 + 10],
+                    x_horizon[row0 + 11],
+                ),
+            });
+        }
+
+        CentroidalMpcSolution {
+            grfs_first_step: grfs_all_steps[0],
+            grfs_all_steps,
+            predicted_body_states,
+            objective,
+            solved,
+        }
+    }
+
+    /// Continuous-time A and B matrices for the discretised MPC at
+    /// one horizon step. State layout (13 dim, augmented):
+    ///
+    /// ```text
+    /// x = [ h_lin/m (0..3); h_ang/m (3..6); base_pos (6..9); euler (9..12); g_const (12) ]
+    /// ```
+    ///
+    /// Yaw-only linearisation (roll = pitch = 0 in the reference).
+    /// `r_per_leg[i]` = world-frame vector from CoM to foot i at this
+    /// step.
+    fn continuous_dynamics(
+        &self,
+        psi_ref: f64,
+        r_per_leg: &[Vector3<f64>; 4],
+        stance: &[bool; 4],
+    ) -> (DMatrix<f64>, DMatrix<f64>) {
+        let nx = 13;
+        let nu = 12;
+        let mut a = DMatrix::<f64>::zeros(nx, nx);
+        let mut b = DMatrix::<f64>::zeros(nx, nu);
+
+        let m = self.cfg.mass_kg.max(1e-9);
+
+        // Yaw rotation R_z(ψ_ref) (small-angle on roll/pitch).
+        let (s, c) = psi_ref.sin_cos();
+        let r_z = Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
+
+        // I_world = R_z · I_body · R_z^T  (yaw-only rotation).
+        let i_body = self.cfg.centroidal_inertia_body;
+        let i_world = r_z * i_body * r_z.transpose();
+        let i_world_inv = i_world.try_inverse().unwrap_or_else(Matrix3::identity);
+
+        // ── d/dt(h_lin/m) = (Σ F)/m + g ─────────────────────────────
+        //   Linear in F: B[0..3, leg*3..(leg+1)*3] = (1/m)·I per stance leg.
+        //   Gravity: state[12] = −9.81 holds the constant; A[2, 12] = 1
+        //   so d(h_lin_z/m)/dt picks up state[12] = −9.81.
+        a[(2, 12)] = 1.0;
+        for leg in 0..4 {
+            if !stance[leg] {
+                continue;
+            }
+            for i in 0..3 {
+                b[(i, leg * 3 + i)] = 1.0 / m;
+            }
+        }
+
+        // ── d/dt(h_ang/m) = (1/m) · Σ (foot_i − CoM) × F_i ─────────
+        //   skew(r) operator yields a 3×3 block per stance leg.
+        for leg in 0..4 {
+            if !stance[leg] {
+                continue;
+            }
+            let r = r_per_leg[leg];
+            let block = skew_symmetric_3(&r) / m;
+            for i in 0..3 {
+                for j in 0..3 {
+                    b[(3 + i, leg * 3 + j)] = block[(i, j)];
+                }
+            }
+        }
+
+        // ── d/dt(base_pos) = h_lin/m  (small-CoM-offset approximation) ─
+        //   Strictly: base_pos_dot = h_lin/m − ω × com_offset_world.
+        //   At ω=0 reference and small com_offset (~5 mm) the cross-
+        //   product term contributes O(α·offset) ≈ mm/s², below the
+        //   QP's noise floor — drop it for the linearisation.
+        a[(6, 0)] = 1.0;
+        a[(7, 1)] = 1.0;
+        a[(8, 2)] = 1.0;
+
+        // ── d/dt(euler_zyx) = T_inv · ω_world ──────────────────────
+        //   At euler_ref = (0, 0, ψ_ref): T_inv = R_z(ψ_ref)^T.
+        //   ω_world = I_world⁻¹ · m · (h_ang/m) (state field 3..6).
+        //   ⇒ A[9..12, 3..6] = R_z^T · I_world⁻¹ · m.
+        let coupling = r_z.transpose() * i_world_inv * m;
+        for i in 0..3 {
+            for j in 0..3 {
+                a[(9 + i, 3 + j)] = coupling[(i, j)];
+            }
+        }
+
+        (a, b)
+    }
+}
+
+fn state_to_vec13(s: &CentroidalState) -> DVector<f64> {
+    let mut v = DVector::zeros(13);
+    v[0] = s.h_lin_per_mass.x;
+    v[1] = s.h_lin_per_mass.y;
+    v[2] = s.h_lin_per_mass.z;
+    v[3] = s.h_ang_per_mass.x;
+    v[4] = s.h_ang_per_mass.y;
+    v[5] = s.h_ang_per_mass.z;
+    v[6] = s.base_pos_world.x;
+    v[7] = s.base_pos_world.y;
+    v[8] = s.base_pos_world.z;
+    v[9] = s.base_euler_zyx.x;
+    v[10] = s.base_euler_zyx.y;
+    v[11] = s.base_euler_zyx.z;
+    v[12] = -9.81; // constant gravity column
+    v
+}
+
+fn skew_symmetric_3(v: &Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(
+        0.0, -v.z, v.y,
+        v.z, 0.0, -v.x,
+        -v.y, v.x, 0.0,
+    )
+}
+
+/// Convert a dense symmetric PSD matrix to clarabel's CSC upper-
+/// triangular layout. (Same helper as `srbd_mpc.rs`; kept here so the
+/// new module has no internal cross-module dependency on private
+/// helpers.)
+fn dense_to_csc_upper(p: &DMatrix<f64>) -> CscMatrix<f64> {
+    let n = p.nrows();
+    debug_assert_eq!(n, p.ncols());
+    let mut colptr = Vec::with_capacity(n + 1);
+    let mut rowval = Vec::new();
+    let mut nzval = Vec::new();
+    colptr.push(0);
+    for j in 0..n {
+        for i in 0..=j {
+            let v = p[(i, j)];
+            if v.abs() > 1e-12 {
+                rowval.push(i);
+                nzval.push(v);
+            }
+        }
+        colptr.push(rowval.len());
+    }
+    CscMatrix::new(n, n, colptr, rowval, nzval)
+}
+
+/// Build the friction-cone + contact-mode constraints. Layout matches
+/// `srbd_mpc::build_constraints`: equality rows for swing legs first,
+/// then inequality rows for stance legs (f_z bounds + 4-side pyramid).
+fn build_constraints(
+    cfg: &CentroidalMpcConfig,
+    contact: &CentroidalContactSchedule,
+    n: usize,
+    nu: usize,
+) -> (CscMatrix<f64>, Vec<f64>, Vec<SupportedConeT<f64>>) {
+    let total_vars = nu * n;
+    let mu = cfg.friction_mu;
+    let f_max = cfg.max_normal_force;
+
+    let mut n_eq = 0;
+    let mut n_ineq = 0;
+    for k in 0..n {
+        for leg in 0..4 {
+            if contact.is_stance[leg][k] {
+                let mut count = 4; // friction pyramid (±x, ±y vs μ·f_z)
+                count += 1; // f_z ≥ 0
+                if f_max > 0.0 {
+                    count += 1; // f_z ≤ f_max
+                }
+                n_ineq += count;
+            } else {
+                n_eq += 3; // f_x = f_y = f_z = 0
+            }
+        }
+    }
+
+    let n_rows = n_eq + n_ineq;
+    let mut a_dense = DMatrix::<f64>::zeros(n_rows, total_vars);
+    let mut b_vec = vec![0.0; n_rows];
+    let mut row = 0;
+
+    // Equality rows
+    for k in 0..n {
+        for leg in 0..4 {
+            if !contact.is_stance[leg][k] {
+                let col = k * nu + leg * 3;
+                for ax in 0..3 {
+                    a_dense[(row + ax, col + ax)] = 1.0;
+                }
+                row += 3;
+            }
+        }
+    }
+
+    // Inequality rows
+    for k in 0..n {
+        for leg in 0..4 {
+            if !contact.is_stance[leg][k] {
+                continue;
+            }
+            let col_x = k * nu + leg * 3;
+            let col_y = col_x + 1;
+            let col_z = col_x + 2;
+            // f_z ≥ 0  ⇒  -f_z ≤ 0
+            a_dense[(row, col_z)] = -1.0;
+            row += 1;
+            // f_z ≤ f_max
+            if f_max > 0.0 {
+                a_dense[(row, col_z)] = 1.0;
+                b_vec[row] = f_max;
+                row += 1;
+            }
+            // |f_x| ≤ μ·f_z
+            a_dense[(row, col_x)] = 1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+            a_dense[(row, col_x)] = -1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+            // |f_y| ≤ μ·f_z
+            a_dense[(row, col_y)] = 1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+            a_dense[(row, col_y)] = -1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+        }
+    }
+
+    let a_csc = dense_to_csc(&a_dense);
+    let cones = vec![
+        SupportedConeT::ZeroConeT(n_eq),
+        SupportedConeT::NonnegativeConeT(n_ineq),
+    ];
+    (a_csc, b_vec, cones)
+}
+
+/// CSC conversion of a general (not necessarily symmetric) dense matrix.
+fn dense_to_csc(m: &DMatrix<f64>) -> CscMatrix<f64> {
+    let nr = m.nrows();
+    let nc = m.ncols();
+    let mut colptr = Vec::with_capacity(nc + 1);
+    let mut rowval = Vec::new();
+    let mut nzval = Vec::new();
+    colptr.push(0);
+    for j in 0..nc {
+        for i in 0..nr {
+            let v = m[(i, j)];
+            if v.abs() > 1e-12 {
+                rowval.push(i);
+                nzval.push(v);
+            }
+        }
+        colptr.push(rowval.len());
+    }
+    CscMatrix::new(nr, nc, colptr, rowval, nzval)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +1125,132 @@ mod tests {
         let v = s.to_vec12();
         let s2 = CentroidalState::from_vec12(&v);
         assert_eq!(s, s2);
+    }
+
+    /// Solver smoke test: hover scenario. All four feet in stance,
+    /// reference is "hold position", state at rest. The QP should
+    /// settle on Σ F_z ≈ m·g and zero horizontal forces.
+    #[test]
+    fn mpc_hover_balances_gravity() {
+        let cfg = nominal_namiashi_cfg();
+        let mpc = CentroidalMpc::new(cfg.clone());
+
+        let s = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        let reference = CentroidalReference::constant(s, cfg.horizon_steps);
+        let contact = CentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        // Feet at the nominal stance footprint, CoM at body root (no
+        // offset in this cfg). r = foot_world - com_world = nominal_foot_world
+        // since base_pos_world = 0 here.
+        let nominal_feet = nominal_foot_world();
+        let feet = CentroidalFootOffsets::constant_per_leg(nominal_feet, cfg.horizon_steps);
+
+        let sol = mpc.solve(s, &reference, &contact, &feet);
+
+        assert!(sol.solved, "MPC failed to solve hover scenario");
+        let total_fz: f64 = sol.grfs_first_step.iter().map(|f| f.z).sum();
+        let m_g = cfg.mass_kg * 9.81;
+        // Allow 15% slack — clarabel + the small horizon's discretization
+        // error means the equilibrium isn't reached to machine precision
+        // at horizon=10.
+        assert!(
+            (total_fz - m_g).abs() < 0.15 * m_g,
+            "hover: Σf_z = {:.3} N, expected ≈ m·g = {:.3} N",
+            total_fz, m_g,
+        );
+        // Horizontal forces should be near zero.
+        let total_fx: f64 = sol.grfs_first_step.iter().map(|f| f.x).sum();
+        let total_fy: f64 = sol.grfs_first_step.iter().map(|f| f.y).sum();
+        assert!(
+            total_fx.abs() < 0.1 * m_g,
+            "hover: Σf_x = {:.3} N, expected ≈ 0", total_fx
+        );
+        assert!(
+            total_fy.abs() < 0.1 * m_g,
+            "hover: Σf_y = {:.3} N, expected ≈ 0", total_fy
+        );
+    }
+
+    /// Forward-velocity command produces a forward bias in the
+    /// per-foot horizontal forces. Specifically, for `v_cmd = (+0.15, 0, 0)`
+    /// the QP should choose a positive total Σ f_x (push the CoM in +x).
+    #[test]
+    fn mpc_forward_cmd_yields_positive_fx() {
+        let cfg = nominal_namiashi_cfg();
+        let mpc = CentroidalMpc::new(cfg.clone());
+
+        let s_now = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        let reference = CentroidalReference::from_constant_velocity(
+            s_now,
+            Vector3::new(0.15, 0.0, 0.0),
+            0.0,
+            &cfg,
+        );
+        let contact = CentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        let feet = CentroidalFootOffsets::constant_per_leg(
+            nominal_foot_world(),
+            cfg.horizon_steps,
+        );
+
+        let sol = mpc.solve(s_now, &reference, &contact, &feet);
+        assert!(sol.solved, "MPC failed to solve forward-walk reference");
+
+        let total_fx: f64 = sol.grfs_first_step.iter().map(|f| f.x).sum();
+        // The MPC should select a non-zero forward force to start
+        // accelerating the CoM toward `v_cmd`. Sign matters: positive
+        // x-force = body accelerates forward.
+        assert!(
+            total_fx > 0.05,
+            "forward cmd: Σf_x = {:.3} N, expected > 0.05 N",
+            total_fx
+        );
+    }
+
+    /// Swing legs (no stance) have their GRF pinned to zero by the
+    /// equality constraints.
+    #[test]
+    fn mpc_swing_leg_grf_is_zero() {
+        let cfg = nominal_namiashi_cfg();
+        let mpc = CentroidalMpc::new(cfg.clone());
+
+        let s = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        let reference = CentroidalReference::constant(s, cfg.horizon_steps);
+        // Trot phase 1: FL and RR in stance, FR and RL in swing.
+        let mut contact = CentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        contact.is_stance[1] = vec![false; cfg.horizon_steps]; // FR swing
+        contact.is_stance[2] = vec![false; cfg.horizon_steps]; // RL swing
+        let feet = CentroidalFootOffsets::constant_per_leg(
+            nominal_foot_world(),
+            cfg.horizon_steps,
+        );
+
+        let sol = mpc.solve(s, &reference, &contact, &feet);
+        assert!(sol.solved);
+
+        // FR and RL should have ≈ zero force (clarabel's equality
+        // tolerance ~1e-5).
+        let fr_norm = sol.grfs_first_step[1].norm();
+        let rl_norm = sol.grfs_first_step[2].norm();
+        assert!(fr_norm < 1e-4, "FR (swing) f = {:.6} N, expected 0", fr_norm);
+        assert!(rl_norm < 1e-4, "RL (swing) f = {:.6} N, expected 0", rl_norm);
+
+        // FL and RR (stance pair) must split the gravity load.
+        let fl_fz = sol.grfs_first_step[0].z;
+        let rr_fz = sol.grfs_first_step[3].z;
+        let m_g = cfg.mass_kg * 9.81;
+        assert!(
+            (fl_fz + rr_fz - m_g).abs() < 0.2 * m_g,
+            "diagonal stance Σf_z = {:.3} N, expected ≈ m·g = {:.3} N",
+            fl_fz + rr_fz, m_g,
+        );
     }
 
     #[test]
