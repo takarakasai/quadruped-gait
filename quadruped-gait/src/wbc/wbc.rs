@@ -163,7 +163,7 @@ impl WbcWeights {
     /// hip abduction reaction-torques the body back toward the
     /// neutral pose).
     ///
-    /// Mitigation: linearly fade `swing_leg` from `1.0` (forward-only
+    /// Mitigation: linearly fade `swing_leg` from `0.2` (forward-only
     /// command) down to `0.1` as `|cmd.vy|` and `|cmd.wz|` grow.
     /// This matches the sweep's local optima per axis without touching
     /// the other tasks.
@@ -172,10 +172,24 @@ impl WbcWeights {
     /// match the test commands; cmds beyond them stay at the lateral-
     /// optimal weight. Hosts that want a different schedule can
     /// override `swing_leg` (or any other field) directly after this.
+    ///
+    /// Forward-axis sweep (constant `SWING_LATERAL = 0.1`):
+    /// | SWING_FWD | body_dx | body_dy            | Δyaw     |
+    /// |-----------|---------|--------------------|----------|
+    /// | 1.0 (was) | +0.124  | -0.117             | -0.554   |
+    /// | **0.2 (now)** | **+0.118** | **-0.034 (−3.4x)** | +0.589   |
+    /// | 0.3       | +1.700  | -0.315             | +2.574   |
+    /// | 0.5       | -0.399  | -0.718             | -0.811   |
+    ///
+    /// `0.2` keeps forward dx ≈ baseline while cutting lateral cross-
+    /// coupling 3-4×. Going to `0.3` overshoots forward but explodes
+    /// yaw drift; `0.5+` flips the sign — the system has narrow stable
+    /// bands so this knob is fragile, but `0.2` is the best compromise
+    /// in the regression suite.
     pub fn for_cmd(cmd: &crate::config::VelocityCmd) -> Self {
         const VY_FULL: f64 = 0.10;
         const WZ_FULL: f64 = 0.5;
-        const SWING_FORWARD: f64 = 1.0;
+        const SWING_FORWARD: f64 = 0.2;
         const SWING_LATERAL: f64 = 0.1;
         let lat = (cmd.vy.abs() / VY_FULL).min(1.0);
         let yaw = (cmd.wz.abs() / WZ_FULL).min(1.0);
@@ -293,7 +307,7 @@ mod tests {
     #[test]
     fn for_cmd_pure_forward_keeps_default_swing_leg() {
         let w = WbcWeights::for_cmd(&VelocityCmd { vx: 0.5, vy: 0.0, wz: 0.0 });
-        assert_eq!(w.swing_leg, 1.0);
+        assert!((w.swing_leg - 0.2).abs() < 1e-9);
     }
 
     /// Pure full-rate lateral command snaps swing_leg to the lateral-
