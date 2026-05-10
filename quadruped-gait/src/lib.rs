@@ -59,6 +59,7 @@ pub mod footstep;
 pub mod generator;
 pub mod centroidal_controller;
 pub mod centroidal_mpc;
+pub mod full_centroidal_controller;
 pub mod full_centroidal_mpc;
 pub mod ik;
 pub mod mpc_controller;
@@ -88,6 +89,12 @@ pub use centroidal_mpc::{
     centroidal_dynamics, predicted_base_accel_world_centroidal, CentroidalContactSchedule,
     CentroidalFootOffsets, CentroidalInput, CentroidalMpc, CentroidalMpcConfig,
     CentroidalMpcSolution, CentroidalReference, CentroidalState,
+};
+pub use full_centroidal_controller::FullCentroidalMpcGaitController;
+pub use full_centroidal_mpc::{
+    full_centroidal_dynamics, FullCentroidalContactSchedule, FullCentroidalInput,
+    FullCentroidalMpc, FullCentroidalMpcConfig, FullCentroidalMpcSolution,
+    FullCentroidalReference, FullCentroidalState,
 };
 pub use srbd_mpc::{
     predicted_base_accel_world, ContactSchedule, FootOffsets, MpcSolution,

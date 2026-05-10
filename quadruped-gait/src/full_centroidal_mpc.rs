@@ -244,6 +244,56 @@ pub struct FullCentroidalMpcConfig {
     pub kinematics: KinematicsConfig,
 }
 
+impl FullCentroidalMpcConfig {
+    /// Sensible defaults for a Cheetah-3-class quadruped, with the
+    /// caller supplying the per-leg `KinematicsConfig` (the one field
+    /// that has no model-independent default). Mirrors
+    /// `CentroidalMpcConfig::default()` for the body params; cost
+    /// weights are conservative and the host typically overrides via
+    /// `auto_detect_full_centroidal_mpc_config`.
+    pub fn default_with_kin(kinematics: KinematicsConfig) -> Self {
+        let mut q_diag = [0.0; N_STATE];
+        // Body block (12 entries) — same shape as 12-state CentroidalMpc
+        // defaults: v_com, ω, base_pos, euler.
+        q_diag[0..3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        q_diag[3..6].copy_from_slice(&[0.5, 0.5, 10.0]);
+        q_diag[6..9].copy_from_slice(&[0.0, 5.0, 50.0]);
+        q_diag[9..12].copy_from_slice(&[25.0, 25.0, 50.0]);
+        // joint_q block (12 entries) — light weight so the cost biases
+        // toward the held reference without overriding stance no-slip
+        // forced joint motion.
+        for i in 12..N_STATE {
+            q_diag[i] = 0.1;
+        }
+
+        let mut r_diag = [0.0; N_INPUT];
+        // GRF cost (12 entries) — same as 12-state default.
+        for i in 0..12 {
+            r_diag[i] = 1e-3;
+        }
+        // joint_v cost (12 entries) — heavier than GRF so the optimiser
+        // doesn't fire crazy joint velocities; stance no-slip equality
+        // overrides this when foot pinning requires non-zero `joint_v`.
+        for i in 12..N_INPUT {
+            r_diag[i] = 1.0;
+        }
+
+        Self {
+            mass_kg: 9.0,
+            centroidal_inertia_body: Matrix3::from_diagonal(&Vector3::new(0.07, 0.26, 0.242)),
+            com_offset_body: Vector3::zeros(),
+            friction_mu: 0.5,
+            max_normal_force: 200.0,
+            horizon_steps: 10,
+            dt_per_step: 0.030,
+            q_diag,
+            r_diag,
+            sqp_iterations: 3,
+            kinematics,
+        }
+    }
+}
+
 /// Continuous-time full-centroidal dynamics: ẋ = f(x, u).
 ///
 /// Differs from [`crate::centroidal_mpc::centroidal_dynamics`] in three

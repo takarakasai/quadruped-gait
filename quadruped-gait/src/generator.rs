@@ -142,6 +142,13 @@ pub enum GaitMode {
     /// over centroidal coordinates). Available for direct comparison
     /// against `Mpc` — both are kept as baselines.
     CentroidalSrbd,
+    /// Full-centroidal MPC (D3.3): 25-state SQP with joint angles in
+    /// the state and joint velocities in the input, plus a stance
+    /// no-slip equality. Equivalent to legged_control's
+    /// `centroidalModelType = 0`. Designed to fix the lateral-inversion
+    /// and forward-dy cross-coupling that empirical tuning + 12-state
+    /// SQP could not eliminate.
+    FullCentroidal,
 }
 
 impl Default for GaitMode {
@@ -157,12 +164,14 @@ impl GaitMode {
             GaitMode::Champ => "CHAMP (open-loop)",
             GaitMode::Mpc => "MPC (capture-point)",
             GaitMode::CentroidalSrbd => "MPC (centroidal-SRBD)",
+            GaitMode::FullCentroidal => "MPC (full-centroidal 24s)",
         }
     }
-    pub const ALL: [GaitMode; 3] = [
+    pub const ALL: [GaitMode; 4] = [
         GaitMode::Champ,
         GaitMode::Mpc,
         GaitMode::CentroidalSrbd,
+        GaitMode::FullCentroidal,
     ];
 }
 
@@ -175,6 +184,7 @@ pub enum AnyGaitController {
     Champ(ChampGaitController),
     Mpc(crate::MpcGaitController),
     CentroidalSrbd(crate::CentroidalMpcGaitController),
+    FullCentroidal(crate::FullCentroidalMpcGaitController),
 }
 
 impl AnyGaitController {
@@ -189,6 +199,9 @@ impl AnyGaitController {
             GaitMode::CentroidalSrbd => AnyGaitController::CentroidalSrbd(
                 crate::CentroidalMpcGaitController::new(cfg, kin),
             ),
+            GaitMode::FullCentroidal => AnyGaitController::FullCentroidal(
+                crate::FullCentroidalMpcGaitController::new(cfg, kin),
+            ),
         }
     }
 
@@ -197,6 +210,7 @@ impl AnyGaitController {
             AnyGaitController::Champ(_) => GaitMode::Champ,
             AnyGaitController::Mpc(_) => GaitMode::Mpc,
             AnyGaitController::CentroidalSrbd(_) => GaitMode::CentroidalSrbd,
+            AnyGaitController::FullCentroidal(_) => GaitMode::FullCentroidal,
         }
     }
 
@@ -231,6 +245,7 @@ impl AnyGaitController {
             AnyGaitController::Champ(_) => None,
             AnyGaitController::Mpc(c) => c.predicted_grfs(),
             AnyGaitController::CentroidalSrbd(c) => c.predicted_grfs(),
+            AnyGaitController::FullCentroidal(c) => c.predicted_grfs(),
         }
     }
 
@@ -247,6 +262,19 @@ impl AnyGaitController {
         }
     }
 
+    /// Native full-centroidal MPC solution (only in
+    /// [`GaitMode::FullCentroidal`]). Hosts that want 24-state-aware
+    /// WBC integration read this; everyone else can use
+    /// [`Self::predicted_grfs`].
+    pub fn predicted_full_centroidal_solution(
+        &self,
+    ) -> Option<&crate::full_centroidal_mpc::FullCentroidalMpcSolution> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => c.predicted_full_centroidal_solution(),
+            _ => None,
+        }
+    }
+
     /// Per-leg stance-foot torque feedforward (`τ = -J^T·f_GRF`)
     /// computed from the last MPC solve.
     pub fn stance_grf_torques(
@@ -257,6 +285,7 @@ impl AnyGaitController {
             AnyGaitController::Champ(_) => [None; 4],
             AnyGaitController::Mpc(c) => c.stance_grf_torques(output),
             AnyGaitController::CentroidalSrbd(c) => c.stance_grf_torques(output),
+            AnyGaitController::FullCentroidal(c) => c.stance_grf_torques(output),
         }
     }
 
@@ -301,6 +330,27 @@ impl AnyGaitController {
             _ => None,
         }
     }
+
+    /// Override the full-centroidal MPC's config. No-op outside of
+    /// [`GaitMode::FullCentroidal`].
+    pub fn set_full_centroidal_mpc_config(
+        &mut self,
+        cfg: crate::full_centroidal_mpc::FullCentroidalMpcConfig,
+    ) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_full_centroidal_mpc_config(cfg);
+        }
+    }
+
+    /// Read the active full-centroidal MPC config.
+    pub fn full_centroidal_mpc_config(
+        &self,
+    ) -> Option<&crate::full_centroidal_mpc::FullCentroidalMpcConfig> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.full_centroidal_mpc_config()),
+            _ => None,
+        }
+    }
 }
 
 impl GaitGenerator for AnyGaitController {
@@ -309,6 +359,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.tick(dt),
             AnyGaitController::Mpc(c) => c.tick(dt),
             AnyGaitController::CentroidalSrbd(c) => c.tick(dt),
+            AnyGaitController::FullCentroidal(c) => c.tick(dt),
         }
     }
     fn set_velocity_cmd(&mut self, cmd: VelocityCmd) {
@@ -316,6 +367,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.set_velocity_cmd(cmd),
             AnyGaitController::Mpc(c) => c.set_velocity_cmd(cmd),
             AnyGaitController::CentroidalSrbd(c) => c.set_velocity_cmd(cmd),
+            AnyGaitController::FullCentroidal(c) => c.set_velocity_cmd(cmd),
         }
     }
     fn velocity_cmd(&self) -> VelocityCmd {
@@ -323,6 +375,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.velocity_cmd(),
             AnyGaitController::Mpc(c) => c.velocity_cmd(),
             AnyGaitController::CentroidalSrbd(c) => c.velocity_cmd(),
+            AnyGaitController::FullCentroidal(c) => c.velocity_cmd(),
         }
     }
     fn reset(&mut self) {
@@ -330,6 +383,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.reset(),
             AnyGaitController::Mpc(c) => c.reset(),
             AnyGaitController::CentroidalSrbd(c) => c.reset(),
+            AnyGaitController::FullCentroidal(c) => c.reset(),
         }
     }
     fn config(&self) -> &GaitConfig {
@@ -337,6 +391,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.config(),
             AnyGaitController::Mpc(c) => c.config(),
             AnyGaitController::CentroidalSrbd(c) => c.config(),
+            AnyGaitController::FullCentroidal(c) => c.config(),
         }
     }
     fn set_config(&mut self, cfg: GaitConfig) {
@@ -344,6 +399,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.set_config(cfg),
             AnyGaitController::Mpc(c) => c.set_config(cfg),
             AnyGaitController::CentroidalSrbd(c) => c.set_config(cfg),
+            AnyGaitController::FullCentroidal(c) => c.set_config(cfg),
         }
     }
     fn kinematics(&self) -> &KinematicsConfig {
@@ -351,6 +407,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.kinematics(),
             AnyGaitController::Mpc(c) => c.kinematics(),
             AnyGaitController::CentroidalSrbd(c) => c.kinematics(),
+            AnyGaitController::FullCentroidal(c) => c.kinematics(),
         }
     }
     fn set_kinematics(&mut self, kin: KinematicsConfig) {
@@ -358,6 +415,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.set_kinematics(kin),
             AnyGaitController::Mpc(c) => c.set_kinematics(kin),
             AnyGaitController::CentroidalSrbd(c) => c.set_kinematics(kin),
+            AnyGaitController::FullCentroidal(c) => c.set_kinematics(kin),
         }
     }
     fn set_knee_forward(&mut self, leg: LegId, forward: bool) {
@@ -365,6 +423,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.set_knee_forward(leg, forward),
             AnyGaitController::Mpc(c) => c.set_knee_forward(leg, forward),
             AnyGaitController::CentroidalSrbd(c) => c.set_knee_forward(leg, forward),
+            AnyGaitController::FullCentroidal(c) => c.set_knee_forward(leg, forward),
         }
     }
     fn set_knee_pattern(&mut self, pattern: KneePattern) {
@@ -372,6 +431,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.set_knee_pattern(pattern),
             AnyGaitController::Mpc(c) => c.set_knee_pattern(pattern),
             AnyGaitController::CentroidalSrbd(c) => c.set_knee_pattern(pattern),
+            AnyGaitController::FullCentroidal(c) => c.set_knee_pattern(pattern),
         }
     }
     fn knee_pattern(&self) -> KneePattern {
@@ -379,6 +439,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.knee_pattern(),
             AnyGaitController::Mpc(c) => c.knee_pattern(),
             AnyGaitController::CentroidalSrbd(c) => c.knee_pattern(),
+            AnyGaitController::FullCentroidal(c) => c.knee_pattern(),
         }
     }
     fn knee_forward(&self) -> [bool; 4] {
@@ -386,6 +447,7 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.knee_forward(),
             AnyGaitController::Mpc(c) => c.knee_forward(),
             AnyGaitController::CentroidalSrbd(c) => c.knee_forward(),
+            AnyGaitController::FullCentroidal(c) => c.knee_forward(),
         }
     }
     fn set_body_state_observed(
@@ -397,6 +459,9 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(c) => c.set_body_state_observed(v_world, omega_world),
             AnyGaitController::Mpc(c) => c.set_body_state_observed(v_world, omega_world),
             AnyGaitController::CentroidalSrbd(c) => {
+                c.set_body_state_observed(v_world, omega_world)
+            }
+            AnyGaitController::FullCentroidal(c) => {
                 c.set_body_state_observed(v_world, omega_world)
             }
         }
@@ -413,6 +478,9 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Champ(_) => {}
             AnyGaitController::Mpc(c) => c.set_body_pose_observed(world_yaw, world_position),
             AnyGaitController::CentroidalSrbd(c) => {
+                c.set_body_pose_observed(world_yaw, world_position)
+            }
+            AnyGaitController::FullCentroidal(c) => {
                 c.set_body_pose_observed(world_yaw, world_position)
             }
         }
