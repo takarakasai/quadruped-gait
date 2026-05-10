@@ -191,6 +191,31 @@ pub struct CentroidalMpcConfig {
     /// Input cost weight (scalar applied uniformly across all 12 GRF
     /// components per step).
     pub r_diag: f64,
+    /// SQP-style re-linearisation iterations within a single
+    /// [`CentroidalMpc::solve`] call.
+    ///
+    /// The convex centroidal QP linearises angular dynamics around a
+    /// reference yaw (`psi_ref`) and small roll/pitch. When the
+    /// reference's predicted yaw evolves significantly across the
+    /// horizon (e.g. yaw command at 0.5 rad/s × 300 ms ≈ 0.15 rad
+    /// of yaw change) the linearisation error accumulates and the
+    /// QP's optimum diverges from the true non-linear optimum.
+    ///
+    /// SQP fixes this by:
+    ///   1. Solving the QP linearised at the reference (or previous
+    ///      iteration's predicted trajectory).
+    ///   2. Using the predicted trajectory from that QP as the new
+    ///      linearisation point and re-solving.
+    ///   3. Repeating until the trajectory converges or `sqp_iterations`
+    ///      iterations have run.
+    ///
+    /// `1` (default) ⇒ single-shot solve (D1 behaviour, fastest).
+    /// `2-3`         ⇒ typical SQP iteration count for legged_control-
+    ///                 class controllers — improves angular tracking
+    ///                 at non-zero yaw cmds at the cost of solver time.
+    /// `>5`          ⇒ usually overkill; convergence stalls fast for
+    ///                 short-horizon convex QPs.
+    pub sqp_iterations: usize,
 }
 
 impl Default for CentroidalMpcConfig {
@@ -230,6 +255,7 @@ impl Default for CentroidalMpcConfig {
                 25.0, 25.0, 50.0,
             ],
             r_diag: 1e-3,
+            sqp_iterations: 1,
         }
     }
 }
@@ -577,14 +603,71 @@ impl CentroidalMpc {
             assert_eq!(feet.r[leg].len(), n);
         }
 
-        // ── Build per-step continuous-time A_c, B_c, then discretise ──
         let nx = 13_usize;
         let nu = 12_usize;
+        let n_iter = self.cfg.sqp_iterations.max(1);
+
+        // ── SQP iteration loop ──────────────────────────────────────
+        // Each iteration:
+        //   1. Build QP linearised at `psi_ref_per_step`.
+        //   2. Solve, get optimal U and predicted state trajectory.
+        //   3. Update `psi_ref_per_step` from the predicted yaw at each
+        //      step. The next iteration linearises angular dynamics
+        //      around the new (closer to optimal) trajectory.
+        // For `sqp_iterations = 1` the loop runs once with the
+        // reference trajectory's yaw — identical to D1's single-shot
+        // behaviour, no extra cost.
+        let mut psi_ref_per_step: Vec<f64> = reference
+            .states
+            .iter()
+            .map(|s| s.base_euler_zyx.z)
+            .collect();
+        let mut last_solution: Option<CentroidalMpcSolution> = None;
+        for iter in 0..n_iter {
+            let sol = self.solve_one_iter(
+                state_now,
+                reference,
+                contact,
+                feet,
+                &psi_ref_per_step,
+                nx,
+                nu,
+                n,
+            );
+            // Update linearisation point for the next iteration (if any)
+            // from the predicted yaw trajectory of this iteration's
+            // solution. Skip if solver failed — keep the previous psi_ref.
+            if iter + 1 < n_iter && sol.solved {
+                for k in 0..n {
+                    psi_ref_per_step[k] = sol.predicted_body_states[k].base_euler_zyx.z;
+                }
+            }
+            last_solution = Some(sol);
+        }
+        last_solution.expect("at least one SQP iteration ran")
+    }
+
+    /// Build + solve one SQP iteration's QP at the given per-step
+    /// linearisation yaw. Used by [`Self::solve`]'s outer loop. The
+    /// non-yaw inputs (`reference`, `contact`, `feet`) and the QP
+    /// dimensions (`nx`, `nu`, `n`) are passed in to avoid recomputing.
+    fn solve_one_iter(
+        &self,
+        state_now: CentroidalState,
+        reference: &CentroidalReference,
+        contact: &CentroidalContactSchedule,
+        feet: &CentroidalFootOffsets,
+        psi_ref_per_step: &[f64],
+        nx: usize,
+        nu: usize,
+        n: usize,
+    ) -> CentroidalMpcSolution {
+        // ── Build per-step continuous-time A_c, B_c, then discretise ──
 
         let mut a_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
         let mut b_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
         for k in 0..n {
-            let psi_ref = reference.states[k].base_euler_zyx.z;
+            let psi_ref = psi_ref_per_step[k];
             let r_per_leg = [feet.r[0][k], feet.r[1][k], feet.r[2][k], feet.r[3][k]];
             let stance = [
                 contact.is_stance[0][k],
@@ -1012,6 +1095,7 @@ mod tests {
                 1.0, 1.0, 1.0, 0.5, 0.5, 10.0, 0.0, 20.0, 50.0, 25.0, 25.0, 50.0,
             ],
             r_diag: 1e-3,
+            sqp_iterations: 1,
         }
     }
 
@@ -1363,6 +1447,51 @@ mod tests {
                 epsilon = 1e-9,
             );
         }
+    }
+
+    /// SQP iterations smoke test: at `sqp_iterations = 3`, solving a
+    /// yaw-cmd reference produces a solution whose objective is no
+    /// worse than the single-shot baseline (`sqp_iterations = 1`).
+    /// Re-linearising at the predicted trajectory should never make
+    /// the cost go up — that would mean the QP found a worse optimum
+    /// than the reference linearisation, which is impossible for a
+    /// convex problem barring numerical noise.
+    #[test]
+    fn mpc_sqp_iter_does_not_increase_objective() {
+        let mut cfg_single = nominal_namiashi_cfg();
+        cfg_single.sqp_iterations = 1;
+        let mut cfg_iter = nominal_namiashi_cfg();
+        cfg_iter.sqp_iterations = 3;
+
+        let s_now = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        let reference = CentroidalReference::from_constant_velocity(
+            s_now,
+            Vector3::zeros(),
+            0.5, // yaw rate
+            &cfg_single,
+        );
+        let contact = CentroidalContactSchedule::all_stance(cfg_single.horizon_steps);
+        let feet = CentroidalFootOffsets::constant_per_leg(
+            nominal_foot_world(),
+            cfg_single.horizon_steps,
+        );
+
+        let mpc_single = CentroidalMpc::new(cfg_single);
+        let mpc_iter = CentroidalMpc::new(cfg_iter);
+        let s = mpc_single.solve(s_now, &reference, &contact, &feet);
+        let i = mpc_iter.solve(s_now, &reference, &contact, &feet);
+
+        assert!(s.solved && i.solved);
+        // The 3-iteration objective should be at most the 1-iteration
+        // objective (within numerical tolerance).
+        assert!(
+            i.objective <= s.objective + 1e-6,
+            "SQP 3-iter obj ({:.6}) > 1-iter obj ({:.6})",
+            i.objective, s.objective,
+        );
     }
 
     /// Yaw rate command (`wz = +0.5`) should produce a positive
