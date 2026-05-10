@@ -366,7 +366,7 @@ pub fn centroidal_dynamics(
 /// Singular at `pitch = ±π/2` (gimbal lock). The controller's
 /// operating regime keeps `|pitch| ≪ π/2`; the tiny `cp_safe` clamp
 /// only fires for pathological inputs and bounds the divergence.
-fn euler_zyx_dot_from_world_omega(
+pub fn euler_zyx_dot_from_world_omega(
     euler: &Vector3<f64>,
     omega_world: &Vector3<f64>,
 ) -> Vector3<f64> {
