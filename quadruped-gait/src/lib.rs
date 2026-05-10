@@ -59,6 +59,7 @@ pub mod footstep;
 pub mod generator;
 pub mod centroidal_controller;
 pub mod centroidal_mpc;
+pub mod full_centroidal_mpc;
 pub mod ik;
 pub mod mpc_controller;
 pub mod mpc_reference;
