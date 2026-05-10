@@ -1562,6 +1562,67 @@ mod tests {
         );
     }
 
+    /// Convergence test: at typical gait commands (yaw 0.5 rad/s,
+    /// horizon 300 ms ⇒ ~8.6° yaw drift over horizon), `sqp_iterations
+    /// = 3` already converges to within 0.5 % of the `sqp_iterations
+    /// = 5` solution. This justifies the host default of 3 — going
+    /// to 5 (= 67 % more solver time) gives no measurable improvement.
+    ///
+    /// Linearisation-error drives convergence speed. For ZYX Euler at
+    /// small angles, `sin(δψ) ≈ δψ` to within `δψ²/6` ≈ 0.4 %
+    /// at δψ = 0.15 rad. Iteration 1 gets the bulk of the correction;
+    /// iterations 2-3 handle the residual quadratic / cross-coupling
+    /// terms; iteration 4+ converges into clarabel's interior-point
+    /// numerical noise floor.
+    #[test]
+    fn mpc_sqp_3_iters_match_5_iters() {
+        let mut cfg_3 = nominal_namiashi_cfg();
+        cfg_3.sqp_iterations = 3;
+        let mut cfg_5 = nominal_namiashi_cfg();
+        cfg_5.sqp_iterations = 5;
+
+        let s_now = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        // Realistic gait command: yaw + small forward.
+        let reference = CentroidalReference::from_constant_velocity(
+            s_now,
+            Vector3::new(0.15, 0.0, 0.0),
+            0.5,
+            &cfg_3,
+        );
+        let contact = CentroidalContactSchedule::all_stance(cfg_3.horizon_steps);
+        let feet = CentroidalFootOffsets::constant_per_leg(
+            nominal_foot_world(),
+            cfg_3.horizon_steps,
+        );
+
+        let mut mpc_3 = CentroidalMpc::new(cfg_3);
+        let mut mpc_5 = CentroidalMpc::new(cfg_5);
+        let s3 = mpc_3.solve(s_now, &reference, &contact, &feet);
+        let s5 = mpc_5.solve(s_now, &reference, &contact, &feet);
+        assert!(s3.solved && s5.solved);
+
+        // Objectives within 0.5 % relative.
+        let rel_err = ((s3.objective - s5.objective) / s5.objective.max(1e-9)).abs();
+        assert!(
+            rel_err < 5e-3,
+            "SQP=3 objective {:.6} vs SQP=5 {:.6}, relative error {:.4} — \
+             expected < 0.5 %",
+            s3.objective, s5.objective, rel_err,
+        );
+
+        // First-step GRFs match within 0.1 N (= 0.4 % of m·g for namiashi).
+        for slot in 0..4 {
+            let diff = (s3.grfs_first_step[slot] - s5.grfs_first_step[slot]).norm();
+            assert!(
+                diff < 0.1,
+                "SQP=3 vs SQP=5 grf[leg {}] differ by {:.4} N", slot, diff
+            );
+        }
+    }
+
     /// SQP iterations smoke test: at `sqp_iterations = 3`, solving a
     /// yaw-cmd reference produces a solution whose objective is no
     /// worse than the single-shot baseline (`sqp_iterations = 1`).
