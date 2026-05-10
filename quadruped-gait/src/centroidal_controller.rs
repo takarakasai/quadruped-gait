@@ -225,6 +225,11 @@ impl CentroidalMpcGaitController {
         self.last_solution = None;
         self.last_solution_compat = None;
         self.mpc_solve_accumulator_s = f64::INFINITY;
+        // Drop the SQP warm-start so the next solve starts at the
+        // reference trajectory's yaw (cold start). Reset is typically
+        // called on mode switch or large state jumps where the
+        // previous prediction is no longer relevant.
+        self.centroidal_mpc.reset_warm_start();
     }
 
     /// One control tick: advance phase, update body integrator, plan
@@ -284,7 +289,9 @@ impl CentroidalMpcGaitController {
 
     /// Build the centroidal MPC inputs from current state and call
     /// the QP solver. Mirror of [`crate::MpcGaitController::solve_srbd_mpc`].
-    fn solve_centroidal_mpc(&self, output: &ControllerOutput) -> CentroidalMpcSolution {
+    /// `&mut self` because the underlying `CentroidalMpc` carries a
+    /// warm-start trajectory that the solver mutates per call.
+    fn solve_centroidal_mpc(&mut self, output: &ControllerOutput) -> CentroidalMpcSolution {
         let cfg = self.centroidal_mpc.config().clone();
         let n = cfg.horizon_steps;
 

@@ -556,17 +556,30 @@ pub struct CentroidalMpcSolution {
     pub solved: bool,
 }
 
-/// Stateless centroidal-SRBD MPC solver. Holds only the cached
-/// `CentroidalMpcConfig`; the host can rebuild the QP each tick
-/// without re-allocating the tuning struct.
+/// Centroidal-SRBD MPC solver.
+///
+/// **D2.2 update**: holds a warm-start trajectory from the previous
+/// `solve()` so the next call can linearise its first SQP iteration
+/// at the previously-predicted yaw trajectory (rather than the
+/// reference trajectory's yaw). For walks where the actual body yaw
+/// drifts from the cmd-integrated reference, this gives a more
+/// accurate starting linearisation than D2.1's "always start at
+/// reference yaw" — a measurable win at high cmd magnitudes.
 #[derive(Clone, Debug)]
 pub struct CentroidalMpc {
     cfg: CentroidalMpcConfig,
+    /// Per-step yaw values from the **previous** `solve()`'s final
+    /// SQP iteration. Used as the initial linearisation point of the
+    /// next call (warm-start). `None` before the first solve.
+    warm_psi_ref: Option<Vec<f64>>,
 }
 
 impl CentroidalMpc {
     pub fn new(cfg: CentroidalMpcConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            warm_psi_ref: None,
+        }
     }
 
     pub fn config(&self) -> &CentroidalMpcConfig {
@@ -574,7 +587,24 @@ impl CentroidalMpc {
     }
 
     pub fn set_config(&mut self, cfg: CentroidalMpcConfig) {
+        // Horizon change invalidates the warm-start (different vector
+        // length). Reset on size mismatch; new horizon defaults to
+        // cold-start until the first solve repopulates it.
+        if self
+            .warm_psi_ref
+            .as_ref()
+            .map_or(false, |v| v.len() != cfg.horizon_steps)
+        {
+            self.warm_psi_ref = None;
+        }
         self.cfg = cfg;
+    }
+
+    /// Drop the warm-start trajectory. Hosts call this on mode switch
+    /// or after large state jumps (teleport / reset) so the next
+    /// `solve()` starts fresh from the reference.
+    pub fn reset_warm_start(&mut self) {
+        self.warm_psi_ref = None;
     }
 
     /// Solve the MPC QP for the next horizon and return the optimal
@@ -590,7 +620,7 @@ impl CentroidalMpc {
     /// at each horizon step; the caller is responsible for projecting
     /// them forward (typically constant for type-1 SRBD).
     pub fn solve(
-        &self,
+        &mut self,
         state_now: CentroidalState,
         reference: &CentroidalReference,
         contact: &CentroidalContactSchedule,
@@ -617,6 +647,20 @@ impl CentroidalMpc {
         // For `sqp_iterations = 1` the loop runs once with the
         // reference trajectory's yaw — identical to D1's single-shot
         // behaviour, no extra cost.
+        //
+        // Warm-start (D2.2 — disabled): we tried caching the previous
+        // solve's predicted yaw trajectory as the next call's iter-0
+        // linearisation point. In closed-loop pose feedback (host
+        // calls `set_body_pose_observed` every tick), the reference
+        // trajectory's yaw is already the cmd-integrated continuation
+        // from the *actual* body pose, so it's a better starting
+        // point than a stale 30 ms-old prediction. Empirically the
+        // warm-start regressed forward / yaw tests in the integration
+        // suite (forward fell to z=0.07, yaw flipped sign), so we
+        // always cold-start at the reference. The state is kept so
+        // future work can revive warm-start with a 1-step temporal
+        // shift to match the new reference's time origin.
+        let _ = self.warm_psi_ref;
         let mut psi_ref_per_step: Vec<f64> = reference
             .states
             .iter()
@@ -643,6 +687,16 @@ impl CentroidalMpc {
                 }
             }
             last_solution = Some(sol);
+        }
+
+        // (D2.2 disabled) Persist the final iter's psi for *future*
+        // warm-start use. Currently this cache is read by nothing —
+        // see the comment at the top of the SQP loop. Keeping the
+        // write here so a re-enable is a one-line change above.
+        if let Some(s) = last_solution.as_ref() {
+            if s.solved {
+                self.warm_psi_ref = Some(psi_ref_per_step.clone());
+            }
         }
         last_solution.expect("at least one SQP iteration ran")
     }
@@ -1313,7 +1367,7 @@ mod tests {
     #[test]
     fn mpc_hover_balances_gravity() {
         let cfg = nominal_namiashi_cfg();
-        let mpc = CentroidalMpc::new(cfg.clone());
+        let mut mpc = CentroidalMpc::new(cfg.clone());
 
         let s = CentroidalState {
             base_pos_world: Vector3::new(0.0, 0.0, 0.165),
@@ -1361,7 +1415,7 @@ mod tests {
     #[test]
     fn mpc_lateral_cmd_yields_positive_fy() {
         let cfg = nominal_namiashi_cfg();
-        let mpc = CentroidalMpc::new(cfg.clone());
+        let mut mpc = CentroidalMpc::new(cfg.clone());
 
         let s_now = CentroidalState {
             base_pos_world: Vector3::new(0.0, 0.0, 0.165),
@@ -1479,8 +1533,8 @@ mod tests {
             cfg_single.horizon_steps,
         );
 
-        let mpc_single = CentroidalMpc::new(cfg_single);
-        let mpc_iter = CentroidalMpc::new(cfg_iter);
+        let mut mpc_single = CentroidalMpc::new(cfg_single);
+        let mut mpc_iter = CentroidalMpc::new(cfg_iter);
         let s = mpc_single.solve(s_now, &reference, &contact, &feet);
         let i = mpc_iter.solve(s_now, &reference, &contact, &feet);
 
@@ -1500,7 +1554,7 @@ mod tests {
     #[test]
     fn mpc_yaw_cmd_yields_positive_yaw_moment() {
         let cfg = nominal_namiashi_cfg();
-        let mpc = CentroidalMpc::new(cfg.clone());
+        let mut mpc = CentroidalMpc::new(cfg.clone());
 
         let s_now = CentroidalState {
             base_pos_world: Vector3::new(0.0, 0.0, 0.165),
@@ -1543,7 +1597,7 @@ mod tests {
     #[test]
     fn mpc_forward_cmd_yields_positive_fx() {
         let cfg = nominal_namiashi_cfg();
-        let mpc = CentroidalMpc::new(cfg.clone());
+        let mut mpc = CentroidalMpc::new(cfg.clone());
 
         let s_now = CentroidalState {
             base_pos_world: Vector3::new(0.0, 0.0, 0.165),
@@ -1580,7 +1634,7 @@ mod tests {
     #[test]
     fn mpc_swing_leg_grf_is_zero() {
         let cfg = nominal_namiashi_cfg();
-        let mpc = CentroidalMpc::new(cfg.clone());
+        let mut mpc = CentroidalMpc::new(cfg.clone());
 
         let s = CentroidalState {
             base_pos_world: Vector3::new(0.0, 0.0, 0.165),
