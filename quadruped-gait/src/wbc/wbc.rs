@@ -198,6 +198,34 @@ impl WbcWeights {
         w.swing_leg = SWING_FORWARD * (1.0 - intensity) + SWING_LATERAL * intensity;
         w
     }
+
+    /// Per-cmd weight schedule for the **centroidal-SRBD MPC** mode.
+    ///
+    /// **H-sweep result**: tried halved (`0.1 / 0.05`), doubled
+    /// (`0.4 / 0.2`), and identical (`0.2 / 0.1`) swing_leg weights
+    /// vs the body-root SRBD baseline. None of the variants pass
+    /// all 3 axes simultaneously:
+    ///
+    /// | Variant | forward | lateral | yaw |
+    /// |---|---|---|---|
+    /// | identical (= for_cmd) | dx +0.777 ✓ | dy −0.134 ✗ | dyaw +1.599 ✓ |
+    /// | halved 0.5× | dy +0.260, yaw −2.825 ✗ | dy +0.020 (no motion) | fell |
+    /// | doubled 2.0× | dx −0.299 ✗ | dy −0.210 ✗ | dyaw +2.637, dx/dy ✗ |
+    ///
+    /// Conclusion: the swing_leg-vs-MPC mismatch is more nuanced
+    /// than a uniform scale factor. We keep this entry point
+    /// intentionally identical to [`Self::for_cmd`] so hosts can
+    /// flip mode-aware logic on without changing observed behaviour;
+    /// future tuning can refine the constants here without changing
+    /// the call sites.
+    pub fn for_cmd_centroidal(cmd: &crate::config::VelocityCmd) -> Self {
+        // H-sweep settled on body-root values as the best uniform
+        // compromise. See for_cmd's per-axis trade-off table; the
+        // centroidal-specific tune may need axis-conditional weights
+        // (different for vx vs vy vs wz cmds) which would require a
+        // structural change to `WbcWeights`.
+        Self::for_cmd(cmd)
+    }
 }
 
 /// Warm-start hint carried across WBC ticks.
