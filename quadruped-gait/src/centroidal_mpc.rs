@@ -364,6 +364,60 @@ fn euler_zyx_dot_from_world_omega(
     Vector3::new(roll_dot, pitch_dot, yaw_dot)
 }
 
+/// Predicted base acceleration (body root, world frame) given the
+/// centroidal-SRBD model and the current MPC GRFs. Sibling of
+/// [`crate::predicted_base_accel_world`] but uses the CoM-aware
+/// moment arm `r_i = foot_world − CoM_world`, where `CoM_world =
+/// body_root_world + R_world_body · cfg.com_offset_body`.
+///
+/// Used by the WBC pipeline to compute its `a_base_des` reference
+/// when the host's gait controller is in `GaitMode::CentroidalSrbd`.
+/// In that mode the MPC's predicted GRFs satisfy CoM Newton-Euler
+/// (not body-root), so feeding them through the body-root
+/// `predicted_base_accel_world` would create a 2-3% moment-arm
+/// mismatch that the WBC then chases unsuccessfully — exactly the
+/// failure mode that broke the C1 attempt.
+///
+/// Returns `(a_lin_world, a_ang_world)`. The linear accel is the same
+/// as the body-root version (`Σf/m + g` is independent of where the
+/// reference point sits — the kinematic difference between root and
+/// CoM linear acceleration is `O(α · com_offset)`, well below WBC's
+/// noise floor for typical 5 mm offsets and 1 rad/s² angular accels).
+/// The angular accel uses the centroidal moment-arm correction.
+pub fn predicted_base_accel_world_centroidal(
+    cfg: &CentroidalMpcConfig,
+    body_pos_world: Vector3<f64>,
+    body_quat_to_world: nalgebra::UnitQuaternion<f64>,
+    omega_obs_world: Vector3<f64>,
+    grfs_world: &[Vector3<f64>; 4],
+    foot_positions_world: &[Vector3<f64>; 4],
+) -> (Vector3<f64>, Vector3<f64>) {
+    let g_world = Vector3::new(0.0, 0.0, -9.81);
+
+    // Linear: Σf/m + g.
+    let total_f: Vector3<f64> = grfs_world.iter().sum();
+    let a_lin_world = total_f / cfg.mass_kg.max(1e-9) + g_world;
+
+    // CoM position in world.
+    let r_mat = body_quat_to_world.to_rotation_matrix().into_inner();
+    let com_offset_world = r_mat * cfg.com_offset_body;
+    let com_pos_world = body_pos_world + com_offset_world;
+
+    // Angular: α = I_world⁻¹ · (Σ (foot − CoM) × F − ω × Iω)
+    let i_world = r_mat * cfg.centroidal_inertia_body * r_mat.transpose();
+    let i_world_inv = i_world.try_inverse().unwrap_or_else(Matrix3::identity);
+    let mut tau_world = Vector3::zeros();
+    for slot in 0..4 {
+        let r = foot_positions_world[slot] - com_pos_world;
+        tau_world += r.cross(&grfs_world[slot]);
+    }
+    let i_omega = i_world * omega_obs_world;
+    let coriolis = omega_obs_world.cross(&i_omega);
+    let a_ang_world = i_world_inv * (tau_world - coriolis);
+
+    (a_lin_world, a_ang_world)
+}
+
 /// Reference trajectory the centroidal MPC tracks. One state per
 /// horizon step (length must equal `cfg.horizon_steps`).
 #[derive(Clone, Debug)]
