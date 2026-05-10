@@ -702,8 +702,9 @@ impl FullCentroidalMpc {
         let p_dense = 2.0 * (b_u.transpose() * &q_block * &b_u + &r_block);
         let q_vec = 2.0 * (b_u.transpose() * &q_block * &drift - &r_block * &u_ref);
 
-        // ── Constraints (D3.3.4a — swing GRF=0 + friction only) ──────
-        let (a_csc, b_vec, cones) = build_constraints_24(&self.cfg, contact, n);
+        // ── Constraints (D3.3.4b — adds stance no-slip) ─────────────
+        let (a_csc, b_vec, cones) =
+            build_constraints_24(&self.cfg, contact, ref_traj, n, &a_x, &b_u, &x_now);
 
         // ── clarabel solve ────────────────────────────────────────────
         let p_csc = dense_to_csc_upper_24(&p_dense);
@@ -782,24 +783,43 @@ fn failed_solution(
     }
 }
 
-/// Constraint assembly (D3.3.4a): swing leg GRF = 0 (equality) +
-/// friction pyramid + f_z bounds (inequality). Stance no-slip is added
-/// in D3.3.4b.
+/// Constraint assembly. Equalities first (`ZeroCone`), inequalities
+/// second (`NonnegativeCone`); clarabel requires that order.
+///
+/// Equalities:
+/// 1. Swing leg GRF = 0 (3 rows per swing-leg-step)
+/// 2. Stance no-slip — `v_foot_world(stance leg, step k) = 0`
+///    expressed linearly in U via the lifted state. 3 rows per
+///    stance-leg-step. See D3.3.4b derivation in module-level docs.
+///
+/// Inequalities: per stance leg per step,
+/// - `f_z ≥ 0` (1 row)
+/// - `f_z ≤ f_max` (1 row, if `f_max > 0`)
+/// - `|f_x| ≤ μ·f_z` (2 rows)
+/// - `|f_y| ≤ μ·f_z` (2 rows)
 fn build_constraints_24(
     cfg: &FullCentroidalMpcConfig,
     contact: &FullCentroidalContactSchedule,
+    ref_traj: &FullCentroidalReference,
     n: usize,
+    a_x: &DMatrix<f64>,
+    b_u: &DMatrix<f64>,
+    x_now: &DVector<f64>,
 ) -> (CscMatrix<f64>, Vec<f64>, Vec<SupportedConeT<f64>>) {
     let nu = N_INPUT;
+    let nx = N_STATE_AUG;
     let total_vars = nu * n;
     let mu = cfg.friction_mu;
     let f_max = cfg.max_normal_force;
+    let legs = [LegId::FL, LegId::FR, LegId::RL, LegId::RR];
 
     let mut n_eq = 0;
     let mut n_ineq = 0;
     for k in 0..n {
         for leg in 0..N_FEET {
             if contact.is_stance[leg][k] {
+                // Stance no-slip: 3 equality rows
+                n_eq += 3;
                 let mut count = 4; // friction ±x, ±y
                 count += 1; // f_z ≥ 0
                 if f_max > 0.0 {
@@ -807,7 +827,7 @@ fn build_constraints_24(
                 }
                 n_ineq += count;
             } else {
-                n_eq += 3; // F = 0
+                n_eq += 3; // swing F = 0
             }
         }
     }
@@ -817,7 +837,7 @@ fn build_constraints_24(
     let mut b_vec = vec![0.0; n_rows];
     let mut row = 0;
 
-    // Equality: swing GRF = 0
+    // ── Equality 1: swing GRF = 0 ─────────────────────────────────────
     for k in 0..n {
         for leg in 0..N_FEET {
             if !contact.is_stance[leg][k] {
@@ -829,7 +849,68 @@ fn build_constraints_24(
             }
         }
     }
-    // Inequality: friction + f_z bounds
+
+    // ── Equality 2: stance no-slip ────────────────────────────────────
+    // Per stance-leg-step:
+    //   v_foot_world = v_com + ω × r_ref + R_z · J_foot(q_ref) · joint_v_leg = 0
+    // where r_ref = R_z · (foot_body_ref − com_offset_body). Substituting
+    // `v_com_k = (A_x[k, 0..3] · x_0) + (B_u[k, 0..3] · U)` and same for
+    // ω_k yields a linear row in U with constant RHS.
+    for k in 0..n {
+        for leg in 0..N_FEET {
+            if !contact.is_stance[leg][k] {
+                continue;
+            }
+            let psi = ref_traj.states[k].base_euler_zyx.z;
+            let (s, c) = psi.sin_cos();
+            let r_z = Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
+            let kin = cfg.kinematics.leg(legs[leg]);
+            let [qhip, qthigh, qcalf] = ref_traj.states[k].leg_joint_q(leg);
+            let foot_body_ref = forward_leg_kinematics(kin, qhip, qthigh, qcalf);
+            let r_ref = r_z * (foot_body_ref - cfg.com_offset_body);
+            let j_foot_body = foot_jacobian_body(kin, qhip, qthigh, qcalf);
+            let r_z_j = r_z * j_foot_body;
+            let m_skew = skew_3(&r_ref);
+
+            // Build the 3×6 M matrix = [I_3, -skew(r_ref)] applied to
+            // the 6-row (v_com; ω) block of the lifted state at step k.
+            // For each of the 3 constraint rows we walk every column of U.
+            let row_base_in_a = k * nx; // top of step-k state block in a_x / b_u
+            let joint_v_col_base = k * nu + 12 + 3 * leg;
+            for ax in 0..3 {
+                // Coefficient column-by-column. Sparse but the matrix
+                // sizes are small enough that the dense pass is fine.
+                for col_u in 0..total_vars {
+                    let mut coef = b_u[(row_base_in_a + ax, col_u)]; // v_com row
+                    for sr in 0..3 {
+                        coef += -m_skew[(ax, sr)] * b_u[(row_base_in_a + 3 + sr, col_u)];
+                    }
+                    // Direct U slice for this stance leg's joint_v_leg
+                    if col_u >= joint_v_col_base && col_u < joint_v_col_base + 3 {
+                        let local = col_u - joint_v_col_base;
+                        coef += r_z_j[(ax, local)];
+                    }
+                    if coef.abs() > 1e-14 {
+                        a_dense[(row + ax, col_u)] = coef;
+                    }
+                }
+                // RHS: -(M row · A_x[k_block][0..6, :] · x_0)
+                let mut rhs = 0.0;
+                for col_x in 0..nx {
+                    let mut m_row = 0.0;
+                    m_row += a_x[(row_base_in_a + ax, col_x)]; // v_com[ax]
+                    for sr in 0..3 {
+                        m_row += -m_skew[(ax, sr)] * a_x[(row_base_in_a + 3 + sr, col_x)];
+                    }
+                    rhs += m_row * x_now[col_x];
+                }
+                b_vec[row + ax] = -rhs;
+            }
+            row += 3;
+        }
+    }
+
+    // ── Inequality: friction + f_z bounds ─────────────────────────────
     for k in 0..n {
         for leg in 0..N_FEET {
             if !contact.is_stance[leg][k] {
@@ -1439,6 +1520,76 @@ mod tests {
         // Joint_v should be small (no swing leg, no big body motion).
         for v in sol.first_input.joint_v.iter() {
             assert!(v.abs() < 2.0, "joint_v {v} too large at static stand");
+        }
+    }
+
+    #[test]
+    fn mpc_stance_no_slip_keeps_foot_velocity_zero() {
+        // Body starts moving forward at v_com.x = 0.1 m/s; reference is
+        // static stand (v_com_ref = 0). All four legs stance.
+        // The stance no-slip constraint should force the MPC's
+        // solution joint_v to make each foot velocity zero —
+        // i.e. the legs "rotate backward" relative to the body to
+        // compensate for the body's motion.
+        //
+        // Foot velocity at the linearization (= reference) point with
+        // first input u_0:
+        //   v_foot[leg] = v_com_now + ω_now × r_ref[leg]
+        //               + R_z · J_foot · joint_v_leg
+        // With v_com_now = (0.1, 0, 0) and ω_now = 0, this means
+        // R_z · J_foot · joint_v_leg ≈ (-0.1, 0, 0) per leg. The exact
+        // tolerance is loose because the constraint is on
+        // post-discretization-integrated state, not on instantaneous
+        // velocity at t=0. We check that |v_foot_world| at t=0 is well
+        // below the un-constrained value of 0.1 m/s.
+        let mut cfg = test_config();
+        cfg.horizon_steps = 4;
+        cfg.sqp_iterations = 1;
+        let state_ref = FullCentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        let f_per_foot = cfg.mass_kg * 9.81 / 4.0;
+        let input_ref = FullCentroidalInput {
+            grfs_world: [Vector3::new(0.0, 0.0, f_per_foot); 4],
+            joint_v: [0.0; N_LEG_JOINTS],
+        };
+        let reference = FullCentroidalReference {
+            states: vec![state_ref; cfg.horizon_steps],
+            inputs: vec![input_ref; cfg.horizon_steps],
+        };
+        let contact = FullCentroidalContactSchedule::all_stance(cfg.horizon_steps);
+
+        let state_now = FullCentroidalState {
+            v_com_world: Vector3::new(0.1, 0.0, 0.0),
+            base_pos_world: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        let mut mpc = FullCentroidalMpc::new(cfg.clone());
+        let sol = mpc.solve(state_now, &reference, &contact);
+        assert!(sol.solved, "MPC must solve under stance no-slip constraint");
+
+        // For each leg, compute v_foot_world = v_com_now + R_z·J_foot·joint_v_leg
+        // (ω_now = 0 so the ω×r term vanishes).
+        for leg in 0..N_FEET {
+            let kin = cfg.kinematics.leg(
+                [LegId::FL, LegId::FR, LegId::RL, LegId::RR][leg],
+            );
+            let [qhip, qthigh, qcalf] = state_now.leg_joint_q(leg);
+            let j_foot = foot_jacobian_body(kin, qhip, qthigh, qcalf);
+            let joint_v = sol.first_input.joint_v;
+            let v_leg = Vector3::new(
+                joint_v[3 * leg],
+                joint_v[3 * leg + 1],
+                joint_v[3 * leg + 2],
+            );
+            // R_z at zero yaw is identity.
+            let v_foot = state_now.v_com_world + j_foot * v_leg;
+            assert!(
+                v_foot.norm() < 0.03,
+                "leg {leg} foot velocity {v_foot} not pinned to 0 by stance constraint (||·|| = {})",
+                v_foot.norm()
+            );
         }
     }
 
