@@ -216,9 +216,15 @@ impl Default for CentroidalMpcConfig {
                 // directly (was h_ang/m in D1.1-D1.3, with units that
                 // forced 5+ orders of magnitude in the cost matrix).
                 0.5, 0.5, 10.0,
-                // base_pos (m): same as SRBD `p` weights — lateral /
-                // yaw-heavy bias toward the reference path.
-                0.0, 20.0, 50.0,
+                // base_pos (m): D1.4 reduced lateral / longitudinal
+                // weights to 5 (from SRBD's 20) — centroidal QP's
+                // I_world⁻¹·skew(r) entries are O(100) for namiashi
+                // (vs SRBD's m·1/I ~ idem), but combined with the
+                // CoM-shifted moment arm and explicit reference yaw,
+                // 20 over-corrects and produces oscillating GRFs that
+                // saturate the friction cone. 5 keeps tracking firm
+                // without saturation.
+                0.0, 5.0, 50.0,
                 // euler_zyx (rad): same as SRBD `θ` weights —
                 // keep body level + track yaw.
                 25.0, 25.0, 50.0,
