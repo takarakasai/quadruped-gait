@@ -40,10 +40,10 @@
 //! retire `CentroidalMpc` or keep it as a "fast-mode" fallback for
 //! constrained compute.
 
-use nalgebra::{Matrix3, Rotation3, Vector3};
+use nalgebra::{DMatrix, Matrix3, Rotation3, Vector3};
 
 use crate::config::{KinematicsConfig, LegId};
-use crate::ik::forward_leg_kinematics;
+use crate::ik::{foot_jacobian_body, forward_leg_kinematics};
 
 /// Number of leg joints handled by the full-centroidal state. Three per
 /// leg × four legs = 12 (Hip-Thigh-Calf RPP morphology, the only one
@@ -316,6 +316,176 @@ pub fn full_centroidal_dynamics(
         base_euler_zyx: base_euler_dot,
         joint_q: joint_q_dot,
     }
+}
+
+/// State dimension augmented with constant gravity (one extra row).
+/// This matches the 12-state MPC's `nx=13` convention (= 12 dynamic + 1
+/// augmented gravity) so the discrete-time shooting uses the same
+/// `x_{k+1} = A_d · x_aug + B_d · u` layout.
+pub const N_STATE_AUG: usize = N_STATE + 1; // 25
+
+/// Continuous-time Jacobians `(A_c, B_c)` of [`full_centroidal_dynamics`]
+/// evaluated at a yaw-only reference state.
+///
+/// The reference is treated as **small-angle on roll/pitch and ω_ref = 0**
+/// (the operating regime of trotting flat-ground gaits), reducing
+/// `R_world_body` to `R_z(psi_ref)` in the linearisation. Coriolis
+/// `ω × I·ω` is dropped (quadratic in ω; zero at ω_ref=0).
+///
+/// Returns `(A: 25×25, B: 25×24)` matching the augmented state layout
+/// `[v_com (3); ω_world (3); base_pos (3); euler_zyx (3); joint_q (12); g_aug (1)]`.
+/// The augmented state's last component holds the constant `g_world.z =
+/// −9.81`; row `2` of `A` has a `1.0` at column `24` so the discrete
+/// integration picks up gravity exactly.
+///
+/// New blocks vs. [`crate::centroidal_mpc::CentroidalMpc::continuous_dynamics`]:
+///
+/// - `A[3..6, 12..24]` = ∂α/∂joint_q. The angular acceleration
+///   responds to per-leg foot-position changes via `r_i = R_z·(p_foot_body
+///   − com_offset)`, and `∂(r×F)/∂q = -skew(F_ref) · R_z · ∂p_foot_body/∂q`
+///   where the body-frame Jacobian comes from
+///   [`crate::ik::foot_jacobian_body`]. This is the structural fix
+///   the 12-state model could not represent — the optimiser now sees
+///   how its joint commands shift the moment arm.
+/// - `B[12..24, 12..24]` = `I_12` — joint_v drives joint_q one-to-one.
+pub fn continuous_dynamics_full(
+    state_ref: &FullCentroidalState,
+    input_ref: &FullCentroidalInput,
+    cfg: &FullCentroidalMpcConfig,
+    stance: &[bool; N_FEET],
+    psi_ref: f64,
+) -> (DMatrix<f64>, DMatrix<f64>) {
+    let nx = N_STATE_AUG;
+    let nu = N_INPUT;
+    let mut a = DMatrix::<f64>::zeros(nx, nx);
+    let mut b = DMatrix::<f64>::zeros(nx, nu);
+
+    let m = cfg.mass_kg.max(1e-9);
+    let (s, c) = psi_ref.sin_cos();
+    let r_z = Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
+    let i_world = r_z * cfg.centroidal_inertia_body * r_z.transpose();
+    let i_world_inv = i_world.try_inverse().unwrap_or_else(Matrix3::identity);
+
+    // Per-leg reference foot positions in world. CoM offset is
+    // small-angle: `com_offset_world ≈ R_z · com_offset_body`.
+    let com_offset_world_ref = r_z * cfg.com_offset_body;
+    let com_pos_world_ref = state_ref.base_pos_world + com_offset_world_ref;
+    let foot_ref_world = compute_foot_positions_world(state_ref, cfg);
+
+    // ── 1. v̇_com row: gravity (via aug state) + (1/m)·F per stance leg
+    a[(2, 24)] = 1.0;
+    for leg in 0..N_FEET {
+        if !stance[leg] {
+            continue;
+        }
+        for i in 0..3 {
+            b[(i, 3 * leg + i)] = 1.0 / m;
+        }
+    }
+
+    // ── 2. α row ──────────────────────────────────────────────────────
+    let legs = [LegId::FL, LegId::FR, LegId::RL, LegId::RR];
+    // Per-axis basis-skew matrices for the small-angle Euler derivative
+    // `∂R/∂φ_k ≈ R_z · skew(e_k)` at roll=pitch=0.
+    let e_skew = [
+        skew_3(&Vector3::x()),
+        skew_3(&Vector3::y()),
+        skew_3(&Vector3::z()),
+    ];
+    // Sum-of-stance-leg ∂τ_world/∂φ_k accumulator (k = 0=roll, 1=pitch, 2=yaw).
+    let mut dtau_deuler = [Vector3::zeros(); 3];
+    for leg in 0..N_FEET {
+        if !stance[leg] {
+            continue;
+        }
+        // ∂α/∂F[leg] = I_world⁻¹ · skew(r_leg_ref)
+        let r_ref = foot_ref_world[leg] - com_pos_world_ref;
+        let block_grf = i_world_inv * skew_3(&r_ref);
+        for i in 0..3 {
+            for j in 0..3 {
+                b[(3 + i, 3 * leg + j)] = block_grf[(i, j)];
+            }
+        }
+        // ∂α/∂joint_q_leg = -I_world⁻¹ · skew(F_leg_ref) · R_z · J_q_body
+        let f_ref = input_ref.grfs_world[leg];
+        let kin = cfg.kinematics.leg(legs[leg]);
+        let [qhip, qthigh, qcalf] = state_ref.leg_joint_q(leg);
+        let j_body = foot_jacobian_body(kin, qhip, qthigh, qcalf);
+        let block_q = -i_world_inv * skew_3(&f_ref) * r_z * j_body;
+        let q_col_base = 12 + 3 * leg;
+        for i in 0..3 {
+            for j in 0..3 {
+                a[(3 + i, q_col_base + j)] = block_q[(i, j)];
+            }
+        }
+        // Accumulate ∂τ_world/∂base_euler. With foot_body fixed (joint_q
+        // held), the rotation-induced position change is
+        //   ∂r_leg/∂φ_k = R_z · skew(e_k) · (foot_body − com_offset)
+        // and the moment contribution is
+        //   ∂(r × F)/∂φ_k = (∂r/∂φ_k) × F_ref
+        // (the F vector lives in the world frame and is independent of
+        // the base orientation).
+        let foot_body_minus_com =
+            forward_leg_kinematics(kin, qhip, qthigh, qcalf) - cfg.com_offset_body;
+        for k in 0..3 {
+            let dr = r_z * e_skew[k] * foot_body_minus_com;
+            dtau_deuler[k] += dr.cross(&f_ref);
+        }
+    }
+    // ∂α/∂base_euler also has the ∂I_world⁻¹/∂φ · τ_ref term:
+    //   I_world(φ) = R(φ) · I_body · R(φ)^T
+    //   ∂I_world/∂φ_k at small roll/pitch and yaw ψ_ref equals
+    //     R_z · ([skew(e_k), I_body]) · R_z^T   (matrix commutator)
+    //   ∂I_world⁻¹/∂φ_k = -I_world⁻¹ · ∂I_world/∂φ_k · I_world⁻¹
+    //   ⇒ extra term:   -I_world⁻¹ · ∂I_world/∂φ_k · I_world⁻¹ · τ_ref
+    // This term is non-zero even when τ_ref is balanced — gravity-supporting
+    // Σ r×F ≠ 0 at non-symmetric leg poses.
+    let mut tau_ref_world = Vector3::zeros();
+    for leg in 0..N_FEET {
+        if !stance[leg] {
+            continue;
+        }
+        let r_leg = foot_ref_world[leg] - com_pos_world_ref;
+        tau_ref_world += r_leg.cross(&input_ref.grfs_world[leg]);
+    }
+    let i_world_inv_tau = i_world_inv * tau_ref_world;
+    let i_body = cfg.centroidal_inertia_body;
+    for k in 0..3 {
+        // Commutator [skew(e_k), I_body] = skew(e_k)·I_body − I_body·skew(e_k)
+        let comm = e_skew[k] * i_body - i_body * e_skew[k];
+        let di_world = r_z * comm * r_z.transpose();
+        let di_inv_term = -i_world_inv * di_world * i_world_inv_tau;
+        let dalpha = i_world_inv * dtau_deuler[k] + di_inv_term;
+        for i in 0..3 {
+            a[(3 + i, 9 + k)] = dalpha[i];
+        }
+    }
+
+    // ── 3. ṗ_base row: v_com (small-CoM-offset) ──────────────────────
+    a[(6, 0)] = 1.0;
+    a[(7, 1)] = 1.0;
+    a[(8, 2)] = 1.0;
+
+    // ── 4. ė_zyx row: T_inv · ω = R_z^T · ω at small roll/pitch ──────
+    let r_z_t = r_z.transpose();
+    for i in 0..3 {
+        for j in 0..3 {
+            a[(9 + i, 3 + j)] = r_z_t[(i, j)];
+        }
+    }
+
+    // ── 5. q̇_j row: joint_v block of B is identity ───────────────────
+    for i in 0..N_LEG_JOINTS {
+        b[(12 + i, 12 + i)] = 1.0;
+    }
+
+    // ── 6. augmented gravity row: ġ = 0 (left zero by initialiser) ───
+
+    (a, b)
+}
+
+fn skew_3(v: &Vector3<f64>) -> Matrix3<f64> {
+    Matrix3::new(0.0, -v.z, v.y, v.z, 0.0, -v.x, -v.y, v.x, 0.0)
 }
 
 /// Per-leg world-frame foot positions via the analytical 3R chain FK
@@ -630,5 +800,189 @@ mod tests {
         assert!((dx24.angular_velocity_world - dx12.angular_velocity_world).norm() < tol);
         assert!((dx24.base_pos_world - dx12.base_pos_world).norm() < tol);
         assert!((dx24.base_euler_zyx - dx12.base_euler_zyx).norm() < tol);
+    }
+
+    /// Convert `FullCentroidalState` to a plain 24-vec for FD perturbation.
+    fn dx_minus(a: &FullCentroidalState, b: &FullCentroidalState) -> [f64; N_STATE] {
+        let av = a.to_vec();
+        let bv = b.to_vec();
+        let mut out = [0.0; N_STATE];
+        for i in 0..N_STATE {
+            out[i] = av[i] - bv[i];
+        }
+        out
+    }
+
+    /// Build a non-trivial reference state for linearization tests.
+    /// Roll/pitch = 0 (the linearization assumes this), but joint_q
+    /// and v_com are non-zero so the Jacobian columns we care about
+    /// (∂α/∂q in particular) carry non-trivial values.
+    fn ref_state_for_lin_test() -> FullCentroidalState {
+        FullCentroidalState {
+            v_com_world: Vector3::new(0.10, 0.05, 0.0),
+            angular_velocity_world: Vector3::zeros(),
+            base_pos_world: Vector3::new(0.0, 0.0, 0.32),
+            base_euler_zyx: Vector3::zeros(),
+            joint_q: [
+                0.05, 0.55, -1.20, // FL
+                -0.05, 0.55, -1.20, // FR
+                0.05, 0.60, -1.25, // RL
+                -0.05, 0.60, -1.25, // RR
+            ],
+        }
+    }
+
+    fn ref_input_for_lin_test() -> FullCentroidalInput {
+        let mut joint_v = [0.0; N_LEG_JOINTS];
+        for (i, x) in joint_v.iter_mut().enumerate() {
+            *x = 0.05 * (i as f64 + 1.0).sin();
+        }
+        FullCentroidalInput {
+            grfs_world: [
+                Vector3::new(2.0, 1.0, 25.0),
+                Vector3::new(-1.5, 0.8, 22.0),
+                Vector3::new(2.5, -0.7, 24.0),
+                Vector3::new(-2.0, -0.5, 17.0),
+            ],
+            joint_v,
+        }
+    }
+
+    /// Numerical column-k of ∂f/∂x via central FD on
+    /// `full_centroidal_dynamics`. Returns the 24-vector
+    /// `(f(x+ε e_k, u) − f(x−ε e_k, u)) / (2ε)`.
+    fn fd_state_col(
+        k: usize,
+        state: &FullCentroidalState,
+        input: &FullCentroidalInput,
+        cfg: &FullCentroidalMpcConfig,
+        eps: f64,
+    ) -> [f64; N_STATE] {
+        let mut xv = state.to_vec();
+        let original = xv[k];
+        xv[k] = original + eps;
+        let f_plus = full_centroidal_dynamics(&FullCentroidalState::from_vec(&xv), input, cfg);
+        xv[k] = original - eps;
+        let f_minus = full_centroidal_dynamics(&FullCentroidalState::from_vec(&xv), input, cfg);
+        let mut out = [0.0; N_STATE];
+        let plus = f_plus.to_vec();
+        let minus = f_minus.to_vec();
+        for i in 0..N_STATE {
+            out[i] = (plus[i] - minus[i]) / (2.0 * eps);
+        }
+        out
+    }
+
+    fn fd_input_col(
+        k: usize,
+        state: &FullCentroidalState,
+        input: &FullCentroidalInput,
+        cfg: &FullCentroidalMpcConfig,
+        eps: f64,
+    ) -> [f64; N_STATE] {
+        let mut uv = input.to_vec();
+        let original = uv[k];
+        uv[k] = original + eps;
+        let f_plus = full_centroidal_dynamics(state, &FullCentroidalInput::from_vec(&uv), cfg);
+        uv[k] = original - eps;
+        let f_minus = full_centroidal_dynamics(state, &FullCentroidalInput::from_vec(&uv), cfg);
+        let mut out = [0.0; N_STATE];
+        let plus = f_plus.to_vec();
+        let minus = f_minus.to_vec();
+        for i in 0..N_STATE {
+            out[i] = (plus[i] - minus[i]) / (2.0 * eps);
+        }
+        out
+    }
+
+    #[test]
+    fn linearization_state_jacobian_matches_fd() {
+        let cfg = test_config();
+        let state = ref_state_for_lin_test();
+        let input = ref_input_for_lin_test();
+        let stance = [true; N_FEET];
+        let psi_ref = state.base_euler_zyx.z;
+
+        let (a_mat, _b_mat) = continuous_dynamics_full(&state, &input, &cfg, &stance, psi_ref);
+        let eps = 1e-6;
+        let tol = 1e-3; // FD has ~1e-6 noise, plus we drop ω×Iω
+
+        // Skip column 24 (augmented gravity) — not part of the
+        // non-augmented `full_centroidal_dynamics` state.
+        for k in 0..N_STATE {
+            let fd = fd_state_col(k, &state, &input, &cfg, eps);
+            for i in 0..N_STATE {
+                let analytical = a_mat[(i, k)];
+                let diff = (fd[i] - analytical).abs();
+                assert!(
+                    diff < tol,
+                    "A[{i},{k}]: analytical={analytical:.6e}  fd={:.6e}  diff={diff:.3e}",
+                    fd[i]
+                );
+            }
+        }
+        let _ = dx_minus; // silence warning — kept for future tests
+    }
+
+    #[test]
+    fn linearization_input_jacobian_matches_fd() {
+        let cfg = test_config();
+        let state = ref_state_for_lin_test();
+        let input = ref_input_for_lin_test();
+        let stance = [true; N_FEET];
+        let psi_ref = state.base_euler_zyx.z;
+
+        let (_a_mat, b_mat) = continuous_dynamics_full(&state, &input, &cfg, &stance, psi_ref);
+        let eps = 1e-6;
+        let tol = 1e-3;
+
+        for k in 0..N_INPUT {
+            let fd = fd_input_col(k, &state, &input, &cfg, eps);
+            for i in 0..N_STATE {
+                let analytical = b_mat[(i, k)];
+                let diff = (fd[i] - analytical).abs();
+                assert!(
+                    diff < tol,
+                    "B[{i},{k}]: analytical={analytical:.6e}  fd={:.6e}  diff={diff:.3e}",
+                    fd[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linearization_swing_legs_zero_their_grf_block() {
+        // A swing leg's foot is in the air → no GRF effect on body
+        // dynamics regardless of any input force (constraint enforced
+        // by the QP equality). The linearization should reflect this
+        // by zeroing the corresponding 6×3 block of B for v̇_com and α
+        // rows.
+        let cfg = test_config();
+        let state = ref_state_for_lin_test();
+        let input = ref_input_for_lin_test();
+        let stance = [true, false, true, false]; // FR, RR are swinging
+        let (_a, b) = continuous_dynamics_full(&state, &input, &cfg, &stance, 0.0);
+
+        for swing_leg in [1usize, 3] {
+            for j in 0..3 {
+                for i in 0..6 {
+                    assert_eq!(b[(i, 3 * swing_leg + j)], 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn linearization_aug_gravity_column_is_unit_z_on_v_com() {
+        // The augmented gravity state [24] only feeds into v_com_z dot
+        // via A[2, 24] = 1. Every other entry in column 24 must be 0.
+        let cfg = test_config();
+        let state = ref_state_for_lin_test();
+        let input = ref_input_for_lin_test();
+        let (a, _b) = continuous_dynamics_full(&state, &input, &cfg, &[true; N_FEET], 0.0);
+        for i in 0..N_STATE_AUG {
+            let expected = if i == 2 { 1.0 } else { 0.0 };
+            assert_eq!(a[(i, 24)], expected, "A[{i}, 24] != {expected}");
+        }
     }
 }
