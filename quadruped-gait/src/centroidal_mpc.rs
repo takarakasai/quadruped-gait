@@ -1503,6 +1503,65 @@ mod tests {
         }
     }
 
+    /// Performance benchmark: median solve time over 50 calls at
+    /// `sqp_iterations = 3` should stay under 25 ms. Verifies that
+    /// the SQP iteration loop fits within a `dt_per_step = 30 ms`
+    /// MPC re-solve budget — the controller calls `solve` at ~33 Hz
+    /// (every 30 ms of physics time), not every 2 ms tick, so we
+    /// have full 30 ms to spare.
+    ///
+    /// Empirical (release build, namiashi-class): median ≈ 12 ms,
+    /// p99 ≈ 14 ms at SQP=3 + horizon=10. SQP=1 baseline ≈ 4 ms.
+    ///
+    /// Disabled by default (`#[ignore]`) because timing tests are
+    /// flaky on busy CI; run manually with
+    /// `cargo test --release ... -- --ignored mpc_solve_under_25ms`
+    /// when investigating performance.
+    #[test]
+    #[ignore = "performance benchmark — run with --ignored"]
+    fn mpc_solve_under_25ms_at_sqp_3() {
+        let mut cfg = nominal_namiashi_cfg();
+        cfg.sqp_iterations = 3;
+        let mut mpc = CentroidalMpc::new(cfg.clone());
+
+        let s_now = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        let reference = CentroidalReference::from_constant_velocity(
+            s_now,
+            Vector3::new(0.15, 0.0, 0.0),
+            0.5,
+            &cfg,
+        );
+        let contact = CentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        let feet = CentroidalFootOffsets::constant_per_leg(
+            nominal_foot_world(),
+            cfg.horizon_steps,
+        );
+
+        // Warm up: first solve has clarabel JIT cost.
+        let _ = mpc.solve(s_now, &reference, &contact, &feet);
+
+        let mut samples_us = Vec::with_capacity(50);
+        for _ in 0..50 {
+            let t0 = std::time::Instant::now();
+            let _sol = mpc.solve(s_now, &reference, &contact, &feet);
+            samples_us.push(t0.elapsed().as_micros() as u64);
+        }
+        samples_us.sort();
+        let median_us = samples_us[samples_us.len() / 2];
+        let p99_us = samples_us[samples_us.len() * 99 / 100];
+        eprintln!(
+            "[mpc:solve] median = {} µs, p99 = {} µs (target < 25_000 µs)",
+            median_us, p99_us
+        );
+        assert!(
+            median_us < 25_000,
+            "median solve time {} µs exceeds 25 ms budget", median_us
+        );
+    }
+
     /// SQP iterations smoke test: at `sqp_iterations = 3`, solving a
     /// yaw-cmd reference produces a solution whose objective is no
     /// worse than the single-shot baseline (`sqp_iterations = 1`).
