@@ -40,7 +40,9 @@
 //! retire `CentroidalMpc` or keep it as a "fast-mode" fallback for
 //! constrained compute.
 
-use nalgebra::{DMatrix, Matrix3, Rotation3, Vector3};
+use clarabel::algebra::CscMatrix;
+use clarabel::solver::{DefaultSettings, DefaultSolver, IPSolver, SolverStatus, SupportedConeT};
+use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
 
 use crate::config::{KinematicsConfig, LegId};
 use crate::ik::{foot_jacobian_body, forward_leg_kinematics};
@@ -486,6 +488,428 @@ pub fn continuous_dynamics_full(
 
 fn skew_3(v: &Vector3<f64>) -> Matrix3<f64> {
     Matrix3::new(0.0, -v.z, v.y, v.z, 0.0, -v.x, -v.y, v.x, 0.0)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reference / Contact / Solution / Mpc — sibling types to centroidal_mpc.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Reference trajectory the full-centroidal MPC tracks. One entry per
+/// horizon step. Caller (host) is responsible for filling `joint_q_ref`
+/// from IK of the planned footstep trajectory (D3.3 design choice (a)
+/// — swing leg tracking via pre-computed joint reference).
+#[derive(Clone, Debug)]
+pub struct FullCentroidalReference {
+    pub states: Vec<FullCentroidalState>,
+    pub inputs: Vec<FullCentroidalInput>,
+}
+
+impl FullCentroidalReference {
+    /// Constant reference: same state and zero input over the horizon.
+    /// Useful for unit tests; production code fills joint_q from IK
+    /// per step.
+    pub fn constant(state: FullCentroidalState, horizon_steps: usize) -> Self {
+        Self {
+            states: vec![state; horizon_steps],
+            inputs: vec![FullCentroidalInput::default(); horizon_steps],
+        }
+    }
+}
+
+/// Per-leg per-step stance schedule (same shape as the 12-state version).
+#[derive(Clone, Debug)]
+pub struct FullCentroidalContactSchedule {
+    pub is_stance: [Vec<bool>; N_FEET],
+}
+
+impl FullCentroidalContactSchedule {
+    pub fn all_stance(horizon_steps: usize) -> Self {
+        Self {
+            is_stance: [
+                vec![true; horizon_steps],
+                vec![true; horizon_steps],
+                vec![true; horizon_steps],
+                vec![true; horizon_steps],
+            ],
+        }
+    }
+}
+
+/// Output of [`FullCentroidalMpc::solve`].
+#[derive(Clone, Debug)]
+pub struct FullCentroidalMpcSolution {
+    /// First-step inputs — what the host commits this MPC tick
+    /// (receding-horizon convention).
+    pub first_input: FullCentroidalInput,
+    /// Full-horizon inputs.
+    pub inputs_all_steps: Vec<FullCentroidalInput>,
+    /// Predicted state across the horizon.
+    pub predicted_states: Vec<FullCentroidalState>,
+    /// QP objective value.
+    pub objective: f64,
+    /// Clarabel reported Solved / AlmostSolved.
+    pub solved: bool,
+}
+
+/// Full-centroidal MPC solver (24-state).
+#[derive(Clone, Debug)]
+pub struct FullCentroidalMpc {
+    cfg: FullCentroidalMpcConfig,
+}
+
+impl FullCentroidalMpc {
+    pub fn new(cfg: FullCentroidalMpcConfig) -> Self {
+        Self { cfg }
+    }
+
+    pub fn config(&self) -> &FullCentroidalMpcConfig {
+        &self.cfg
+    }
+
+    pub fn set_config(&mut self, cfg: FullCentroidalMpcConfig) {
+        self.cfg = cfg;
+    }
+
+    /// Solve the MPC QP for the next horizon, returning the optimal
+    /// first-step input (GRFs + joint_v) and the full predicted
+    /// trajectory. SQP runs `cfg.sqp_iterations` re-linearizations of
+    /// the full (state, input) reference trajectory — chosen per D3.3
+    /// design (a) for full SQP coverage of joint-driven non-linearity.
+    pub fn solve(
+        &mut self,
+        state_now: FullCentroidalState,
+        reference: &FullCentroidalReference,
+        contact: &FullCentroidalContactSchedule,
+    ) -> FullCentroidalMpcSolution {
+        let n = self.cfg.horizon_steps;
+        assert_eq!(reference.states.len(), n, "ref state length mismatch");
+        assert_eq!(reference.inputs.len(), n, "ref input length mismatch");
+        for leg in 0..N_FEET {
+            assert_eq!(contact.is_stance[leg].len(), n);
+        }
+
+        let n_iter = self.cfg.sqp_iterations.max(1);
+
+        // SQP loop. Re-linearisation point updates from previous iter's
+        // predicted (state, input) trajectory. Iter 0 starts at the
+        // caller-supplied reference.
+        let mut ref_traj = reference.clone();
+        let mut last_solution: Option<FullCentroidalMpcSolution> = None;
+        for iter in 0..n_iter {
+            let sol = self.solve_one_iter(state_now, &ref_traj, contact, n);
+            if iter + 1 < n_iter && sol.solved {
+                // Update ref states/inputs from this solution; the next
+                // iteration linearises at the trajectory the QP just
+                // predicted.
+                for k in 0..n {
+                    ref_traj.states[k] = sol.predicted_states[k];
+                    ref_traj.inputs[k] = sol.inputs_all_steps[k];
+                }
+            }
+            last_solution = Some(sol);
+        }
+        last_solution.expect("at least one SQP iteration ran")
+    }
+
+    fn solve_one_iter(
+        &self,
+        state_now: FullCentroidalState,
+        ref_traj: &FullCentroidalReference,
+        contact: &FullCentroidalContactSchedule,
+        n: usize,
+    ) -> FullCentroidalMpcSolution {
+        let nx = N_STATE_AUG; // 25
+        let nu = N_INPUT; // 24
+
+        // ── Build per-step continuous-time A_c, B_c, then discretise ──
+        let mut a_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
+        let mut b_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
+        for k in 0..n {
+            let stance = [
+                contact.is_stance[0][k],
+                contact.is_stance[1][k],
+                contact.is_stance[2][k],
+                contact.is_stance[3][k],
+            ];
+            let psi_ref = ref_traj.states[k].base_euler_zyx.z;
+            let (a_c, b_c) = continuous_dynamics_full(
+                &ref_traj.states[k],
+                &ref_traj.inputs[k],
+                &self.cfg,
+                &stance,
+                psi_ref,
+            );
+            // Forward Euler: x_{k+1} = (I + dt·A) x_k + dt·B u_k.
+            let mut a_d = DMatrix::<f64>::identity(nx, nx);
+            a_d += &a_c * self.cfg.dt_per_step;
+            let b_d = b_c * self.cfg.dt_per_step;
+            a_d_per_step.push(a_d);
+            b_d_per_step.push(b_d);
+        }
+
+        // ── Lifted dynamics: X = A_x x_0 + B_u U ──────────────────────
+        let mut a_x = DMatrix::<f64>::zeros(nx * n, nx);
+        let mut b_u = DMatrix::<f64>::zeros(nx * n, nu * n);
+        let mut prod = DMatrix::<f64>::identity(nx, nx);
+        for k in 0..n {
+            prod = &a_d_per_step[k] * &prod;
+            a_x.view_mut((k * nx, 0), (nx, nx)).copy_from(&prod);
+            let mut tail = DMatrix::<f64>::identity(nx, nx);
+            for j in (0..=k).rev() {
+                let block = &tail * &b_d_per_step[j];
+                b_u.view_mut((k * nx, j * nu), (nx, nu)).copy_from(&block);
+                if j > 0 {
+                    tail = &tail * &a_d_per_step[j];
+                }
+            }
+        }
+
+        // ── Cost: J = ‖X − X_ref‖²_Q + ‖U − U_ref‖²_R ─────────────────
+        // P = 2 (B_u^T Q B_u + R), q = 2 (B_u^T Q (A_x x_0 − X_ref) − R U_ref).
+        let mut q_block = DMatrix::<f64>::zeros(nx * n, nx * n);
+        for k in 0..n {
+            for i in 0..N_STATE {
+                q_block[(k * nx + i, k * nx + i)] = self.cfg.q_diag[i];
+            }
+            // Augmented gravity col has zero weight (deterministic constant).
+        }
+        let mut r_block = DMatrix::<f64>::zeros(nu * n, nu * n);
+        for k in 0..n {
+            for i in 0..nu {
+                r_block[(k * nu + i, k * nu + i)] = self.cfg.r_diag[i];
+            }
+        }
+        let x_ref = {
+            let mut v = DVector::<f64>::zeros(nx * n);
+            for k in 0..n {
+                let s = state_to_vec_aug(&ref_traj.states[k]);
+                v.rows_mut(k * nx, nx).copy_from(&s);
+            }
+            v
+        };
+        let u_ref = {
+            let mut v = DVector::<f64>::zeros(nu * n);
+            for k in 0..n {
+                let ui = ref_traj.inputs[k].to_vec();
+                for i in 0..nu {
+                    v[k * nu + i] = ui[i];
+                }
+            }
+            v
+        };
+        let x_now = state_to_vec_aug(&state_now);
+        let drift = &a_x * &x_now - &x_ref;
+        let p_dense = 2.0 * (b_u.transpose() * &q_block * &b_u + &r_block);
+        let q_vec = 2.0 * (b_u.transpose() * &q_block * &drift - &r_block * &u_ref);
+
+        // ── Constraints (D3.3.4a — swing GRF=0 + friction only) ──────
+        let (a_csc, b_vec, cones) = build_constraints_24(&self.cfg, contact, n);
+
+        // ── clarabel solve ────────────────────────────────────────────
+        let p_csc = dense_to_csc_upper_24(&p_dense);
+        let q_slice: Vec<f64> = q_vec.iter().copied().collect();
+        let mut settings = DefaultSettings::default();
+        settings.verbose = false;
+        settings.max_iter = 50;
+        let mut solver =
+            match DefaultSolver::new(&p_csc, &q_slice, &a_csc, &b_vec, &cones, settings) {
+                Ok(s) => s,
+                Err(_) => {
+                    return failed_solution(&state_now, &ref_traj.inputs, n);
+                }
+            };
+        solver.solve();
+        let solved = matches!(
+            solver.solution.status,
+            SolverStatus::Solved | SolverStatus::AlmostSolved
+        );
+        let u_opt: Vec<f64> = solver.solution.x.clone();
+        let objective = solver.solution.obj_val;
+
+        // Decode U → per-step FullCentroidalInput.
+        let mut inputs_all_steps = Vec::with_capacity(n);
+        for k in 0..n {
+            let base = k * nu;
+            let mut slice = [0.0; N_INPUT];
+            slice.copy_from_slice(&u_opt[base..base + nu]);
+            inputs_all_steps.push(FullCentroidalInput::from_vec(&slice));
+        }
+
+        // Decode predicted states from X = A_x x_0 + B_u U.
+        let u_dvec = DVector::from_vec(u_opt);
+        let x_horizon = &a_x * &x_now + &b_u * &u_dvec;
+        let mut predicted_states = Vec::with_capacity(n);
+        for k in 0..n {
+            let row0 = k * nx;
+            let mut slice = [0.0; N_STATE];
+            slice.copy_from_slice(&x_horizon.as_slice()[row0..row0 + N_STATE]);
+            predicted_states.push(FullCentroidalState::from_vec(&slice));
+        }
+
+        FullCentroidalMpcSolution {
+            first_input: inputs_all_steps[0].clone(),
+            inputs_all_steps,
+            predicted_states,
+            objective,
+            solved,
+        }
+    }
+}
+
+/// Pack `FullCentroidalState` into the 25-dim augmented vector with
+/// `g_aug = -9.81` in the last slot.
+fn state_to_vec_aug(s: &FullCentroidalState) -> DVector<f64> {
+    let mut v = DVector::<f64>::zeros(N_STATE_AUG);
+    let body = s.to_vec();
+    for i in 0..N_STATE {
+        v[i] = body[i];
+    }
+    v[N_STATE] = -9.81;
+    v
+}
+
+fn failed_solution(
+    state_now: &FullCentroidalState,
+    ref_inputs: &[FullCentroidalInput],
+    n: usize,
+) -> FullCentroidalMpcSolution {
+    FullCentroidalMpcSolution {
+        first_input: FullCentroidalInput::default(),
+        inputs_all_steps: ref_inputs.to_vec(),
+        predicted_states: vec![*state_now; n],
+        objective: f64::NAN,
+        solved: false,
+    }
+}
+
+/// Constraint assembly (D3.3.4a): swing leg GRF = 0 (equality) +
+/// friction pyramid + f_z bounds (inequality). Stance no-slip is added
+/// in D3.3.4b.
+fn build_constraints_24(
+    cfg: &FullCentroidalMpcConfig,
+    contact: &FullCentroidalContactSchedule,
+    n: usize,
+) -> (CscMatrix<f64>, Vec<f64>, Vec<SupportedConeT<f64>>) {
+    let nu = N_INPUT;
+    let total_vars = nu * n;
+    let mu = cfg.friction_mu;
+    let f_max = cfg.max_normal_force;
+
+    let mut n_eq = 0;
+    let mut n_ineq = 0;
+    for k in 0..n {
+        for leg in 0..N_FEET {
+            if contact.is_stance[leg][k] {
+                let mut count = 4; // friction ±x, ±y
+                count += 1; // f_z ≥ 0
+                if f_max > 0.0 {
+                    count += 1;
+                }
+                n_ineq += count;
+            } else {
+                n_eq += 3; // F = 0
+            }
+        }
+    }
+
+    let n_rows = n_eq + n_ineq;
+    let mut a_dense = DMatrix::<f64>::zeros(n_rows, total_vars);
+    let mut b_vec = vec![0.0; n_rows];
+    let mut row = 0;
+
+    // Equality: swing GRF = 0
+    for k in 0..n {
+        for leg in 0..N_FEET {
+            if !contact.is_stance[leg][k] {
+                let col = k * nu + leg * 3;
+                for ax in 0..3 {
+                    a_dense[(row + ax, col + ax)] = 1.0;
+                }
+                row += 3;
+            }
+        }
+    }
+    // Inequality: friction + f_z bounds
+    for k in 0..n {
+        for leg in 0..N_FEET {
+            if !contact.is_stance[leg][k] {
+                continue;
+            }
+            let col_x = k * nu + leg * 3;
+            let col_y = col_x + 1;
+            let col_z = col_x + 2;
+            // f_z ≥ 0  ⇒  -f_z ≤ 0
+            a_dense[(row, col_z)] = -1.0;
+            row += 1;
+            if f_max > 0.0 {
+                a_dense[(row, col_z)] = 1.0;
+                b_vec[row] = f_max;
+                row += 1;
+            }
+            // |f_x| ≤ μ·f_z
+            a_dense[(row, col_x)] = 1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+            a_dense[(row, col_x)] = -1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+            // |f_y| ≤ μ·f_z
+            a_dense[(row, col_y)] = 1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+            a_dense[(row, col_y)] = -1.0;
+            a_dense[(row, col_z)] = -mu;
+            row += 1;
+        }
+    }
+    debug_assert_eq!(row, n_rows);
+    let a_csc = dense_to_csc_24(&a_dense);
+    let cones = vec![
+        SupportedConeT::ZeroConeT(n_eq),
+        SupportedConeT::NonnegativeConeT(n_ineq),
+    ];
+    (a_csc, b_vec, cones)
+}
+
+fn dense_to_csc_upper_24(p: &DMatrix<f64>) -> CscMatrix<f64> {
+    let nr = p.nrows();
+    let nc = p.ncols();
+    debug_assert_eq!(nr, nc);
+    let mut colptr = Vec::with_capacity(nc + 1);
+    let mut rowval = Vec::new();
+    let mut nzval = Vec::new();
+    colptr.push(0);
+    for j in 0..nc {
+        for i in 0..=j {
+            let v = p[(i, j)];
+            if v.abs() > 1e-12 {
+                rowval.push(i);
+                nzval.push(v);
+            }
+        }
+        colptr.push(rowval.len());
+    }
+    CscMatrix::new(nr, nc, colptr, rowval, nzval)
+}
+
+fn dense_to_csc_24(m: &DMatrix<f64>) -> CscMatrix<f64> {
+    let nr = m.nrows();
+    let nc = m.ncols();
+    let mut colptr = Vec::with_capacity(nc + 1);
+    let mut rowval = Vec::new();
+    let mut nzval = Vec::new();
+    colptr.push(0);
+    for j in 0..nc {
+        for i in 0..nr {
+            let v = m[(i, j)];
+            if v.abs() > 1e-12 {
+                rowval.push(i);
+                nzval.push(v);
+            }
+        }
+        colptr.push(rowval.len());
+    }
+    CscMatrix::new(nr, nc, colptr, rowval, nzval)
 }
 
 /// Per-leg world-frame foot positions via the analytical 3R chain FK
@@ -969,6 +1393,90 @@ mod tests {
                     assert_eq!(b[(i, 3 * swing_leg + j)], 0.0);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn mpc_solve_at_static_stand_returns_gravity_balancing_grfs() {
+        // Static-stand reference: body at z=0.32, joint_q at "knees
+        // flexed" so the foot rests on z=0. Reference inputs balance
+        // gravity. The MPC should converge to ~ref inputs.
+        let mut cfg = test_config();
+        cfg.horizon_steps = 5; // shorter for unit-test speed
+        cfg.sqp_iterations = 1;
+
+        // Pick a joint_q that puts foot z ≈ -0.32 (= base z = 0.32 above ground).
+        // Test rig: l1=l2=0.15, so straight-down gives z=-0.30. We
+        // accept that small offset; the QP will simply produce some
+        // f_z slightly above static.
+        let state_ref = FullCentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        let f_per_foot = cfg.mass_kg * 9.81 / 4.0;
+        let input_ref = FullCentroidalInput {
+            grfs_world: [Vector3::new(0.0, 0.0, f_per_foot); 4],
+            joint_v: [0.0; N_LEG_JOINTS],
+        };
+        let reference = FullCentroidalReference {
+            states: vec![state_ref; cfg.horizon_steps],
+            inputs: vec![input_ref; cfg.horizon_steps],
+        };
+        let contact = FullCentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        let mut mpc = FullCentroidalMpc::new(cfg);
+        let sol = mpc.solve(state_ref, &reference, &contact);
+        assert!(sol.solved, "QP must solve at static stand");
+
+        // First-step GRFs: each foot's f_z should be in [10, 60] N
+        // (= roughly within 50% of the static reference).
+        for leg in 0..N_FEET {
+            let fz = sol.first_input.grfs_world[leg].z;
+            assert!(
+                fz > 5.0 && fz < 70.0,
+                "leg {leg} f_z = {fz} N outside reasonable range"
+            );
+        }
+        // Joint_v should be small (no swing leg, no big body motion).
+        for v in sol.first_input.joint_v.iter() {
+            assert!(v.abs() < 2.0, "joint_v {v} too large at static stand");
+        }
+    }
+
+    #[test]
+    fn mpc_solve_with_swing_leg_zeros_its_grf() {
+        // FR leg swinging in the air (stance=false). The equality
+        // constraint must pin its GRF to exactly zero in the solution.
+        let mut cfg = test_config();
+        cfg.horizon_steps = 3;
+        cfg.sqp_iterations = 1;
+        let state_ref = FullCentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        let f_per_foot = cfg.mass_kg * 9.81 / 3.0; // 3 stance legs
+        let mut grfs = [Vector3::zeros(); N_FEET];
+        for leg in [0, 2, 3] {
+            grfs[leg].z = f_per_foot;
+        }
+        let input_ref = FullCentroidalInput {
+            grfs_world: grfs,
+            joint_v: [0.0; N_LEG_JOINTS],
+        };
+        let reference = FullCentroidalReference {
+            states: vec![state_ref; cfg.horizon_steps],
+            inputs: vec![input_ref; cfg.horizon_steps],
+        };
+        let mut contact = FullCentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        for k in 0..cfg.horizon_steps {
+            contact.is_stance[1][k] = false; // FR swing
+        }
+        let mut mpc = FullCentroidalMpc::new(cfg);
+        let sol = mpc.solve(state_ref, &reference, &contact);
+        assert!(sol.solved);
+        // FR GRF must be exactly zero (equality constraint).
+        for k in 0..sol.inputs_all_steps.len() {
+            let fr = sol.inputs_all_steps[k].grfs_world[1];
+            assert!(fr.norm() < 1e-7, "FR GRF nonzero at step {k}: {fr}");
         }
     }
 
