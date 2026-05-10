@@ -68,13 +68,32 @@ use clarabel::algebra::CscMatrix;
 use clarabel::solver::{DefaultSettings, DefaultSolver, IPSolver, SolverStatus, SupportedConeT};
 use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
 
-/// 12-dim centroidal state. See module docs for the layout.
+/// 12-dim centroidal state.
+///
+/// **State design (D1.4)**: stores `angular_velocity_world` directly
+/// instead of the centroidal `h_ang/m`. The two are related by
+/// `h_ang/m = (I_centroidal/m) · ω`, but their numerical scales
+/// differ by `m/I` ≈ 267 for namiashi-class robots, which forces
+/// 5-6 orders-of-magnitude weight ratios in the QP cost matrix and
+/// breaks clarabel's tracking accuracy. Storing ω directly lets us
+/// reuse SRBD's already-tuned cost weights without unit gymnastics.
+///
+/// The CoM-aware moment-arm structure (`α = I_com⁻¹ · Σ (foot_i −
+/// CoM_world) × F_i`) is preserved in the dynamics — that's the
+/// actual benefit of the centroidal model over the body-root SRBD.
+/// Storing ω vs h_ang/m is a presentation choice that doesn't affect
+/// the underlying physics.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CentroidalState {
-    /// CoM linear velocity in world frame (m/s).
+    /// CoM linear velocity in world frame (m/s). Equals "linear
+    /// momentum / mass"; we keep the field name for backward
+    /// compatibility with D1.1-D1.3 callers.
     pub h_lin_per_mass: Vector3<f64>,
-    /// Centroidal angular momentum / mass in world frame (m²/s).
-    pub h_ang_per_mass: Vector3<f64>,
+    /// Body angular velocity in world frame (rad/s). For a rigid
+    /// body the CoM and base share ω, so this works at either
+    /// reference point. Same units as SRBD's body-frame ω so cost
+    /// weights port directly.
+    pub angular_velocity_world: Vector3<f64>,
     /// Body root position in world frame (m).
     pub base_pos_world: Vector3<f64>,
     /// Base orientation as ZYX Euler angles (rad): `[roll, pitch, yaw]`.
@@ -82,15 +101,15 @@ pub struct CentroidalState {
 }
 
 impl CentroidalState {
-    /// Pack into a flat 12-vector with layout `[h_lin/m; h_ang/m; pos; euler]`.
+    /// Pack into a flat 12-vector with layout `[v_com; ω_world; pos; euler]`.
     pub fn to_vec12(&self) -> [f64; 12] {
         [
             self.h_lin_per_mass.x,
             self.h_lin_per_mass.y,
             self.h_lin_per_mass.z,
-            self.h_ang_per_mass.x,
-            self.h_ang_per_mass.y,
-            self.h_ang_per_mass.z,
+            self.angular_velocity_world.x,
+            self.angular_velocity_world.y,
+            self.angular_velocity_world.z,
             self.base_pos_world.x,
             self.base_pos_world.y,
             self.base_pos_world.z,
@@ -104,7 +123,7 @@ impl CentroidalState {
     pub fn from_vec12(v: &[f64; 12]) -> Self {
         Self {
             h_lin_per_mass: Vector3::new(v[0], v[1], v[2]),
-            h_ang_per_mass: Vector3::new(v[3], v[4], v[5]),
+            angular_velocity_world: Vector3::new(v[3], v[4], v[5]),
             base_pos_world: Vector3::new(v[6], v[7], v[8]),
             base_euler_zyx: Vector3::new(v[9], v[10], v[11]),
         }
@@ -190,18 +209,13 @@ impl Default for CentroidalMpcConfig {
             horizon_steps: 10,
             dt_per_step: 0.030,
             q_diag: [
-                // h_lin/m (= v_com, m/s): same scale as SRBD's `v`, weight 1.0.
+                // v_com (m/s): same scale as SRBD's `v`, weight 1.0.
                 1.0, 1.0, 1.0,
-                // h_ang/m (m²/s, world frame at CoM): the units differ
-                // from SRBD's body-frame ω by a factor I/m. For
-                // namiashi (m=2.4 kg, I_z=0.009 kg·m²) that's 0.00375.
-                // The "unit-corrected" SRBD-equivalent weights would be
-                // 1/0.00375² ≈ 7×10⁴ × SRBD's ω weights, but that
-                // suppresses the natural angular momentum from gait
-                // swing too aggressively. Pragmatic tune: about an
-                // order of magnitude lower so swing dynamics are not
-                // crushed but yaw still tracks.
-                1e3, 1e3, 1e4,
+                // ω_world (rad/s): identical to SRBD's `ω` weights.
+                // D1.4 update — state[3..6] is now angular velocity
+                // directly (was h_ang/m in D1.1-D1.3, with units that
+                // forced 5+ orders of magnitude in the cost matrix).
+                0.5, 0.5, 10.0,
                 // base_pos (m): same as SRBD `p` weights — lateral /
                 // yaw-heavy bias toward the reference path.
                 0.0, 20.0, 50.0,
@@ -264,21 +278,19 @@ pub fn centroidal_dynamics(
         let r = foot_world[slot] - com_pos_world;
         tau_world += r.cross(&input.grfs_world[slot]);
     }
-    let h_ang_dot_per_m = tau_world / cfg.mass_kg.max(1e-9);
 
-    // ── Angular velocity in world frame ─────────────────────────────
-    // ω_world = R · I_body⁻¹ · R^T · h_ang_world
-    // (rotate h_ang into body frame, divide by body inertia, rotate
-    // result back to world frame.)
-    let h_ang_world = cfg.mass_kg * state.h_ang_per_mass;
-    let i_body_inv = cfg
-        .centroidal_inertia_body
-        .try_inverse()
-        .unwrap_or_else(Matrix3::identity);
+    // ── Angular acceleration ────────────────────────────────────────
+    // Newton-Euler at CoM: α_world = I_world⁻¹ · (τ_world − ω × I·ω)
+    //   I_world = R · I_body · R^T  (yaw-only rotation of body inertia)
+    //   The Coriolis term `ω × (I·ω)` is `O(ω²)` and small at typical
+    //   gait yaw rates; we keep it for accuracy at higher rates.
     let r_mat = r_world_body.matrix();
-    let h_ang_body = r_mat.transpose() * h_ang_world;
-    let omega_body = i_body_inv * h_ang_body;
-    let omega_world = r_mat * omega_body;
+    let i_world = r_mat * cfg.centroidal_inertia_body * r_mat.transpose();
+    let i_world_inv = i_world.try_inverse().unwrap_or_else(Matrix3::identity);
+    let omega_world = state.angular_velocity_world;
+    let i_omega = i_world * omega_world;
+    let coriolis = omega_world.cross(&i_omega);
+    let alpha_world = i_world_inv * (tau_world - coriolis);
 
     // ── Base-position rate ──────────────────────────────────────────
     //   v_base_world = v_com_world − ω × com_offset_world
@@ -291,7 +303,7 @@ pub fn centroidal_dynamics(
 
     CentroidalState {
         h_lin_per_mass: h_lin_dot_per_m,
-        h_ang_per_mass: h_ang_dot_per_m,
+        angular_velocity_world: alpha_world,
         base_pos_world: base_pos_dot,
         base_euler_zyx: base_euler_dot,
     }
@@ -379,13 +391,9 @@ impl CentroidalReference {
         // reachable target rather than a step jump).
         let mut s = s_now;
         s.h_lin_per_mass = v_world;
-        // Centroidal angular-momentum reference for the commanded
-        // yaw rate. For yaw-only with body-frame inertia diag I_body
-        // and identity body-to-world rotation, the world-frame angular
-        // momentum is `h_ang_world = I_body · ω = (0, 0, I_zz · wz)`.
-        // Per-mass version: divide by m.
-        let i_zz = cfg.centroidal_inertia_body[(2, 2)];
-        s.h_ang_per_mass = Vector3::new(0.0, 0.0, i_zz * wz / cfg.mass_kg.max(1e-9));
+        // Reference angular velocity in world frame: pure yaw at the
+        // commanded rate (roll/pitch held at zero).
+        s.angular_velocity_world = Vector3::new(0.0, 0.0, wz);
         // Integrate position + yaw across the horizon.
         for k in 0..cfg.horizon_steps {
             let t = (k + 1) as f64 * cfg.dt_per_step;
@@ -636,7 +644,7 @@ impl CentroidalMpc {
                     x_horizon[row0 + 1],
                     x_horizon[row0 + 2],
                 ),
-                h_ang_per_mass: Vector3::new(
+                angular_velocity_world: Vector3::new(
                     x_horizon[row0 + 3],
                     x_horizon[row0 + 4],
                     x_horizon[row0 + 5],
@@ -709,14 +717,20 @@ impl CentroidalMpc {
             }
         }
 
-        // ── d/dt(h_ang/m) = (1/m) · Σ (foot_i − CoM) × F_i ─────────
-        //   skew(r) operator yields a 3×3 block per stance leg.
+        // ── d/dt(ω_world) = I_world⁻¹ · Σ (foot_i − CoM) × F_i ─────
+        //   At ω≈0 reference the Coriolis term `ω × Iω` is dropped from
+        //   the linearisation. The CoM offset enters via `r_per_leg`
+        //   (= foot_world − CoM_world) — the controller subtracts the
+        //   CoM offset from foot_world before passing to the QP.
+        //   skew(r) is the 3×3 cross-product matrix; pre-multiplying
+        //   by I_world⁻¹ gives the angular-acceleration response per
+        //   foot force.
         for leg in 0..4 {
             if !stance[leg] {
                 continue;
             }
             let r = r_per_leg[leg];
-            let block = skew_symmetric_3(&r) / m;
+            let block = i_world_inv * skew_symmetric_3(&r);
             for i in 0..3 {
                 for j in 0..3 {
                     b[(3 + i, leg * 3 + j)] = block[(i, j)];
@@ -724,8 +738,8 @@ impl CentroidalMpc {
             }
         }
 
-        // ── d/dt(base_pos) = h_lin/m  (small-CoM-offset approximation) ─
-        //   Strictly: base_pos_dot = h_lin/m − ω × com_offset_world.
+        // ── d/dt(base_pos) = v_com  (small-CoM-offset approximation) ─
+        //   Strictly: base_pos_dot = v_com − ω × com_offset_world.
         //   At ω=0 reference and small com_offset (~5 mm) the cross-
         //   product term contributes O(α·offset) ≈ mm/s², below the
         //   QP's noise floor — drop it for the linearisation.
@@ -734,15 +748,21 @@ impl CentroidalMpc {
         a[(8, 2)] = 1.0;
 
         // ── d/dt(euler_zyx) = T_inv · ω_world ──────────────────────
-        //   At euler_ref = (0, 0, ψ_ref): T_inv = R_z(ψ_ref)^T.
-        //   ω_world = I_world⁻¹ · m · (h_ang/m) (state field 3..6).
-        //   ⇒ A[9..12, 3..6] = R_z^T · I_world⁻¹ · m.
-        let coupling = r_z.transpose() * i_world_inv * m;
+        //   At euler_ref = (0, 0, ψ_ref): T_inv = R_z(ψ_ref)^T (because
+        //   the body→world rotation at zero roll/pitch is just R_z).
+        //   ω_world is now state field 3..6 directly (no I/m scaling).
+        //   ⇒ A[9..12, 3..6] = R_z^T.
+        let r_z_t = r_z.transpose();
         for i in 0..3 {
             for j in 0..3 {
-                a[(9 + i, 3 + j)] = coupling[(i, j)];
+                a[(9 + i, 3 + j)] = r_z_t[(i, j)];
             }
         }
+
+        // Suppress the now-unused `m` if nobody else references it.
+        let _ = i_world; // kept for symmetry; the linearisation only
+                         // uses `i_world_inv` above.
+        let _ = m;
 
         (a, b)
     }
@@ -753,9 +773,9 @@ fn state_to_vec13(s: &CentroidalState) -> DVector<f64> {
     v[0] = s.h_lin_per_mass.x;
     v[1] = s.h_lin_per_mass.y;
     v[2] = s.h_lin_per_mass.z;
-    v[3] = s.h_ang_per_mass.x;
-    v[4] = s.h_ang_per_mass.y;
-    v[5] = s.h_ang_per_mass.z;
+    v[3] = s.angular_velocity_world.x;
+    v[4] = s.angular_velocity_world.y;
+    v[5] = s.angular_velocity_world.z;
     v[6] = s.base_pos_world.x;
     v[7] = s.base_pos_world.y;
     v[8] = s.base_pos_world.z;
@@ -928,7 +948,8 @@ mod tests {
             horizon_steps: 10,
             dt_per_step: 0.030,
             q_diag: [
-                1.0, 1.0, 1.0, 0.5, 0.5, 5.0, 0.0, 20.0, 50.0, 25.0, 25.0, 50.0,
+                // v_com, ω_world, base_pos, euler — SRBD-equivalent weights.
+                1.0, 1.0, 1.0, 0.5, 0.5, 10.0, 0.0, 20.0, 50.0, 25.0, 25.0, 50.0,
             ],
             r_diag: 1e-3,
         }
@@ -951,7 +972,7 @@ mod tests {
         let cfg = nominal_namiashi_cfg();
         let state = CentroidalState {
             h_lin_per_mass: Vector3::zeros(),
-            h_ang_per_mass: Vector3::zeros(),
+            angular_velocity_world: Vector3::zeros(),
             base_pos_world: Vector3::new(0.0, 0.0, 0.165),
             base_euler_zyx: Vector3::zeros(),
         };
@@ -968,9 +989,9 @@ mod tests {
         assert_abs_diff_eq!(dx.h_lin_per_mass.z, 0.0, epsilon = 1e-9);
 
         // ḣ_ang/m = 0 (symmetric stance, equal vertical force per foot).
-        assert_abs_diff_eq!(dx.h_ang_per_mass.x, 0.0, epsilon = 1e-12);
-        assert_abs_diff_eq!(dx.h_ang_per_mass.y, 0.0, epsilon = 1e-12);
-        assert_abs_diff_eq!(dx.h_ang_per_mass.z, 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(dx.angular_velocity_world.x, 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(dx.angular_velocity_world.y, 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(dx.angular_velocity_world.z, 0.0, epsilon = 1e-12);
 
         // Base position / orientation: zero v_com → zero base velocity.
         assert_abs_diff_eq!(dx.base_pos_world.norm(), 0.0, epsilon = 1e-12);
@@ -990,7 +1011,7 @@ mod tests {
         assert_abs_diff_eq!(dx.h_lin_per_mass.x, 0.0, epsilon = 1e-12);
         assert_abs_diff_eq!(dx.h_lin_per_mass.y, 0.0, epsilon = 1e-12);
         assert_abs_diff_eq!(dx.h_lin_per_mass.z, -9.81, epsilon = 1e-12);
-        assert_abs_diff_eq!(dx.h_ang_per_mass.norm(), 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(dx.angular_velocity_world.norm(), 0.0, epsilon = 1e-12);
     }
 
     #[test]
@@ -1037,7 +1058,9 @@ mod tests {
         // (signs intuitively: FL pushed forward + RR pushed backward
         // = couple yawing the body **clockwise** about +z, i.e.
         // negative yaw rate)
-        // total τ_z = -0.218·fx. Then ḣ_ang/m.z = τ_z / m.
+        // total τ_z = -0.218·fx. Then α_z = τ_z / I_z (D1.4: state[3..6]
+        // is now ω directly so the time derivative is angular accel,
+        // not angular momentum rate / mass).
         let cfg = nominal_namiashi_cfg();
         let state = CentroidalState::default();
         let fx = 1.0_f64;
@@ -1052,15 +1075,16 @@ mod tests {
 
         let dx = centroidal_dynamics(&state, &input, &nominal_foot_world(), &cfg);
 
+        let i_z = cfg.centroidal_inertia_body[(2, 2)];
         assert_abs_diff_eq!(
-            dx.h_ang_per_mass.z,
-            -0.218 * fx / cfg.mass_kg,
+            dx.angular_velocity_world.z,
+            -0.218 * fx / i_z,
             epsilon = 1e-9
         );
         // x and y angular components should be zero (forces are pure +x
         // and the moment arms have z = 0).
-        assert_abs_diff_eq!(dx.h_ang_per_mass.x, 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(dx.h_ang_per_mass.y, 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(dx.angular_velocity_world.x, 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(dx.angular_velocity_world.y, 0.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -1102,14 +1126,16 @@ mod tests {
         let m = cfg.mass_kg;
         let g = 9.81;
         let d = 0.005;
-        // ḣ_ang/m = τ_world / m = (-m·g·d, 0, 0) / m = (-g·d, 0, 0)
-        assert_abs_diff_eq!(dx.h_ang_per_mass.x, -g * d, epsilon = 1e-9);
-        assert_abs_diff_eq!(dx.h_ang_per_mass.y, 0.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(dx.h_ang_per_mass.z, 0.0, epsilon = 1e-9);
-
+        // D1.4: state stores ω directly, so the time derivative is
+        // angular accel α = I⁻¹·τ. With τ_x = -m·g·d:
+        //   α_x = -m·g·d / I_xx
+        let i_xx = cfg.centroidal_inertia_body[(0, 0)];
+        let expected_alpha_x = -m * g * d / i_xx;
+        assert_abs_diff_eq!(dx.angular_velocity_world.x, expected_alpha_x, epsilon = 1e-9);
+        assert_abs_diff_eq!(dx.angular_velocity_world.y, 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(dx.angular_velocity_world.z, 0.0, epsilon = 1e-9);
         // The whole point — this is the rolling moment the body-root
         // SRBD MPC was missing.
-        let _ = m;
     }
 
     #[test]
@@ -1128,7 +1154,7 @@ mod tests {
     fn state_pack_unpack_roundtrip() {
         let s = CentroidalState {
             h_lin_per_mass: Vector3::new(0.1, 0.2, 0.3),
-            h_ang_per_mass: Vector3::new(0.4, 0.5, 0.6),
+            angular_velocity_world: Vector3::new(0.4, 0.5, 0.6),
             base_pos_world: Vector3::new(1.0, 2.0, 3.0),
             base_euler_zyx: Vector3::new(0.01, 0.02, 0.03),
         };

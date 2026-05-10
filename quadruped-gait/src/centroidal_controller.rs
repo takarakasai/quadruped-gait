@@ -288,26 +288,15 @@ impl CentroidalMpcGaitController {
         let cfg = self.centroidal_mpc.config().clone();
         let n = cfg.horizon_steps;
 
-        // Current centroidal state. h_lin/m = observed CoM velocity ≈
-        // observed body-root velocity (the difference is ω × com_offset,
-        // O(mm/s) at typical gait speeds — well below MPC's noise floor).
-        // h_ang/m = m·ω_world / m = ω_world for pure-yaw motion (the SRBD
-        // type-1 approximation treats centroidal angular inertia as
-        // diagonal at nominal pose — the conversion is one matrix-vec
-        // away when we need it, and the hold-mode cmd is zero so this
-        // approximation collapses to zero anyway).
+        // Current centroidal state. h_lin_per_mass = observed CoM
+        // velocity ≈ observed body-root velocity (the difference is
+        // ω × com_offset, O(mm/s) at typical gait speeds — well below
+        // MPC's noise floor). angular_velocity_world is the observed
+        // gyro directly (D1.4 — was h_ang/m which forced unit
+        // gymnastics in the cost matrix).
         let s_now = CentroidalState {
             h_lin_per_mass: self.v_observed_world,
-            // For type-1 SRBD with `I_centroidal_body` diagonal:
-            //   h_ang/m_world ≈ I_world · ω_world / m
-            // We feed observed ω directly weighted by I/m so the MPC
-            // sees a real angular-momentum error against the reference
-            // (the reference's h_ang is zero except for cmd.wz).
-            h_ang_per_mass: scale_h_ang_world(
-                &self.omega_observed_world,
-                &cfg,
-                self.body_state.world_yaw,
-            ),
+            angular_velocity_world: self.omega_observed_world,
             base_pos_world: self.body_state.world_position,
             base_euler_zyx: Vector3::new(0.0, 0.0, self.body_state.world_yaw),
         };
@@ -424,32 +413,15 @@ impl CentroidalMpcGaitController {
     }
 }
 
-/// Convert observed world-frame angular velocity into the
-/// `h_ang/m_world` field of [`CentroidalState`]. For type-1 SRBD with
-/// constant centroidal inertia, h_ang_world = I_world · ω_world; we
-/// divide by mass for the per-mass field convention.
-///
-/// `I_world = R_z(yaw) · I_body · R_z(yaw)^T` for yaw-only.
-fn scale_h_ang_world(
-    omega_world: &Vector3<f64>,
-    cfg: &CentroidalMpcConfig,
-    yaw: f64,
-) -> Vector3<f64> {
-    let (s, c) = yaw.sin_cos();
-    let r_z = nalgebra::Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
-    let i_world = r_z * cfg.centroidal_inertia_body * r_z.transpose();
-    let h_ang_world = i_world * omega_world;
-    h_ang_world / cfg.mass_kg.max(1e-9)
-}
-
 /// Lossy projection of [`CentroidalMpcSolution`] into the SRBD-shaped
 /// [`MpcSolution`]. Field semantics differ:
 /// - GRFs: identical (both world-frame N).
 /// - `predicted_body_states`: SRBD's `[orientation_rpy; position; ω; v]`
 ///   are filled from the centroidal state's `[euler; pos; ω; v_com]`
-///   (ω recovered from h_ang/m via I⁻¹). For visualisation / diagnostic
-///   only — host code that needs the centroidal state directly should
-///   call `predicted_centroidal_solution` instead.
+///   directly (D1.4 — no unit conversion needed now that the
+///   centroidal state stores ω). For visualisation / diagnostic only —
+///   host code that needs the centroidal state should call
+///   `predicted_centroidal_solution` instead.
 fn to_compat_mpc_solution(sol: &CentroidalMpcSolution) -> MpcSolution {
     let predicted_body_states: Vec<SrbdState> = sol
         .predicted_body_states
@@ -457,13 +429,7 @@ fn to_compat_mpc_solution(sol: &CentroidalMpcSolution) -> MpcSolution {
         .map(|s| SrbdState {
             orientation_rpy: s.base_euler_zyx,
             position: s.base_pos_world,
-            // ω_world recovered from h_ang/m by multiplying by m and
-            // dividing by I_body — but we don't have the cfg here.
-            // Approximation: leave ω_world ≈ h_ang/m (unit-mismatched
-            // but only used for visualisation).
-            angular_velocity: s.h_ang_per_mass,
-            // v_world = h_lin/m = CoM velocity ≈ body velocity for
-            // small CoM offset.
+            angular_velocity: s.angular_velocity_world,
             linear_velocity: s.h_lin_per_mass,
         })
         .collect();
