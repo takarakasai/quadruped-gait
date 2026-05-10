@@ -234,26 +234,23 @@ impl Default for CentroidalMpcConfig {
             horizon_steps: 10,
             dt_per_step: 0.030,
             q_diag: [
-                // v_com (m/s): same scale as SRBD's `v`, weight 1.0.
+                // v_com (m/s): D1.4 baseline. G-sweep tried 5.0
+                // (symmetric vx/vy boost) — passed lateral cmd test
+                // but broke yaw (-1.405 < target +1.5) and forward
+                // dy (+0.594 > target +0.20). No single q_diag combo
+                // found that passes all three axes simultaneously.
                 1.0, 1.0, 1.0,
-                // ω_world (rad/s): identical to SRBD's `ω` weights.
-                // D1.4 update — state[3..6] is now angular velocity
-                // directly (was h_ang/m in D1.1-D1.3, with units that
-                // forced 5+ orders of magnitude in the cost matrix).
+                // ω_world (rad/s): SRBD weights kept.
                 0.5, 0.5, 10.0,
-                // base_pos (m): D1.4 reduced lateral / longitudinal
-                // weights to 5 (from SRBD's 20) — centroidal QP's
-                // I_world⁻¹·skew(r) entries are O(100) for namiashi
-                // (vs SRBD's m·1/I ~ idem), but combined with the
-                // CoM-shifted moment arm and explicit reference yaw,
-                // 20 over-corrects and produces oscillating GRFs that
-                // saturate the friction cone. 5 keeps tracking firm
-                // without saturation.
+                // base_pos (m): same as D1.4.
                 0.0, 5.0, 50.0,
-                // euler_zyx (rad): same as SRBD `θ` weights —
-                // keep body level + track yaw.
+                // euler_zyx (rad): SRBD weights kept.
                 25.0, 25.0, 50.0,
             ],
+            // r_diag: SRBD baseline 1e-3. G-sweep tried 1e-2 (smoother
+            // forces) — let lateral go in correct +y direction (+0.946)
+            // but body fell (min_z=0.074) and forward dx flipped sign.
+            // Reverted; kept at 1e-3.
             r_diag: 1e-3,
             sqp_iterations: 1,
         }
