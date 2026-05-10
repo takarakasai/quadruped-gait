@@ -1269,6 +1269,145 @@ mod tests {
         );
     }
 
+    /// Lateral velocity command (`vy = +0.10`) should produce a
+    /// positive total Σ f_y (push CoM in +y, i.e. body-frame left).
+    /// Mirror of `mpc_forward_cmd_yields_positive_fx` for the
+    /// y-axis — catches sign / linearisation regressions in the
+    /// lateral channel.
+    #[test]
+    fn mpc_lateral_cmd_yields_positive_fy() {
+        let cfg = nominal_namiashi_cfg();
+        let mpc = CentroidalMpc::new(cfg.clone());
+
+        let s_now = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        let reference = CentroidalReference::from_constant_velocity(
+            s_now,
+            Vector3::new(0.0, 0.10, 0.0),
+            0.0,
+            &cfg,
+        );
+        let contact = CentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        let feet = CentroidalFootOffsets::constant_per_leg(
+            nominal_foot_world(),
+            cfg.horizon_steps,
+        );
+
+        let sol = mpc.solve(s_now, &reference, &contact, &feet);
+        assert!(sol.solved, "MPC failed to solve lateral-walk reference");
+
+        let total_fy: f64 = sol.grfs_first_step.iter().map(|f| f.y).sum();
+        assert!(
+            total_fy > 0.05,
+            "lateral cmd: Σf_y = {:.3} N, expected > 0.05 N",
+            total_fy
+        );
+    }
+
+    /// Compares `predicted_base_accel_world_centroidal` against the
+    /// body-root SRBD `predicted_base_accel_world` at static stand
+    /// with zero CoM offset. They MUST agree to numerical tolerance —
+    /// any drift here means our centroidal formula has a sign /
+    /// formula bug, not just a CoM-offset model difference.
+    #[test]
+    fn centroidal_and_srbd_accel_agree_at_zero_com_offset() {
+        let mut cent_cfg = nominal_namiashi_cfg();
+        cent_cfg.com_offset_body = Vector3::zeros();
+        let srbd_cfg = crate::srbd_mpc::SrbdMpcConfig {
+            mass_kg: cent_cfg.mass_kg,
+            inertia_diag_body: Vector3::new(
+                cent_cfg.centroidal_inertia_body[(0, 0)],
+                cent_cfg.centroidal_inertia_body[(1, 1)],
+                cent_cfg.centroidal_inertia_body[(2, 2)],
+            ),
+            ..crate::srbd_mpc::SrbdMpcConfig::default()
+        };
+
+        let body_pos = Vector3::new(0.0, 0.0, 0.165);
+        let body_quat = nalgebra::UnitQuaternion::identity();
+        let omega_world = Vector3::zeros();
+        let v_obs_world = Vector3::zeros();
+        // Asymmetric GRFs (so τ ≠ 0) — pure stand would give τ = 0
+        // and trivially agree; this catches the moment-arm formula.
+        let f = [
+            Vector3::new(0.5, 0.3, 6.0),
+            Vector3::new(-0.2, -0.1, 5.5),
+            Vector3::new(0.1, 0.4, 6.5),
+            Vector3::new(-0.3, -0.2, 5.0),
+        ];
+        let foot = nominal_foot_world();
+
+        let (a_lin_cent, a_ang_cent) = predicted_base_accel_world_centroidal(
+            &cent_cfg, body_pos, body_quat, omega_world, &f, &foot,
+        );
+        let srbd_state = crate::srbd_mpc::SrbdState {
+            orientation_rpy: Vector3::zeros(),
+            position: body_pos,
+            // SRBD wants ω in body frame; for identity orientation
+            // body == world.
+            angular_velocity: omega_world,
+            linear_velocity: v_obs_world,
+        };
+        let (a_lin_srbd, a_ang_srbd) =
+            crate::srbd_mpc::predicted_base_accel_world(&srbd_cfg, &srbd_state, &f, &foot);
+
+        for i in 0..3 {
+            assert_abs_diff_eq!(
+                a_lin_cent[i], a_lin_srbd[i],
+                epsilon = 1e-9,
+            );
+            assert_abs_diff_eq!(
+                a_ang_cent[i], a_ang_srbd[i],
+                epsilon = 1e-9,
+            );
+        }
+    }
+
+    /// Yaw rate command (`wz = +0.5`) should produce a positive
+    /// total moment about +z (body-frame yaw CCW). Verifies the
+    /// angular dynamics linearisation tracks ω_z correctly.
+    #[test]
+    fn mpc_yaw_cmd_yields_positive_yaw_moment() {
+        let cfg = nominal_namiashi_cfg();
+        let mpc = CentroidalMpc::new(cfg.clone());
+
+        let s_now = CentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.165),
+            ..Default::default()
+        };
+        let reference = CentroidalReference::from_constant_velocity(
+            s_now,
+            Vector3::zeros(),
+            0.5, // wz cmd
+            &cfg,
+        );
+        let contact = CentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        let feet = CentroidalFootOffsets::constant_per_leg(
+            nominal_foot_world(),
+            cfg.horizon_steps,
+        );
+
+        let sol = mpc.solve(s_now, &reference, &contact, &feet);
+        assert!(sol.solved, "MPC failed to solve yaw-walk reference");
+
+        // Total moment about +z from per-foot GRFs at nominal stance:
+        //   τ_z = Σ (foot_i.x · F_i.y − foot_i.y · F_i.x)
+        let feet_w = nominal_foot_world();
+        let total_tau_z: f64 = sol
+            .grfs_first_step
+            .iter()
+            .zip(feet_w.iter())
+            .map(|(f, foot)| foot.x * f.y - foot.y * f.x)
+            .sum();
+        assert!(
+            total_tau_z > 0.01,
+            "yaw cmd: Σ τ_z = {:.3} N·m, expected > 0.01 N·m",
+            total_tau_z
+        );
+    }
+
     /// Forward-velocity command produces a forward bias in the
     /// per-foot horizontal forces. Specifically, for `v_cmd = (+0.15, 0, 0)`
     /// the QP should choose a positive total Σ f_x (push the CoM in +x).
