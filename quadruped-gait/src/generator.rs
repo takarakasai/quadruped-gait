@@ -299,6 +299,18 @@ impl AnyGaitController {
         }
     }
 
+    /// Override the SRBD MPC's capture-point feedback gain. No-op
+    /// outside [`GaitMode::Mpc`]. Default is
+    /// [`crate::mpc_controller::DEFAULT_CAPTURE_POINT_GAIN_S`]; pass
+    /// `0.0` to disable the closed-loop footstep correction (useful
+    /// for bisecting which path is responsible for body drift under
+    /// stiff PD).
+    pub fn set_capture_point_gain(&mut self, k: f64) {
+        if let AnyGaitController::Mpc(c) = self {
+            c.set_capture_point_gain(k);
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).
