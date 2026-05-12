@@ -549,4 +549,49 @@ mod tests {
         assert!(h >= base * 0.4 - 1e-9);
         assert!(h <= base * 0.4 + 1e-9);
     }
+
+    /// March-in-place semantics: a tiny but nonzero command should
+    /// keep the phase generator cycling (it freezes at `cmd.is_zero()`)
+    /// while the Raibert stride amplitude collapses to ~0, so feet lift
+    /// visibly in swing but the body doesn't translate. The GUI panel's
+    /// `👣` button relies on this — see `src/app/gait_panel.rs`.
+    #[test]
+    fn tiny_cmd_lifts_swing_legs_without_horizontal_motion() {
+        let mut ctrl = GaitController::new(GaitConfig::trot(), build_kin());
+        ctrl.set_velocity_cmd(VelocityCmd { vx: 1e-6, vy: 0.0, wz: 0.0 });
+        let mut max_z = f64::NEG_INFINITY;
+        let mut min_z = f64::INFINITY;
+        let mut max_x_excursion = 0.0_f64;
+        // Full cycle ≈ 0.4 s at default trot params → tick 250× at 2 ms
+        // to comfortably cover one cycle.
+        for _ in 0..250 {
+            let out = ctrl.tick(0.002);
+            for slot in 0..4 {
+                let nom_x = ctrl.kinematics().legs()[slot].nominal_foot_body.x;
+                let z = out.legs[slot].foot_body.z;
+                max_z = max_z.max(z);
+                min_z = min_z.min(z);
+                max_x_excursion = max_x_excursion.max(
+                    (out.legs[slot].foot_body.x - nom_x).abs(),
+                );
+            }
+        }
+        let z_span = max_z - min_z;
+        // Swing height default 0.04 m → foot must lift at least 80% of
+        // it to count as a visible march.
+        assert!(
+            z_span > 0.032,
+            "march-in-place: foot z span should be ≈ swing_height (0.04 m), \
+             got {z_span} m. Phase generator may be stuck or swing curve \
+             collapsed.",
+        );
+        // Horizontal excursion should be a tiny fraction of swing height.
+        assert!(
+            max_x_excursion < 1e-3,
+            "march-in-place: foot x should stay near nominal (got excursion \
+             {max_x_excursion} m). With cmd.vx=1e-6 and T_stance=0.2 s the \
+             Raibert step is 1e-7 m — anything larger means a different \
+             code path is creeping into the footstep.",
+        );
+    }
 }
