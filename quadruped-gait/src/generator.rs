@@ -299,15 +299,26 @@ impl AnyGaitController {
         }
     }
 
-    /// Override the SRBD MPC's capture-point feedback gain. No-op
-    /// outside [`GaitMode::Mpc`]. Default is
+    /// Override the MPC capture-point feedback gain. Applies to all
+    /// closed-loop modes (Mpc / CentroidalSrbd / FullCentroidal); CHAMP
+    /// has no closed-loop footstep correction and is left untouched.
+    /// Default is
     /// [`crate::mpc_controller::DEFAULT_CAPTURE_POINT_GAIN_S`]; pass
-    /// `0.0` to disable the closed-loop footstep correction (useful
-    /// for bisecting which path is responsible for body drift under
-    /// stiff PD).
+    /// `0.0` to disable the closed-loop footstep correction.
+    ///
+    /// **Stiff-PD note (2026-05-13)**: under `kp ≥ 100 / kv ≤ 1.2` the
+    /// `+k·(v_obs - v_cmd)` feedback acts as a positive loop in the
+    /// y-axis under pure forward / pure lateral commands — it
+    /// amplifies tracking noise instead of damping it (the bug was
+    /// masked by URDF-tested soft PD). Until the formula is rewritten
+    /// for the linear stance-line model, dynamics-fidelity tests
+    /// should call this with `0.0`.
     pub fn set_capture_point_gain(&mut self, k: f64) {
-        if let AnyGaitController::Mpc(c) = self {
-            c.set_capture_point_gain(k);
+        match self {
+            AnyGaitController::Champ(_) => {}
+            AnyGaitController::Mpc(c) => c.set_capture_point_gain(k),
+            AnyGaitController::CentroidalSrbd(c) => c.set_capture_point_gain(k),
+            AnyGaitController::FullCentroidal(c) => c.set_capture_point_gain(k),
         }
     }
 
