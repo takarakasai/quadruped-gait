@@ -43,11 +43,24 @@ use crate::srbd_mpc::{
 };
 use crate::swing_traj::swing_position;
 
-/// Default capture-point feedback gain. Derived from the LIP model:
-/// `k_fb = √(h/g)` with `h ≈ 0.30 m` (namiashi-class trunk height) and
-/// `g = 9.81 m/s²` → ~0.175 s. The constructor uses this; runtime
-/// tuning is exposed via [`MpcGaitController::set_capture_point_gain`].
-pub const DEFAULT_CAPTURE_POINT_GAIN_S: f64 = 0.175;
+/// Default capture-point feedback gain. **Set to 0.0** (D3.3.7
+/// architectural decision, 2026-05-13): the LIP-derived
+/// `k_fb = √(h/g) ≈ 0.175 s` does not match CHAMP's linear stance-line
+/// model and acts as a **positive feedback loop** under stiff PD (the
+/// fidelity reproduced by `.misa` actuator configs). The reference
+/// `ref/legged_control` does not use any capture-point heuristic at
+/// all — the MPC's reference-tracking horizon closes the loop instead.
+/// See `doc/recent_features.md` section 9 + `memory/project_mpc_frame_bug.md`.
+///
+/// `set_capture_point_gain(k)` is retained so callers can opt back into
+/// the legacy heuristic for A/B comparison (e.g. the GUI slider's
+/// `[default]` button uses 0.175).
+pub const DEFAULT_CAPTURE_POINT_GAIN_S: f64 = 0.0;
+/// Legacy LIP-derived capture-point gain (= √(h/g) for h ≈ 0.30 m,
+/// g = 9.81 m/s²). Kept as a named constant so the GUI / scripts can
+/// restore the old behaviour for comparison without hard-coding a
+/// magic number.
+pub const LEGACY_CAPTURE_POINT_GAIN_S: f64 = 0.175;
 
 /// Minimum predicted GRF magnitude (Newtons) below which the WBC layer
 /// skips emitting a torque feedforward for that foot. Avoids noisy
@@ -751,12 +764,16 @@ mod tests {
     /// When the body is **slower** than commanded forward, the
     /// capture-point feedback should push the foot **further forward**
     /// (positive x correction) so the next stance pulls the body up
-    /// to speed.
+    /// to speed. **Locks in the legacy `k = LEGACY_CAPTURE_POINT_GAIN_S`
+    /// gain explicitly** since the post-D3.3.7 default is 0.0 (= no
+    /// feedback, identical to CHAMP); the test documents what the LIP
+    /// heuristic does for A/B comparison.
     #[test]
     fn slow_body_pushes_foot_forward() {
         let cfg = GaitConfig::trot();
         let kin = build_kin();
         let mut mpc = MpcGaitController::new(cfg, kin);
+        mpc.set_capture_point_gain(crate::mpc_controller::LEGACY_CAPTURE_POINT_GAIN_S);
         mpc.set_velocity_cmd(VelocityCmd { vx: 0.3, ..Default::default() });
         // Observed velocity is half of commanded → error = -0.15 m/s.
         mpc.set_body_state_observed(Vector3::new(0.15, 0.0, 0.0), Vector3::zeros());
