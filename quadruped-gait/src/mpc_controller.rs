@@ -377,6 +377,17 @@ impl MpcGaitController {
 
         let phases = self.phase_gen.legs();
         let mut legs: [Option<LegOutput>; 4] = [None, None, None, None];
+        // Step B (2026-05-14): the SRBD MPC's `enable_foot_offset`
+        // extension produces a per-leg Δr that *would* shift footsteps,
+        // but the bench (`diag_external_force_robustness`) showed the
+        // closed-loop is unstable — `Δr × F` only acts on stance legs in
+        // the MPC dynamics, yet the controller would apply it to swing-
+        // leg touchdowns, so the MPC's optimization and the controller's
+        // application are mismatched. We leave the QP infrastructure in
+        // place (default `enable_foot_offset = false` so the cost path
+        // is unchanged) but don't read `foot_offsets_first_step` here.
+        // See `doc/recent_features.md` section 10 for the post-mortem
+        // and the path forward (FullCentroidal joint_q reference rework).
         for ps in phases.iter() {
             let kin_leg = self.kin.leg(ps.leg);
             let footstep = self.compute_mpc_footstep(kin_leg, &v_err_body);

@@ -440,9 +440,15 @@ fn to_compat_mpc_solution(sol: &CentroidalMpcSolution) -> MpcSolution {
             linear_velocity: s.h_lin_per_mass,
         })
         .collect();
+    let horizon = sol.grfs_all_steps.len();
     MpcSolution {
         grfs_first_step: sol.grfs_first_step,
         grfs_all_steps: sol.grfs_all_steps.clone(),
+        // Centroidal MPC doesn't plan foot offsets either (it tracks
+        // centroidal momentum coordinates; foot offsets are an SRBD-only
+        // extension via `enable_foot_offset`).
+        foot_offsets_first_step: [nalgebra::Vector3::zeros(); 4],
+        foot_offsets_all_steps: vec![[nalgebra::Vector3::zeros(); 4]; horizon],
         predicted_body_states,
         objective: sol.objective,
         solved: sol.solved,

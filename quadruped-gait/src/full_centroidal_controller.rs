@@ -465,9 +465,15 @@ fn to_compat_mpc_solution_full(sol: &FullCentroidalMpcSolution) -> MpcSolution {
         .iter()
         .map(|u| u.grfs_world)
         .collect();
+    let horizon = grfs_all_steps.len();
     MpcSolution {
         grfs_first_step,
         grfs_all_steps,
+        // FullCentroidal mode plans foot positions via joint_q in state,
+        // not via the SRBD-style additive Δr offset. Report zeros so
+        // downstream readers (compute_mpc_footstep) skip the offset.
+        foot_offsets_first_step: [nalgebra::Vector3::zeros(); 4],
+        foot_offsets_all_steps: vec![[nalgebra::Vector3::zeros(); 4]; horizon],
         predicted_body_states,
         objective: sol.objective,
         solved: sol.solved,

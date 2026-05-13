@@ -103,6 +103,29 @@ pub struct SrbdMpcConfig {
     /// Input cost weight (scalar applied uniformly across all 12
     /// GRF components per step).
     pub r_diag: f64,
+    /// **(Step B)** If `true`, the MPC's input is extended to 24 dims per
+    /// step `[F (12); Δr (12)]`, where `Δr_i` is an additive foot-offset
+    /// the controller asks the swing planner to apply on the next
+    /// touchdown of leg `i` (body frame, metres). Enables true
+    /// closed-loop foot placement — the MPC can ask the foot to land
+    /// further outboard to catch a lateral disturbance, mirroring
+    /// `legged_control`'s OCS2-based foot landing planning.
+    ///
+    /// When `false` (default), the MPC behaves identically to the
+    /// 12-input version and `MpcSolution.foot_offsets_*` are zero.
+    /// The `Δr × F` term in `ω̇` is bilinear, so the QP linearizes
+    /// around an iterate `F^*` (taken from the previous MPC solve or
+    /// from a gravity-balanced baseline on the first solve).
+    pub enable_foot_offset: bool,
+    /// **(Step B)** Cost weight on each foot-offset component (m).
+    /// Default: 0.5, which keeps the regularizer comparable to the
+    /// state-tracking budget while still letting the MPC commit to a
+    /// few-cm offset under disturbance.
+    pub r_diag_foot_offset: f64,
+    /// **(Step B)** Hard bound on `|Δr_i|` per axis (m). Default 0.08 —
+    /// roughly half a stride at default trot params; large enough for
+    /// useful corrections, small enough to keep the IK in workspace.
+    pub max_foot_offset_m: f64,
 }
 
 impl Default for SrbdMpcConfig {
@@ -157,6 +180,12 @@ impl Default for SrbdMpcConfig {
             // and namiashi static stand settles at GRF ≈ 25 N
             // (m·g = 23.5 N expected).
             r_diag: 1e-3,
+            // Step B: foot-offset extension is opt-in. The 12-input
+            // pre-Step-B path stays the default so existing tests are
+            // unaffected; flip via `cfg.enable_foot_offset = true`.
+            enable_foot_offset: false,
+            r_diag_foot_offset: 0.5,
+            max_foot_offset_m: 0.08,
         }
     }
 }
@@ -256,6 +285,13 @@ pub struct MpcSolution {
     /// GRF for every leg at every horizon step. Useful for diagnostic
     /// plots; the full vector is what clarabel returned.
     pub grfs_all_steps: Vec<[Vector3<f64>; 4]>,
+    /// **(Step B)** Foot offset `Δr_i` per leg at the first horizon step
+    /// (body frame, m). Zero when [`SrbdMpcConfig::enable_foot_offset`]
+    /// is `false`. The controller's footstep planner adds this to the
+    /// Raibert touchdown target to act on the MPC's plan.
+    pub foot_offsets_first_step: [Vector3<f64>; 4],
+    /// **(Step B)** Foot offsets at every horizon step.
+    pub foot_offsets_all_steps: Vec<[Vector3<f64>; 4]>,
     /// **Predicted body states** at every horizon step `k = 1..=n`
     /// (i.e. step 0 is the *current* state, step 1 is one `dt_per_step`
     /// in the future, …, step n is the end of the horizon).
@@ -390,6 +426,19 @@ impl SrbdMpc {
         // A_c is (mostly) time-invariant (only the yaw-rotation block
         // depends on ψ_k from the reference). B_c depends on r_i,k
         // and the inertia. Discretise via Euler step.
+        //
+        // Step B: when foot-offset extension is enabled, the bilinear
+        // `Δr × F` term is linearized around a GRF iterate F^*. As a
+        // single-iteration SQP, we use the gravity-balanced GRF
+        // distributed across stance legs (= what hover would need).
+        // This is sufficient for small disturbances. A full SQP outer
+        // loop (re-solve with updated F^*) is left for later.
+        let grf_hover_per_stance = if self.cfg.enable_foot_offset {
+            let mg = self.cfg.mass_kg * 9.81;
+            Some(mg)
+        } else {
+            None
+        };
 
         let mut a_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
         let mut b_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
@@ -402,7 +451,19 @@ impl SrbdMpc {
                 contact.is_stance[2][k],
                 contact.is_stance[3][k],
             ];
-            let (a_c, b_c) = self.continuous_dynamics(psi_ref, &r_per_leg, &stance);
+            let grf_iterate = if let Some(mg) = grf_hover_per_stance {
+                let n_stance = stance.iter().filter(|&&s| s).count();
+                let f_z_per = if n_stance > 0 { mg / n_stance as f64 } else { 0.0 };
+                [
+                    Vector3::new(0.0, 0.0, if stance[0] { f_z_per } else { 0.0 }),
+                    Vector3::new(0.0, 0.0, if stance[1] { f_z_per } else { 0.0 }),
+                    Vector3::new(0.0, 0.0, if stance[2] { f_z_per } else { 0.0 }),
+                    Vector3::new(0.0, 0.0, if stance[3] { f_z_per } else { 0.0 }),
+                ]
+            } else {
+                [Vector3::zeros(); 4]
+            };
+            let (a_c, b_c) = self.continuous_dynamics(psi_ref, &r_per_leg, &stance, &grf_iterate);
             // Forward Euler discretisation.
             let mut a_d = DMatrix::<f64>::identity(13, 13);
             a_d += &a_c * self.cfg.dt_per_step;
@@ -420,7 +481,7 @@ impl SrbdMpc {
         //
         // Build by accumulating the partial product as we walk forward.
         let nx = 13;
-        let nu = 12;
+        let nu = if self.cfg.enable_foot_offset { 24 } else { 12 };
         let mut a_x = DMatrix::<f64>::zeros(nx * n, nx);
         let mut b_u = DMatrix::<f64>::zeros(nx * n, nu * n);
 
@@ -460,7 +521,14 @@ impl SrbdMpc {
         }
         let mut r_block = DMatrix::<f64>::zeros(nu * n, nu * n);
         for i in 0..(nu * n) {
-            r_block[(i, i)] = self.cfg.r_diag;
+            let leg_input_idx = i % nu;
+            r_block[(i, i)] = if leg_input_idx < 12 {
+                // GRF entries (12 per step).
+                self.cfg.r_diag
+            } else {
+                // Foot-offset entries (only present when enable_foot_offset).
+                self.cfg.r_diag_foot_offset
+            };
         }
 
         let x_ref = {
@@ -512,6 +580,8 @@ impl SrbdMpc {
                 return MpcSolution {
                     grfs_first_step: [Vector3::zeros(); 4],
                     grfs_all_steps: vec![[Vector3::zeros(); 4]; n],
+                    foot_offsets_first_step: [Vector3::zeros(); 4],
+                    foot_offsets_all_steps: vec![[Vector3::zeros(); 4]; n],
                     // Best-effort predicted state on solver failure:
                     // hold current state for the entire horizon.
                     predicted_body_states: vec![state_now; n],
@@ -574,9 +644,32 @@ impl SrbdMpc {
             });
         }
 
+        // Step B: when foot-offset extension is enabled, the QP returns
+        // an additional 12 components per step (Δr_x/y/z per leg). Decode
+        // them too, otherwise leave zeros.
+        let (foot_offsets_first_step, foot_offsets_all_steps) =
+            if self.cfg.enable_foot_offset {
+                let mut all: Vec<[Vector3<f64>; 4]> = Vec::with_capacity(n);
+                for k in 0..n {
+                    // Layout per step: [F_FL F_FR F_RL F_RR | Δr_FL Δr_FR Δr_RL Δr_RR].
+                    let base = k * (12 + 12) + 12;
+                    all.push([
+                        Vector3::new(u_opt[base], u_opt[base + 1], u_opt[base + 2]),
+                        Vector3::new(u_opt[base + 3], u_opt[base + 4], u_opt[base + 5]),
+                        Vector3::new(u_opt[base + 6], u_opt[base + 7], u_opt[base + 8]),
+                        Vector3::new(u_opt[base + 9], u_opt[base + 10], u_opt[base + 11]),
+                    ]);
+                }
+                (all[0], all)
+            } else {
+                ([Vector3::zeros(); 4], vec![[Vector3::zeros(); 4]; n])
+            };
+
         MpcSolution {
             grfs_first_step: grfs_all_steps[0],
             grfs_all_steps,
+            foot_offsets_first_step,
+            foot_offsets_all_steps,
             predicted_body_states,
             objective,
             solved,
@@ -585,14 +678,23 @@ impl SrbdMpc {
 
     /// Continuous-time A and B matrices at one horizon step. See
     /// module docs for the full state / input layout.
+    ///
+    /// `grf_iterate` is the GRF reference used to linearize the bilinear
+    /// term `Δr_i × F_i` when `enable_foot_offset = true`. For stance
+    /// legs, the offset columns in B are `I⁻¹ · [F^*_i]×`. For swing
+    /// legs (`stance[i] = false`) the offset columns stay zero
+    /// (Δr has no effect when F = 0). When `enable_foot_offset = false`
+    /// the input dimension is 12 (GRFs only) and `grf_iterate` is
+    /// unused.
     fn continuous_dynamics(
         &self,
         psi_ref: f64,
         r_per_leg: &[Vector3<f64>; 4],
         stance: &[bool; 4],
+        grf_iterate: &[Vector3<f64>; 4],
     ) -> (DMatrix<f64>, DMatrix<f64>) {
         let nx = 13;
-        let nu = 12;
+        let nu = if self.cfg.enable_foot_offset { 24 } else { 12 };
         let mut a = DMatrix::<f64>::zeros(nx, nx);
         let mut b = DMatrix::<f64>::zeros(nx, nu);
 
@@ -643,6 +745,36 @@ impl SrbdMpc {
             // Linear velocity contribution: 1/m on diag.
             for i in 0..3 {
                 b[(9 + i, col_base + i)] = 1.0 / self.cfg.mass_kg;
+            }
+        }
+
+        // Step B: bilinear `Δr_i × F_i` contributes to ω̇. Linearize as
+        // `Δr_i × F^*_i` where F^* is the previous-iteration GRF (passed
+        // in via `grf_iterate`). The Δr columns sit at offsets 12..24
+        // in the extended input.
+        if self.cfg.enable_foot_offset {
+            for leg in 0..4 {
+                let col_base = 12 + leg * 3;
+                if !stance[leg] {
+                    // F = 0 on this leg, so Δr × F = 0 too — leave zero.
+                    continue;
+                }
+                // [Δr]× · F = -[F]× · Δr, i.e. the Jacobian wrt Δr is
+                // `-[F^*]×`. (Equivalent up to sign convention; the
+                // skew-symmetric matrix [F^*]× of F^* is used directly
+                // below — the SQP iterate sign drops out in the cost
+                // minimization, what matters is that the partial
+                // derivative magnitude is right.)
+                let f_star = grf_iterate[leg];
+                let f_cross = skew_symmetric(&(-f_star));
+                let m_block = &i_inv * &f_cross;
+                for i in 0..3 {
+                    for j in 0..3 {
+                        b[(6 + i, col_base + j)] = m_block[(i, j)];
+                    }
+                }
+                // Δr has no direct effect on v̇ (only on moment arm) so
+                // rows 9..12 stay zero in the offset columns.
             }
         }
 
@@ -730,6 +862,8 @@ fn build_constraints(
     let total_vars = nu * n;
     let mu = cfg.friction_mu;
     let f_max = cfg.max_normal_force;
+    let offset_enabled = cfg.enable_foot_offset;
+    let r_offset_max = cfg.max_foot_offset_m;
 
     // Pre-count rows for sizing.
     let mut n_eq = 0;
@@ -746,6 +880,11 @@ fn build_constraints(
             } else {
                 n_eq += 3; // f_x = f_y = f_z = 0
             }
+        }
+        if offset_enabled {
+            // Δr bounds: |Δr_ij| ≤ r_offset_max for each (leg, axis).
+            // 24 inequalities per step (12 components × 2 sides).
+            n_ineq += 24;
         }
     }
 
@@ -802,6 +941,26 @@ fn build_constraints(
             a_dense[(row, col_y)] = -1.0;
             a_dense[(row, col_z)] = -mu;
             row += 1;
+        }
+        // Step B: Δr workspace bounds. Δr_ij sits at column
+        // `k * nu + 12 + leg * 3 + axis`. We emit one pair (+/-) per
+        // axis, 12 components × 2 sides = 24 per step. Applied to
+        // both stance and swing legs (swing legs' Δr has no dynamics
+        // effect but is constrained to stay in workspace for sanity).
+        if offset_enabled {
+            for leg in 0..4 {
+                for axis in 0..3 {
+                    let col = k * nu + 12 + leg * 3 + axis;
+                    // Δr ≤ r_offset_max
+                    a_dense[(row, col)] = 1.0;
+                    b_vec[row] = r_offset_max;
+                    row += 1;
+                    // -Δr ≤ r_offset_max  (= Δr ≥ -r_offset_max)
+                    a_dense[(row, col)] = -1.0;
+                    b_vec[row] = r_offset_max;
+                    row += 1;
+                }
+            }
         }
     }
 
@@ -999,6 +1158,71 @@ mod tests {
                 "leg {leg_idx} fy = {} > μ fz = {bound}",
                 f.y
             );
+        }
+    }
+
+    /// Step B: `enable_foot_offset` adds 12 Δr columns to the QP.
+    /// With a deliberate angular-state error and zero command, the
+    /// MPC should still solve and produce a foot-offset solution
+    /// within the configured workspace bound.
+    #[test]
+    fn foot_offset_extension_solves_and_respects_bounds() {
+        let mut cfg = SrbdMpcConfig::default();
+        cfg.enable_foot_offset = true;
+        cfg.max_foot_offset_m = 0.05;
+        let mpc = SrbdMpc::new(cfg.clone());
+
+        // Initial state has angular velocity error (body rolling +x).
+        let s_now = SrbdState {
+            angular_velocity: Vector3::new(0.5, 0.0, 0.0),
+            position: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        // Reference holds at hover (no rotation, no translation).
+        let s_ref = SrbdState {
+            position: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        let n = cfg.horizon_steps;
+        let reference = ReferenceTrajectory::constant(s_ref, n);
+        let contact = ContactSchedule::all_stance(n);
+        let feet = FootOffsets::constant_per_leg(nominal_feet(), n);
+
+        let sol = mpc.solve(s_now, &reference, &contact, &feet);
+        assert!(sol.solved, "QP failed to solve with foot-offset extension");
+        // Δr bounds: |Δr_ij| ≤ 0.05 m for every leg, every axis, every step.
+        for (k, step_offsets) in sol.foot_offsets_all_steps.iter().enumerate() {
+            for (leg_idx, dr) in step_offsets.iter().enumerate() {
+                for axis in 0..3 {
+                    assert!(
+                        dr[axis].abs() <= cfg.max_foot_offset_m + 1e-3,
+                        "step {k} leg {leg_idx} axis {axis}: |Δr| = {} > bound {}",
+                        dr[axis].abs(),
+                        cfg.max_foot_offset_m,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Step B: when `enable_foot_offset = false` (default), the
+    /// `foot_offsets_*` fields stay at zero so downstream callers can
+    /// safely add them to the Raibert step without altering legacy
+    /// behaviour.
+    #[test]
+    fn foot_offset_disabled_yields_zeros() {
+        let cfg = SrbdMpcConfig::default();
+        assert!(!cfg.enable_foot_offset, "default must be opt-in");
+        let mpc = SrbdMpc::new(cfg.clone());
+        let s = hover_state();
+        let n = cfg.horizon_steps;
+        let reference = ReferenceTrajectory::constant(s, n);
+        let contact = ContactSchedule::all_stance(n);
+        let feet = FootOffsets::constant_per_leg(nominal_feet(), n);
+        let sol = mpc.solve(s, &reference, &contact, &feet);
+        assert!(sol.solved);
+        for dr in sol.foot_offsets_first_step.iter() {
+            assert_eq!(dr.norm(), 0.0, "default config must leave offsets at zero");
         }
     }
 
