@@ -284,7 +284,17 @@ impl FullCentroidalMpcConfig {
             com_offset_body: Vector3::zeros(),
             friction_mu: 0.5,
             max_normal_force: 200.0,
-            horizon_steps: 10,
+            // 20 × 30 ms = 600 ms preview. The original D3.3.5 default was
+            // 10 × 30 ms = 300 ms which under-tracks the cmd reference
+            // (forward dx end at 5 s cmd vx=0.15 reached +0.74 m vs +1.06 m
+            // achievable with horizon = 20). The external-force benchmark
+            // (`tests/integration_walk.rs::diag_external_force_robustness`)
+            // showed horizon = 20 wins on the forward-tracking column across
+            // every scenario (forward 2/4/6 N, vertical, yaw torque) while
+            // keeping cross-axis suppression comparable. legged_control's
+            // OCS2 default is 1.0 s (~33 steps) — we trade 33 → 20 to keep
+            // the SQP solve cheap enough for 30 ms cadence.
+            horizon_steps: 20,
             dt_per_step: 0.030,
             q_diag,
             r_diag,
