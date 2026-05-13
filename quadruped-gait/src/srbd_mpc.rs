@@ -152,9 +152,14 @@ impl Default for SrbdMpcConfig {
             //                          yaw drift gets penalised equally
             //   p_x          : 0.0  (forward position is integrated by
             //                          velocity command — no fixed target)
-            //   p_y          : 5.0  ←  was 0.0; small lateral-position
+            //   p_y          : 20.0 ←  was 0.0; small lateral-position
             //                          regulariser that pulls drifting
-            //                          body back to commanded line
+            //                          body back to commanded line. A
+            //                          D3.3.8 attempt to bump this to
+            //                          30/50 broke `integration_walk_
+            //                          lateral_mpc_no_wbc` (over-
+            //                          correction → fall), so 20 is the
+            //                          empirical ceiling on namiashi.
             //   p_z          : 50.0 (height-hold — Cheetah default)
             //   ω_z (yaw rate): 5.0 ←  was 0.5; reinforces θ_z
             q_diag: [
