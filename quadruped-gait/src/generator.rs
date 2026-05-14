@@ -341,6 +341,30 @@ impl AnyGaitController {
         }
     }
 
+    /// Activate **goal-pose mode** on the FullCentroidal controller.
+    /// `set_velocity_cmd` implicitly clears it. No-op for other gait
+    /// modes today — only `FullCentroidal` carries the goal-pose
+    /// state.
+    pub fn set_goal_pose_world(
+        &mut self,
+        goal: crate::full_centroidal_controller::GoalPoseWorld,
+    ) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_goal_pose_world(goal);
+        }
+    }
+    pub fn clear_goal_pose(&mut self) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.clear_goal_pose();
+        }
+    }
+    pub fn goal_pose_world(&self) -> Option<crate::full_centroidal_controller::GoalPoseWorld> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => c.goal_pose_world(),
+            _ => None,
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).

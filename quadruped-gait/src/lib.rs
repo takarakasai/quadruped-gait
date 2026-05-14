@@ -90,7 +90,7 @@ pub use centroidal_mpc::{
     CentroidalFootOffsets, CentroidalInput, CentroidalMpc, CentroidalMpcConfig,
     CentroidalMpcSolution, CentroidalReference, CentroidalState,
 };
-pub use full_centroidal_controller::FullCentroidalMpcGaitController;
+pub use full_centroidal_controller::{FullCentroidalMpcGaitController, GoalPoseWorld};
 pub use full_centroidal_mpc::{
     full_centroidal_dynamics, FullCentroidalContactSchedule, FullCentroidalInput,
     FullCentroidalMpc, FullCentroidalMpcConfig, FullCentroidalMpcSolution,

@@ -123,6 +123,38 @@ pub struct FullCentroidalMpcGaitController {
     /// β-only variant (parity ON, nominal_q_ref OFF) and the combined
     /// (α+β) variant can both be benchmarked.
     parity_use_nominal_q_ref: bool,
+
+    /// Optional absolute goal pose (world frame). When `Some`, [`Self::tick`]
+    /// recomputes the velocity command from `goal − observed_pose` at each
+    /// tick, so the body actively tracks back toward the goal after a
+    /// disturbance — mirroring legged_control's
+    /// `goalToTargetTrajectories` path. When `None`, the controller
+    /// uses [`Self::cmd`] verbatim (= legged_control's
+    /// `cmdVelToTargetTrajectories` path).
+    goal_pose: Option<GoalPoseWorld>,
+}
+
+/// Absolute target pose in the world frame, with traverse-speed limits.
+/// See [`FullCentroidalMpcGaitController::set_goal_pose_world`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GoalPoseWorld {
+    /// Target world-frame x position (m).
+    pub x_m: f64,
+    /// Target world-frame y position (m).
+    pub y_m: f64,
+    /// Target world-frame yaw (rad), wrapped to (−π, π] when used.
+    pub yaw_rad: f64,
+    /// Maximum linear traverse speed (m/s) the controller is allowed to
+    /// command toward the goal. The instantaneous velocity command is
+    /// `clamp(distance_to_goal / time_to_goal, ±max_v_m_s)`.
+    pub max_v_m_s: f64,
+    /// Maximum yaw rate (rad/s) the controller is allowed to command.
+    pub max_wz_rad_s: f64,
+    /// Position tolerance: when the body is within this radius of the
+    /// goal (xy) AND `|yaw_err| < yaw_tolerance_rad`, the controller
+    /// issues `VelocityCmd::zero()` so the gait holds in stance.
+    pub position_tolerance_m: f64,
+    pub yaw_tolerance_rad: f64,
 }
 
 impl FullCentroidalMpcGaitController {
@@ -153,6 +185,7 @@ impl FullCentroidalMpcGaitController {
             mpc_solve_accumulator_s: f64::INFINITY,
             legged_control_parity: false,
             parity_use_nominal_q_ref: false,
+            goal_pose: None,
         }
     }
 
@@ -180,6 +213,28 @@ impl FullCentroidalMpcGaitController {
     /// See struct docs for the rationale.
     pub fn set_parity_use_nominal_q_ref(&mut self, enable: bool) {
         self.parity_use_nominal_q_ref = enable;
+    }
+
+    pub fn goal_pose_world(&self) -> Option<GoalPoseWorld> {
+        self.goal_pose
+    }
+    /// Activate **goal-pose mode**: at each [`Self::tick`] the velocity
+    /// command is recomputed from `(goal − observed_pose) / t_to_goal`,
+    /// rotated into the body frame, and saturated at the configured
+    /// `max_v / max_wz`. Equivalent to legged_control's
+    /// `goalToTargetTrajectories` path — when the body is pushed off
+    /// course, the recomputed cmd has a non-zero component pointing
+    /// back at the goal, so the controller actively recovers position.
+    ///
+    /// Cleared by [`Self::clear_goal_pose`] or by setting a new
+    /// velocity command via [`Self::set_velocity_cmd`] (the latter
+    /// implicitly disables goal mode so existing callers that only use
+    /// the velocity API don't see surprising drift).
+    pub fn set_goal_pose_world(&mut self, goal: GoalPoseWorld) {
+        self.goal_pose = Some(goal);
+    }
+    pub fn clear_goal_pose(&mut self) {
+        self.goal_pose = None;
     }
 
     pub fn predicted_grfs(&self) -> Option<&MpcSolution> {
@@ -246,8 +301,14 @@ impl FullCentroidalMpcGaitController {
     pub fn velocity_cmd(&self) -> VelocityCmd {
         self.cmd
     }
+    /// Set the body velocity command (vx / vy / wz in body frame).
+    /// Implicitly **clears any active goal-pose mode** so callers that
+    /// switch back to velocity control don't see lingering position
+    /// tracking. Use [`Self::set_goal_pose_world`] for the absolute
+    /// position-tracking path.
     pub fn set_velocity_cmd(&mut self, cmd: VelocityCmd) {
         self.cmd = cmd;
+        self.goal_pose = None;
     }
 
     pub fn config(&self) -> &GaitConfig {
@@ -335,6 +396,17 @@ impl FullCentroidalMpcGaitController {
     }
 
     pub fn tick(&mut self, dt: f64) -> ControllerOutput {
+        // Goal-pose mode (legged_control parity): recompute the
+        // velocity command from the absolute goal + observed body
+        // pose, so a disturbance that drifts the body off-track gets
+        // converted into a non-zero v_y_cmd pointing back at the goal.
+        if let Some(goal) = self.goal_pose {
+            self.cmd = velocity_cmd_for_goal(
+                goal,
+                self.body_state.world_position,
+                self.body_state.world_yaw,
+            );
+        }
         self.phase_gen.advance(dt, &self.cmd);
         self.body_state.integrate(&self.cmd, dt);
 
@@ -647,6 +719,61 @@ impl FullCentroidalMpcGaitController {
     }
 }
 
+/// Convert an absolute world-frame goal pose into the instantaneous
+/// body-frame velocity command that drives the body toward the goal in
+/// approximately straight-line fashion, saturated at the per-axis
+/// limits. Matches legged_control's `goalToTargetTrajectories` shape
+/// (line 33-51 + 54-68 of `target_trajectories_publisher.cpp`):
+///
+/// 1. Compute the world-frame error `(dx, dy, dψ)`.
+/// 2. Estimate `t_to_target` so that no axis exceeds its max rate —
+///    `max(‖(dx,dy)‖/max_v, |dψ|/max_wz, eps)` with a 50 ms floor to
+///    avoid division by zero near the goal.
+/// 3. Divide the error by `t_to_target` and clamp each axis at its
+///    saturation limit. World-frame velocities are then rotated into
+///    the body frame using the observed yaw.
+/// 4. If within the configured tolerances, emit
+///    [`VelocityCmd::zero`] so the phase generator holds in stance.
+pub fn velocity_cmd_for_goal(
+    goal: GoalPoseWorld,
+    current_pos_world: Vector3<f64>,
+    current_yaw_world: f64,
+) -> VelocityCmd {
+    let dx = goal.x_m - current_pos_world.x;
+    let dy = goal.y_m - current_pos_world.y;
+    // Wrap yaw error into (−π, π] so the body never picks the long
+    // way around a ±π singularity.
+    let raw_dyaw = goal.yaw_rad - current_yaw_world;
+    let dyaw = (raw_dyaw + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+        - std::f64::consts::PI;
+
+    let dist_xy = (dx * dx + dy * dy).sqrt();
+    if dist_xy < goal.position_tolerance_m && dyaw.abs() < goal.yaw_tolerance_rad {
+        return VelocityCmd::zero();
+    }
+
+    let max_v = goal.max_v_m_s.max(1e-6);
+    let max_wz = goal.max_wz_rad_s.max(1e-6);
+    let t_xy = dist_xy / max_v;
+    let t_yaw = dyaw.abs() / max_wz;
+    // 50 ms floor: prevents an infinite cmd magnitude when very close
+    // to the goal (the tolerance check above usually catches this,
+    // but the floor guards against tolerance = 0 configurations).
+    let t = t_xy.max(t_yaw).max(0.05);
+
+    let v_x_world = (dx / t).clamp(-max_v, max_v);
+    let v_y_world = (dy / t).clamp(-max_v, max_v);
+    let wz = (dyaw / t).clamp(-max_wz, max_wz);
+
+    // World → body frame (planar). Same convention as
+    // `world_to_body_horizontal` from `mpc_controller.rs`.
+    let (s, c) = current_yaw_world.sin_cos();
+    let vx_body = c * v_x_world + s * v_y_world;
+    let vy_body = -s * v_x_world + c * v_y_world;
+
+    VelocityCmd { vx: vx_body, vy: vy_body, wz }
+}
+
 /// Lossy projection of `FullCentroidalMpcSolution` into the SRBD-shaped
 /// `MpcSolution` for WBC integration compat. Same idea as
 /// `to_compat_mpc_solution` in `centroidal_controller.rs`.
@@ -679,5 +806,111 @@ fn to_compat_mpc_solution_full(sol: &FullCentroidalMpcSolution) -> MpcSolution {
         predicted_body_states,
         objective: sol.objective,
         solved: sol.solved,
+    }
+}
+
+#[cfg(test)]
+mod goal_pose_tests {
+    use super::*;
+    use approx::assert_relative_eq;
+
+    fn goal(x: f64, y: f64, yaw: f64) -> GoalPoseWorld {
+        GoalPoseWorld {
+            x_m: x,
+            y_m: y,
+            yaw_rad: yaw,
+            max_v_m_s: 0.30,
+            max_wz_rad_s: 1.00,
+            position_tolerance_m: 0.02,
+            yaw_tolerance_rad: 0.05,
+        }
+    }
+
+    /// At-the-goal: command must be exactly zero so the phase
+    /// generator holds in stance (the gait does not wander once the
+    /// body has arrived).
+    #[test]
+    fn velocity_cmd_for_goal_is_zero_inside_tolerance() {
+        let cmd = velocity_cmd_for_goal(
+            goal(0.0, 0.0, 0.0),
+            Vector3::new(0.01, 0.0, 0.0),
+            0.0,
+        );
+        assert_eq!(cmd, VelocityCmd::zero());
+    }
+
+    /// Pure forward goal: cmd points in +x_body when current yaw = 0
+    /// and the goal is ahead. Magnitude is `dx / t_to_target`; for
+    /// a 1 m goal at max_v = 0.3 m/s, that's `1.0 / (1.0/0.3) = 0.3`.
+    #[test]
+    fn velocity_cmd_for_goal_forward_at_yaw_zero() {
+        let cmd = velocity_cmd_for_goal(
+            goal(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 0.0),
+            0.0,
+        );
+        assert_relative_eq!(cmd.vx, 0.30, epsilon = 1e-9);
+        assert_relative_eq!(cmd.vy, 0.00, epsilon = 1e-9);
+        assert_relative_eq!(cmd.wz, 0.00, epsilon = 1e-9);
+    }
+
+    /// Body has been pushed laterally off the path back to origin
+    /// (goal x=1, y=0). The recovered command must include a
+    /// **non-zero negative vy_body** to drag the body back toward
+    /// y = 0 while still progressing forward in x.
+    #[test]
+    fn velocity_cmd_for_goal_pulls_back_after_lateral_push() {
+        let cmd = velocity_cmd_for_goal(
+            goal(1.0, 0.0, 0.0),
+            Vector3::new(0.4, 0.3, 0.0),
+            0.0,
+        );
+        // dx = 0.6, dy = −0.3 → dist_xy ≈ 0.671, t = 0.671 / 0.3 ≈ 2.24 s.
+        // v_x_world = 0.6 / 2.24 ≈ 0.268; v_y_world = -0.3 / 2.24 ≈ -0.134.
+        // yaw = 0 → body == world.
+        assert!(cmd.vx > 0.0, "must still progress forward");
+        assert!(cmd.vy < 0.0, "must pull back toward y=0 (got {})", cmd.vy);
+        assert_relative_eq!(cmd.vx.hypot(cmd.vy), 0.30, epsilon = 1e-9); // = max_v
+    }
+
+    /// World ↔ body frame: with yaw = π/2 (body facing +y_world), a
+    /// goal in the +x_world direction must produce a **negative
+    /// vy_body** (the body sees the goal to its right).
+    #[test]
+    fn velocity_cmd_for_goal_rotates_with_body_yaw() {
+        let cmd = velocity_cmd_for_goal(
+            goal(1.0, 0.0, std::f64::consts::FRAC_PI_2),
+            Vector3::new(0.0, 0.0, 0.0),
+            std::f64::consts::FRAC_PI_2,
+        );
+        // World err = (+1, 0). yaw = π/2 → R_body_world rotates by -π/2:
+        //   vx_body =  cos(π/2)·1 + sin(π/2)·0 = 0
+        //   vy_body = -sin(π/2)·1 + cos(π/2)·0 = -1
+        // Normalised to max_v = 0.30.
+        assert_relative_eq!(cmd.vx, 0.0, epsilon = 1e-9);
+        assert_relative_eq!(cmd.vy, -0.30, epsilon = 1e-9);
+    }
+
+    /// Yaw error wraps to (−π, π] so the body never picks the long
+    /// way around. Goal at +π facing 0 → error should be −π (not +π).
+    #[test]
+    fn velocity_cmd_for_goal_yaw_wraps_short_way() {
+        // current yaw = +π/2, goal yaw = -π/2  → raw err = -π, wraps to -π (or +π edge).
+        // Use yaw goal -3π/4 from +3π/4: raw err = -3π/2, wraps to +π/2.
+        let cmd = velocity_cmd_for_goal(
+            GoalPoseWorld {
+                x_m: 0.0,
+                y_m: 0.0,
+                yaw_rad: -3.0 * std::f64::consts::FRAC_PI_4,
+                max_v_m_s: 0.30,
+                max_wz_rad_s: 1.0,
+                position_tolerance_m: 0.001,
+                yaw_tolerance_rad: 0.001,
+            },
+            Vector3::new(0.0, 0.0, 0.0),
+            3.0 * std::f64::consts::FRAC_PI_4,
+        );
+        // dyaw = -3π/4 - 3π/4 = -3π/2 → wraps to +π/2 (going the short way).
+        assert!(cmd.wz > 0.0, "should pick the short rotation direction (got wz={})", cmd.wz);
     }
 }
