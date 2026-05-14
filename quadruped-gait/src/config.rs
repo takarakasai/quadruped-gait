@@ -186,6 +186,19 @@ pub struct GaitConfig {
     /// Default `0.0` ⇒ no ramping (legacy step behaviour). Reasonable
     /// values are `0.05`–`0.15`.
     pub transition_fraction: f64,
+    /// **C1-2 experiment**: when `true` AND `transition_fraction > 0`,
+    /// the FullCentroidal controller also applies the
+    /// `stance_weight_at` curve to the per-leg per-step **f_z upper
+    /// bound** that the MPC's friction-cone block enforces as a hard
+    /// constraint. This is the constraint-side counterpart of the
+    /// cost-side `transition_fraction` ramp: at touchdown the leg's
+    /// `max_normal_force` ramps from 0 → full, forcing the MPC to
+    /// redistribute load to other stance legs instead of
+    /// instantaneously spiking the newly-touched-down leg.
+    ///
+    /// Default `false` keeps the legacy global `max_normal_force` as
+    /// the only upper bound — backward compatible.
+    pub transition_enforce_constraint: bool,
 }
 
 impl GaitConfig {
@@ -198,6 +211,7 @@ impl GaitConfig {
             swing_height_m: 0.04,
             max_step_length_m: 0.10,
             transition_fraction: 0.0,
+            transition_enforce_constraint: false,
         }
     }
 
@@ -219,6 +233,10 @@ impl GaitConfig {
     }
     pub fn with_transition_fraction(mut self, tf: f64) -> Self {
         self.transition_fraction = tf.clamp(0.0, 0.5);
+        self
+    }
+    pub fn with_transition_enforce_constraint(mut self, enable: bool) -> Self {
+        self.transition_enforce_constraint = enable;
         self
     }
 }

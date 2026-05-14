@@ -594,10 +594,21 @@ impl FullCentroidalReference {
 /// `is_stance[leg][k]` is true. The MPC reads these only when
 /// [`FullCentroidalMpcConfig::enable_swing_normal_velocity_constraint`]
 /// is `true` — otherwise the field has no effect and zeros are fine.
+///
+/// `stance_f_max` is a per-(leg, step) **upper bound on the vertical
+/// GRF** (Newtons) that the MPC's inequality block enforces as a hard
+/// constraint. Default `f64::INFINITY` ⇒ no per-step tightening, so
+/// the existing global [`FullCentroidalMpcConfig::max_normal_force`]
+/// applies unchanged. Setting a smaller value forces the MPC to
+/// redistribute load to other stance legs at that step — the
+/// constraint-side version of the C1 transition-phase smoothing
+/// (C1-2 experiment). The effective bound is
+/// `min(stance_f_max[leg][k], cfg.max_normal_force)`.
 #[derive(Clone, Debug)]
 pub struct FullCentroidalContactSchedule {
     pub is_stance: [Vec<bool>; N_FEET],
     pub swing_z_velocity: [Vec<f64>; N_FEET],
+    pub stance_f_max: [Vec<f64>; N_FEET],
 }
 
 impl FullCentroidalContactSchedule {
@@ -614,6 +625,12 @@ impl FullCentroidalContactSchedule {
                 vec![0.0; horizon_steps],
                 vec![0.0; horizon_steps],
                 vec![0.0; horizon_steps],
+            ],
+            stance_f_max: [
+                vec![f64::INFINITY; horizon_steps],
+                vec![f64::INFINITY; horizon_steps],
+                vec![f64::INFINITY; horizon_steps],
+                vec![f64::INFINITY; horizon_steps],
             ],
         }
     }
@@ -671,6 +688,7 @@ impl FullCentroidalMpc {
         for leg in 0..N_FEET {
             assert_eq!(contact.is_stance[leg].len(), n);
             assert_eq!(contact.swing_z_velocity[leg].len(), n);
+            assert_eq!(contact.stance_f_max[leg].len(), n);
         }
 
         let n_iter = self.cfg.sqp_iterations.max(1);
@@ -895,8 +913,24 @@ fn build_constraints_24(
     let nx = N_STATE_AUG;
     let total_vars = nu * n;
     let mu = cfg.friction_mu;
-    let f_max = cfg.max_normal_force;
+    let f_max_global = cfg.max_normal_force;
     let legs = [LegId::FL, LegId::FR, LegId::RL, LegId::RR];
+
+    // Effective per-(leg, k) f_z upper bound — the tighter of the
+    // global `cfg.max_normal_force` and the schedule-supplied
+    // `contact.stance_f_max[leg][k]`. Returns `f64::INFINITY` when
+    // neither is set, which means no upper bound row is emitted.
+    let effective_f_max = |leg: usize, k: usize| -> f64 {
+        let local = contact.stance_f_max[leg][k];
+        let local_active = local.is_finite() && local >= 0.0;
+        let global_active = f_max_global > 0.0;
+        match (global_active, local_active) {
+            (true, true) => f_max_global.min(local),
+            (true, false) => f_max_global,
+            (false, true) => local,
+            (false, false) => f64::INFINITY,
+        }
+    };
 
     let mut n_eq = 0;
     let mut n_ineq = 0;
@@ -907,7 +941,7 @@ fn build_constraints_24(
                 n_eq += 3;
                 let mut count = 4; // friction ±x, ±y
                 count += 1; // f_z ≥ 0
-                if f_max > 0.0 {
+                if effective_f_max(leg, k).is_finite() {
                     count += 1;
                 }
                 n_ineq += count;
@@ -1068,9 +1102,10 @@ fn build_constraints_24(
             // f_z ≥ 0  ⇒  -f_z ≤ 0
             a_dense[(row, col_z)] = -1.0;
             row += 1;
-            if f_max > 0.0 {
+            let f_max_this = effective_f_max(leg, k);
+            if f_max_this.is_finite() {
                 a_dense[(row, col_z)] = 1.0;
-                b_vec[row] = f_max;
+                b_vec[row] = f_max_this;
                 row += 1;
             }
             // |f_x| ≤ μ·f_z
@@ -1840,6 +1875,58 @@ mod tests {
             assert!(
                 (v_foot_z - v_z_target).abs() < 1e-3,
                 "FR v_foot_z step {k}: got {v_foot_z}, want {v_z_target}"
+            );
+        }
+    }
+
+    /// C1-2: when the schedule supplies a `stance_f_max[leg][k]`
+    /// tighter than `cfg.max_normal_force`, the MPC must honour it.
+    /// Setting FL's f_max to 5 N at step 0 — well below the hover
+    /// load `m·g/4 ≈ 22 N` for namiashi class — should clamp FL's
+    /// solved vertical GRF at ≤ 5 N (with the rest of the legs
+    /// picking up the slack via the friction-cone-compatible
+    /// redistribution).
+    #[test]
+    fn mpc_stance_f_max_per_step_bound_is_enforced() {
+        let mut cfg = test_config();
+        cfg.horizon_steps = 3;
+        cfg.sqp_iterations = 1;
+        let state_ref = FullCentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        let f_per_foot = cfg.mass_kg * 9.81 / 4.0;
+        let input_ref = FullCentroidalInput {
+            grfs_world: [Vector3::new(0.0, 0.0, f_per_foot); 4],
+            joint_v: [0.0; N_LEG_JOINTS],
+        };
+        let reference = FullCentroidalReference {
+            states: vec![state_ref; cfg.horizon_steps],
+            inputs: vec![input_ref; cfg.horizon_steps],
+        };
+        let mut contact = FullCentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        // Tighten FL only (slot 0) at every step to a small value
+        // well below the per-foot hover load.
+        let tight_f_max = 5.0;
+        for k in 0..cfg.horizon_steps {
+            contact.stance_f_max[0][k] = tight_f_max;
+        }
+        let mut mpc = FullCentroidalMpc::new(cfg.clone());
+        let sol = mpc.solve(state_ref, &reference, &contact);
+        assert!(sol.solved, "MPC must solve under tightened FL f_max bound");
+
+        // FL vertical GRF must respect the tightened bound at every
+        // step. A small numerical slack (1e-5) covers clarabel's
+        // termination tolerance.
+        for k in 0..sol.inputs_all_steps.len() {
+            let fl_z = sol.inputs_all_steps[k].grfs_world[0].z;
+            assert!(
+                fl_z <= tight_f_max + 1e-5,
+                "FL f_z step {k} = {fl_z} exceeds tightened bound {tight_f_max}"
+            );
+            assert!(
+                fl_z >= -1e-9,
+                "FL f_z step {k} = {fl_z} violates the f_z ≥ 0 lower bound"
             );
         }
     }

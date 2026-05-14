@@ -524,6 +524,7 @@ impl FullCentroidalMpcGaitController {
         let mut contact = FullCentroidalContactSchedule {
             is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             swing_z_velocity: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            stance_f_max: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         };
         // Per-(leg, step) stance sub-fraction, kept alongside the
         // schedule so the C1 GRF-reference ramp can look up "how far
@@ -591,6 +592,27 @@ impl FullCentroidalMpcGaitController {
                 // reference loop below can apply the transition ramp.
                 // Swing entries get 0.0 (unused).
                 stance_sub_fractions[leg].push(if in_stance { sub_frac } else { 0.0 });
+                // C1-2: per-(leg, k) f_z upper bound. When the
+                // constraint-side ramp is enabled (and we're on the
+                // parity path with a non-zero transition_fraction),
+                // tighten the bound to `weight · cfg.max_normal_force`.
+                // Otherwise INFINITY ⇒ the global f_max applies
+                // unchanged (backward-compat).
+                let f_max_cell = if in_stance
+                    && self.legged_control_parity
+                    && self.cfg.transition_enforce_constraint
+                    && self.cfg.transition_fraction > 0.0
+                {
+                    let mpc_f_max = cfg.max_normal_force.max(0.0);
+                    let w = crate::config::stance_weight_at(
+                        sub_frac,
+                        self.cfg.transition_fraction,
+                    );
+                    mpc_f_max * w
+                } else {
+                    f64::INFINITY
+                };
+                contact.stance_f_max[leg].push(f_max_cell);
             }
         }
 
