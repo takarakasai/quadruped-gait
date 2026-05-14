@@ -242,6 +242,16 @@ pub struct FullCentroidalMpcConfig {
     pub sqp_iterations: usize,
     /// Per-leg analytical FK config (FL/FR/RL/RR).
     pub kinematics: KinematicsConfig,
+    /// Add a per-swing-leg-step **vertical foot velocity** equality
+    /// constraint to the QP, matching legged_control's
+    /// `NormalVelocityConstraintCppAd`. The RHS is taken from
+    /// [`FullCentroidalContactSchedule::swing_z_velocity`].
+    ///
+    /// Default `false` — the legacy D3.3.5a path (constant joint_q
+    /// reference, no swing-leg foot-velocity constraint) stays intact
+    /// for A/B comparison. Turn on alongside the controller's
+    /// `enable_legged_control_parity` flag.
+    pub enable_swing_normal_velocity_constraint: bool,
 }
 
 impl FullCentroidalMpcConfig {
@@ -300,6 +310,7 @@ impl FullCentroidalMpcConfig {
             r_diag,
             sqp_iterations: 3,
             kinematics,
+            enable_swing_normal_velocity_constraint: false,
         }
     }
 }
@@ -577,9 +588,16 @@ impl FullCentroidalReference {
 }
 
 /// Per-leg per-step stance schedule (same shape as the 12-state version).
+///
+/// `swing_z_velocity` is the per-step planned world-frame vertical foot
+/// velocity for each leg; entries are ignored when the corresponding
+/// `is_stance[leg][k]` is true. The MPC reads these only when
+/// [`FullCentroidalMpcConfig::enable_swing_normal_velocity_constraint`]
+/// is `true` — otherwise the field has no effect and zeros are fine.
 #[derive(Clone, Debug)]
 pub struct FullCentroidalContactSchedule {
     pub is_stance: [Vec<bool>; N_FEET],
+    pub swing_z_velocity: [Vec<f64>; N_FEET],
 }
 
 impl FullCentroidalContactSchedule {
@@ -590,6 +608,12 @@ impl FullCentroidalContactSchedule {
                 vec![true; horizon_steps],
                 vec![true; horizon_steps],
                 vec![true; horizon_steps],
+            ],
+            swing_z_velocity: [
+                vec![0.0; horizon_steps],
+                vec![0.0; horizon_steps],
+                vec![0.0; horizon_steps],
+                vec![0.0; horizon_steps],
             ],
         }
     }
@@ -646,6 +670,7 @@ impl FullCentroidalMpc {
         assert_eq!(reference.inputs.len(), n, "ref input length mismatch");
         for leg in 0..N_FEET {
             assert_eq!(contact.is_stance[leg].len(), n);
+            assert_eq!(contact.swing_z_velocity[leg].len(), n);
         }
 
         let n_iter = self.cfg.sqp_iterations.max(1);
@@ -888,6 +913,9 @@ fn build_constraints_24(
                 n_ineq += count;
             } else {
                 n_eq += 3; // swing F = 0
+                if cfg.enable_swing_normal_velocity_constraint {
+                    n_eq += 1; // swing v_foot_world.z = v_z_planned
+                }
             }
         }
     }
@@ -967,6 +995,64 @@ fn build_constraints_24(
                 b_vec[row + ax] = -rhs;
             }
             row += 3;
+        }
+    }
+
+    // ── Equality 3 (opt-in): swing-leg vertical foot velocity ─────────
+    // Mirrors legged_control's `NormalVelocityConstraintCppAd`. Active
+    // per swing-leg-step when `cfg.enable_swing_normal_velocity_constraint`
+    // is on. The linearization is identical to stance no-slip's z-row,
+    // with the RHS swapped from 0 to the planner-supplied
+    // `v_z_planned = contact.swing_z_velocity[leg][k]`. Horizontal foot
+    // motion remains unconstrained — the optimiser shapes it via the
+    // joint_v cost + the next stance's no-slip constraint at touchdown
+    // (legged_control's design choice).
+    if cfg.enable_swing_normal_velocity_constraint {
+        for k in 0..n {
+            for leg in 0..N_FEET {
+                if contact.is_stance[leg][k] {
+                    continue;
+                }
+                let psi = ref_traj.states[k].base_euler_zyx.z;
+                let (s, c) = psi.sin_cos();
+                let r_z = Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
+                let kin = cfg.kinematics.leg(legs[leg]);
+                let [qhip, qthigh, qcalf] = ref_traj.states[k].leg_joint_q(leg);
+                let foot_body_ref = forward_leg_kinematics(kin, qhip, qthigh, qcalf);
+                let r_ref = r_z * (foot_body_ref - cfg.com_offset_body);
+                let j_foot_body = foot_jacobian_body(kin, qhip, qthigh, qcalf);
+                let r_z_j = r_z * j_foot_body;
+                let m_skew = skew_3(&r_ref);
+
+                let ax = 2; // z-row only
+                let row_base_in_a = k * nx;
+                let joint_v_col_base = k * nu + 12 + 3 * leg;
+                for col_u in 0..total_vars {
+                    let mut coef = b_u[(row_base_in_a + ax, col_u)];
+                    for sr in 0..3 {
+                        coef += -m_skew[(ax, sr)] * b_u[(row_base_in_a + 3 + sr, col_u)];
+                    }
+                    if col_u >= joint_v_col_base && col_u < joint_v_col_base + 3 {
+                        let local = col_u - joint_v_col_base;
+                        coef += r_z_j[(ax, local)];
+                    }
+                    if coef.abs() > 1e-14 {
+                        a_dense[(row, col_u)] = coef;
+                    }
+                }
+                let mut rhs = 0.0;
+                for col_x in 0..nx {
+                    let mut m_row = 0.0;
+                    m_row += a_x[(row_base_in_a + ax, col_x)];
+                    for sr in 0..3 {
+                        m_row += -m_skew[(ax, sr)] * a_x[(row_base_in_a + 3 + sr, col_x)];
+                    }
+                    rhs += m_row * x_now[col_x];
+                }
+                let v_z_planned = contact.swing_z_velocity[leg][k];
+                b_vec[row] = v_z_planned - rhs;
+                row += 1;
+            }
         }
     }
 
@@ -1123,6 +1209,7 @@ mod tests {
             r_diag: [1e-3; N_INPUT],
             sqp_iterations: 1,
             kinematics: test_kinematics(),
+            enable_swing_normal_velocity_constraint: false,
         }
     }
 
@@ -1688,6 +1775,72 @@ mod tests {
         for k in 0..sol.inputs_all_steps.len() {
             let fr = sol.inputs_all_steps[k].grfs_world[1];
             assert!(fr.norm() < 1e-7, "FR GRF nonzero at step {k}: {fr}");
+        }
+    }
+
+    /// With `enable_swing_normal_velocity_constraint = true`, the MPC
+    /// must drive the swing leg's foot vertical velocity to match the
+    /// planner-supplied `swing_z_velocity` at each step. Mirrors
+    /// legged_control's `NormalVelocityConstraintCppAd` behaviour.
+    #[test]
+    fn mpc_swing_normal_velocity_constraint_tracks_planned_vz() {
+        let mut cfg = test_config();
+        cfg.horizon_steps = 3;
+        cfg.sqp_iterations = 1;
+        cfg.enable_swing_normal_velocity_constraint = true;
+        let state_ref = FullCentroidalState {
+            base_pos_world: Vector3::new(0.0, 0.0, 0.30),
+            ..Default::default()
+        };
+        // 3 stance legs (FL, RL, RR) share gravity; FR (slot 1) swings.
+        let f_per_foot = cfg.mass_kg * 9.81 / 3.0;
+        let mut grfs = [Vector3::zeros(); N_FEET];
+        for leg in [0, 2, 3] {
+            grfs[leg].z = f_per_foot;
+        }
+        let input_ref = FullCentroidalInput {
+            grfs_world: grfs,
+            joint_v: [0.0; N_LEG_JOINTS],
+        };
+        let reference = FullCentroidalReference {
+            states: vec![state_ref; cfg.horizon_steps],
+            inputs: vec![input_ref; cfg.horizon_steps],
+        };
+        let mut contact = FullCentroidalContactSchedule::all_stance(cfg.horizon_steps);
+        let v_z_target = 0.10;
+        for k in 0..cfg.horizon_steps {
+            contact.is_stance[1][k] = false;
+            contact.swing_z_velocity[1][k] = v_z_target;
+        }
+        let mut mpc = FullCentroidalMpc::new(cfg.clone());
+        let sol = mpc.solve(state_ref, &reference, &contact);
+        assert!(
+            sol.solved,
+            "MPC must solve with swing normal velocity constraint"
+        );
+
+        // Reconstruct v_foot_world.z at each horizon row from the
+        // predicted state and the solved joint_v, using the same
+        // linearisation point the constraint was built around
+        // (foot_body and J_foot at ref state's joint_q; ω·r picked up
+        // from the predicted ω). With R_z = I at zero yaw, the world
+        // and body z axes coincide.
+        let kin = cfg.kinematics.leg(LegId::FR);
+        let [qhip, qthigh, qcalf] = state_ref.leg_joint_q(1);
+        let j_foot = foot_jacobian_body(kin, qhip, qthigh, qcalf);
+        let foot_body = forward_leg_kinematics(kin, qhip, qthigh, qcalf);
+        let r_ref = foot_body - cfg.com_offset_body;
+        for k in 0..cfg.horizon_steps {
+            let v_com_z = sol.predicted_states[k].v_com_world.z;
+            let omega = sol.predicted_states[k].angular_velocity_world;
+            let jv = sol.inputs_all_steps[k].joint_v;
+            let joint_v_fr = Vector3::new(jv[3], jv[4], jv[5]);
+            let v_foot_z =
+                v_com_z + omega.cross(&r_ref).z + (j_foot * joint_v_fr).z;
+            assert!(
+                (v_foot_z - v_z_target).abs() < 1e-3,
+                "FR v_foot_z step {k}: got {v_foot_z}, want {v_z_target}"
+            );
         }
     }
 

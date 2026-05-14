@@ -19,8 +19,28 @@
 //! 3. Reference joint_q is held at the controller's current IK output
 //!    (D3.3.5a — design choice (a) from the planning session). Swing
 //!    leg foot tracking is still driven by the CHAMP layer's joint
-//!    target. A future revision can replace the held reference with a
-//!    per-step IK of the planned footstep trajectory.
+//!    target.
+//!
+//! ## D3.3.5b — legged_control parity (opt-in)
+//!
+//! When [`FullCentroidalMpcGaitController::set_legged_control_parity`]
+//! is `true`, two additional behaviours kick in to match OCS2 /
+//! legged_control's `centroidalModelType = 0` setup:
+//!
+//! - The per-step contact schedule is built from a per-leg phase
+//!   projection (`cycle_phase + k·dt_per_step / cycle_period_s +
+//!   offset_leg mod 1`), rather than the D3.3.5a `duty > 0.5 ? all
+//!   stance : all swing` proxy.
+//! - Each swing-leg-step receives a planned world-frame vertical foot
+//!   velocity from [`crate::swing_traj::swing_vz_world`], which the
+//!   MPC's new `enable_swing_normal_velocity_constraint` equality
+//!   tracks per node (mirrors `NormalVelocityConstraintCppAd`).
+//!
+//! Joint_q reference is **still held constant** under parity, exactly
+//! as legged_control does — the swing arc enters the MPC in task
+//! space, not joint space. The legacy path (parity off) remains the
+//! default and is the basis of the existing benchmark rows; the
+//! parity path is exposed for A/B comparison.
 //!
 //! GRF output is projected into [`MpcSolution`] via
 //! [`to_compat_mpc_solution_full`] so WBC integration stays
@@ -46,7 +66,7 @@ use crate::mpc_controller::{
 };
 use crate::phase::PhaseGenerator;
 use crate::srbd_mpc::{MpcSolution, SrbdState};
-use crate::swing_traj::swing_position;
+use crate::swing_traj::{swing_position, swing_vz_world};
 
 #[derive(Clone, Debug)]
 pub struct FullCentroidalMpcGaitController {
@@ -65,6 +85,32 @@ pub struct FullCentroidalMpcGaitController {
     last_solution: Option<FullCentroidalMpcSolution>,
     last_solution_compat: Option<MpcSolution>,
     mpc_solve_accumulator_s: f64,
+
+    /// When `true`, the MPC's contact schedule is built from a per-leg
+    /// per-step phase projection (matching legged_control's
+    /// `SwitchedModelReferenceManager` behaviour), and each swing-leg-
+    /// step receives a planned vertical foot velocity that the MPC
+    /// enforces via the `NormalVelocityConstraintCppAd`-equivalent
+    /// equality (see
+    /// [`FullCentroidalMpcConfig::enable_swing_normal_velocity_constraint`]).
+    ///
+    /// Default `false` — the legacy D3.3.5a path stays available for
+    /// A/B comparison via the external-force robustness benchmark and
+    /// the Rhai test scripts.
+    legged_control_parity: bool,
+
+    /// When `true` AND [`Self::legged_control_parity`] is also `true`,
+    /// the joint_q tracking reference is filled with the URDF nominal
+    /// stance pose (= per-leg analytical IK of
+    /// `kin.nominal_foot_body`) instead of the observed `joint_q_now`.
+    /// This matches legged_control's
+    /// `DEFAULT_JOINT_STATE`-based tracking (see `reference.info`),
+    /// where the MPC's joint cost biases the swing leg back toward the
+    /// nominal pose rather than tracking whatever the leg is doing
+    /// right now. Independent of [`Self::legged_control_parity`] so the
+    /// β-only variant (parity ON, nominal_q_ref OFF) and the combined
+    /// (α+β) variant can both be benchmarked.
+    parity_use_nominal_q_ref: bool,
 }
 
 impl FullCentroidalMpcGaitController {
@@ -91,7 +137,35 @@ impl FullCentroidalMpcGaitController {
             last_solution: None,
             last_solution_compat: None,
             mpc_solve_accumulator_s: f64::INFINITY,
+            legged_control_parity: false,
+            parity_use_nominal_q_ref: false,
         }
+    }
+
+    pub fn legged_control_parity(&self) -> bool {
+        self.legged_control_parity
+    }
+    /// Toggle the legged_control-style swing-leg vertical foot velocity
+    /// constraint path. Also flips the MPC config's
+    /// `enable_swing_normal_velocity_constraint` to keep the two in
+    /// sync — the controller is the only writer of that flag in
+    /// practice.
+    pub fn set_legged_control_parity(&mut self, enable: bool) {
+        self.legged_control_parity = enable;
+        let mut mpc_cfg = self.full_centroidal_mpc.config().clone();
+        mpc_cfg.enable_swing_normal_velocity_constraint = enable;
+        self.full_centroidal_mpc.set_config(mpc_cfg);
+    }
+
+    pub fn parity_use_nominal_q_ref(&self) -> bool {
+        self.parity_use_nominal_q_ref
+    }
+    /// Switch the joint_q tracking reference between the observed
+    /// `joint_q_now` (default) and the URDF nominal stance pose. Only
+    /// takes effect while [`Self::legged_control_parity`] is also on.
+    /// See struct docs for the rationale.
+    pub fn set_parity_use_nominal_q_ref(&mut self, enable: bool) {
+        self.parity_use_nominal_q_ref = enable;
     }
 
     pub fn predicted_grfs(&self) -> Option<&MpcSolution> {
@@ -329,29 +403,106 @@ impl FullCentroidalMpcGaitController {
         ];
         let holding = self.cmd.is_zero();
 
-        // Per-step contact schedule (mirrors 12-state simplification:
-        // step 0 = actual phase, subsequent steps = duty > 0.5 ?
-        // all stance : all swing).
+        // Per-step contact schedule. Two paths:
+        //
+        // - Legacy (D3.3.5a): step 0 = observed stance, k≥1 = `duty > 0.5
+        //   ? all stance : all swing`. Cheap proxy with no per-leg phase
+        //   awareness; carried because the existing benchmark rows
+        //   (`FullC default / h20 sqp3 / h10 sqp5`) were tuned against
+        //   it and the contact schedule mismatch is part of their
+        //   character.
+        // - legged_control parity (D3.3.5b): step k's per-leg stance is
+        //   derived from the projected per-leg phase
+        //   `(cycle_phase_now + k·dt_per_step / cycle_period + offset) mod 1`,
+        //   matching the OCS2 `SwitchedModelReferenceManager`. Each
+        //   swing-leg-step also carries a planned vertical foot velocity
+        //   (from [`swing_vz_world`]) so the MPC's NormalVelocity-equivalent
+        //   equality constraint has something to track.
         let mut contact = FullCentroidalContactSchedule {
             is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            swing_z_velocity: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        };
+        let cycle_phase_now = self.phase_gen.cycle_phase();
+        let cycle_period = self.cfg.cycle_period_s.max(1e-6);
+        let duty = self.cfg.duty_factor.clamp(1e-6, 1.0 - 1e-6);
+        let swing_duration = cycle_period * (1.0 - duty);
+        let swing_h = effective_swing_height(self.cfg.swing_height_m, &self.cmd);
+        let leg_phase_offsets: [f64; N_FEET] = {
+            let mut arr = [0.0_f64; N_FEET];
+            for (leg, off) in self.cfg.gait_type.phase_offsets() {
+                arr[crate::controller::slot_of(leg)] = off;
+            }
+            arr
         };
         for leg in 0..N_FEET {
             for k in 0..n {
-                let in_stance = if holding {
-                    true
+                let (in_stance, sub_frac, in_swing) = if holding {
+                    (true, 0.0_f64, false)
+                } else if self.legged_control_parity {
+                    // Project the cycle phase forward by k·dt_per_step.
+                    // The k=0 row keeps the observed stance flag — the
+                    // system is in that state right now and the no-slip
+                    // equality at step 0 must not conflict with reality.
+                    // For swing v_z the observed sub_fraction is used so
+                    // the planned velocity is continuous with the
+                    // foot's current motion.
+                    if k == 0 {
+                        let phase = output.legs[leg].phase;
+                        (phase.is_stance, phase.sub_fraction, !phase.is_stance)
+                    } else {
+                        let t = k as f64 * dt_per_step;
+                        let cycle_phase_k =
+                            (cycle_phase_now + t / cycle_period).rem_euclid(1.0);
+                        let pos = (cycle_phase_k + leg_phase_offsets[leg]).rem_euclid(1.0);
+                        if pos < duty {
+                            (true, pos / duty, false)
+                        } else {
+                            (false, (pos - duty) / (1.0 - duty), true)
+                        }
+                    }
                 } else if k == 0 {
-                    stance_now[leg]
+                    (stance_now[leg], 0.0, false)
                 } else {
-                    self.cfg.duty_factor > 0.5
+                    (self.cfg.duty_factor > 0.5, 0.0, false)
                 };
                 contact.is_stance[leg].push(in_stance);
+                let v_z = if in_swing && self.legged_control_parity {
+                    swing_vz_world(swing_h, sub_frac, swing_duration, 0.0, 0.0)
+                } else {
+                    0.0
+                };
+                contact.swing_z_velocity[leg].push(v_z);
             }
         }
 
+        // β: when parity + nominal-q_ref is on, build the URDF nominal
+        // stance pose once (3R analytical IK of each leg's
+        // `kin.nominal_foot_body`) and use that as the joint_q
+        // tracking reference for every horizon step. This matches
+        // legged_control's `DEFAULT_JOINT_STATE` design — the swing
+        // leg's cost biases it back toward the standing pose rather
+        // than tracking whatever the leg happens to be doing.
+        let nominal_joint_q: Option<[f64; N_LEG_JOINTS]> =
+            if self.legged_control_parity && self.parity_use_nominal_q_ref {
+                let mut q = [0.0_f64; N_LEG_JOINTS];
+                for slot in 0..N_FEET {
+                    let kin = self.kin.leg(LegId::ALL[slot]);
+                    let knee_fwd = self.knee_forward[slot];
+                    let sol = solve_leg_ik(kin, kin.nominal_foot_body, knee_fwd);
+                    let (h, th, c) = sol.angles();
+                    q[3 * slot] = h;
+                    q[3 * slot + 1] = th;
+                    q[3 * slot + 2] = c;
+                }
+                Some(q)
+            } else {
+                None
+            };
+
         // Per-step reference state + input. Body pose integrates the cmd
-        // velocity; joint_q held; gravity distributed across stance legs
-        // for the GRF reference (the QP deviates as needed for the cost
-        // and constraints).
+        // velocity; joint_q held (or set to nominal pose when β is on);
+        // gravity distributed across stance legs for the GRF reference
+        // (the QP deviates as needed for the cost and constraints).
         let mut ref_states = Vec::with_capacity(n);
         let mut ref_inputs = Vec::with_capacity(n);
         for k in 0..n {
@@ -361,6 +512,9 @@ impl FullCentroidalMpcGaitController {
             sk.angular_velocity_world = Vector3::new(0.0, 0.0, self.cmd.wz);
             sk.base_pos_world = s_now.base_pos_world + v_world_cmd * t;
             sk.base_euler_zyx.z = s_now.base_euler_zyx.z + self.cmd.wz * t;
+            if let Some(q_nom) = nominal_joint_q {
+                sk.joint_q = q_nom;
+            }
             ref_states.push(sk);
 
             // Gravity-balanced GRF reference: total = m·g, split across

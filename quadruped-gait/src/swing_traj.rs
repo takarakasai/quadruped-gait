@@ -88,6 +88,41 @@ pub fn swing_position(
     p
 }
 
+/// Planned world-frame vertical foot velocity at sub-phase `frac` of a
+/// swing whose total duration is `swing_duration_s` seconds. The base
+/// curve is the analytical derivative of [`swing_position`]'s z bump
+/// (`sin²(π·t)·h`), normalized to the swing's real-time duration:
+///
+/// ```text
+/// dz/dt = h · π · sin(2π·t) / T_swing
+/// ```
+///
+/// `lift_off_vz` / `touch_down_vz` add linear blends from the endpoints
+/// so the caller can switch between the articara-native zero-boundary
+/// profile (both = 0, default) and legged_control's nonzero-boundary
+/// profile (lift_off_vz ≈ +0.05, touch_down_vz ≈ −0.10) without
+/// touching [`swing_position`]'s position curve. The blend uses a
+/// `(1−t)` / `t` ramp so each endpoint exactly matches its requested
+/// boundary value and the sin² peak is left intact at the midpoint.
+///
+/// Returned in m/s. Assumes the body frame's z-axis is aligned with the
+/// world's vertical, which is the small-angle linearisation regime
+/// the full-centroidal MPC operates under.
+pub fn swing_vz_world(
+    swing_height: f64,
+    frac: f64,
+    swing_duration_s: f64,
+    lift_off_vz: f64,
+    touch_down_vz: f64,
+) -> f64 {
+    let t = frac.clamp(0.0, 1.0);
+    let t_swing = swing_duration_s.max(1e-6);
+    let two_pi_t = 2.0 * std::f64::consts::PI * t;
+    let bump_dot = swing_height * std::f64::consts::PI * two_pi_t.sin() / t_swing;
+    let boundary = (1.0 - t) * lift_off_vz + t * touch_down_vz;
+    bump_dot + boundary
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +226,46 @@ mod tests {
         // smoothstep S'(0) = S'(1) = 0 exactly.
         assert!(vxy_lift < 1e-3, "lift-off xy velocity should be ~0, got {vxy_lift}");
         assert!(vxy_land < 1e-3, "touchdown xy velocity should be ~0, got {vxy_land}");
+    }
+
+    /// `swing_vz_world` must agree with a finite-difference of
+    /// `swing_position`'s z-component when boundary velocities are zero.
+    /// This is the consistency check between the position curve and the
+    /// reference velocity the MPC's swing-leg constraint receives.
+    #[test]
+    fn swing_vz_world_matches_position_derivative() {
+        let a = Vector3::new(0.0, 0.0, 0.0);
+        let b = Vector3::new(0.10, 0.02, 0.0);
+        let h = 0.04;
+        let t_swing = 0.25;
+        let eps = 1e-5;
+        for k in 1..10 {
+            let t = k as f64 / 10.0;
+            let p_minus = swing_position(a, b, h, t - eps);
+            let p_plus = swing_position(a, b, h, t + eps);
+            // Finite-difference dz/dfrac, then divide by T_swing to get
+            // dz/dt as a real-time velocity.
+            let dz_dfrac = (p_plus.z - p_minus.z) / (2.0 * eps);
+            let vz_fd = dz_dfrac / t_swing;
+            let vz_an = swing_vz_world(h, t, t_swing, 0.0, 0.0);
+            assert!(
+                (vz_fd - vz_an).abs() < 1e-4,
+                "swing_vz_world disagrees with d/dt(swing_position.z) at t={t}: fd={vz_fd}, an={vz_an}"
+            );
+        }
+    }
+
+    /// Boundary-velocity blend: at frac=0 and frac=1 the analytical
+    /// vz must equal lift_off_vz / touch_down_vz exactly (sin² term is
+    /// zero at both endpoints).
+    #[test]
+    fn swing_vz_world_boundary_blend() {
+        let h = 0.04;
+        let t_swing = 0.25;
+        let vz0 = swing_vz_world(h, 0.0, t_swing, 0.05, -0.10);
+        let vz1 = swing_vz_world(h, 1.0, t_swing, 0.05, -0.10);
+        assert_relative_eq!(vz0, 0.05, epsilon = 1e-9);
+        assert_relative_eq!(vz1, -0.10, epsilon = 1e-9);
     }
 
     /// Swing curve should monotonically traverse the chord in xy

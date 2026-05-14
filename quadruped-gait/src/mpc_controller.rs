@@ -43,23 +43,32 @@ use crate::srbd_mpc::{
 };
 use crate::swing_traj::swing_position;
 
-/// Default capture-point feedback gain. **Set to 0.0** (D3.3.7
-/// architectural decision, 2026-05-13): the LIP-derived
-/// `k_fb = √(h/g) ≈ 0.175 s` does not match CHAMP's linear stance-line
-/// model and acts as a **positive feedback loop** under stiff PD (the
-/// fidelity reproduced by `.misa` actuator configs). The reference
-/// `ref/legged_control` does not use any capture-point heuristic at
-/// all — the MPC's reference-tracking horizon closes the loop instead.
-/// See `doc/recent_features.md` section 9 + `memory/project_mpc_frame_bug.md`.
+/// Default capture-point feedback gain. **Raised to 0.05** (η
+/// experiment, 2026-05-15): a gradient scan in
+/// `diag_external_force_robustness` showed that the C2 setting of 0.0
+/// (which fixed the SRBD-MPC forward-walk cross-coupling bug) made the
+/// robot fall under lateral pushes of 4 N+ — the controller no longer
+/// shifts the foothold in the disturbance direction. Re-enabling the
+/// LIP-derived `k_fb ≈ √(h/g) = 0.175` recreates the original positive-
+/// feedback divergence (y drifts 3 m regardless of input axis). 0.05
+/// is the sweet spot: it prevents lateral 4 N + 6 N falls AND avoids
+/// the cross-axis explosion, while keeping forward / vertical / yaw
+/// recovery intact. legged_control uses 0 because its MPC reference
+/// tracking closes the loop differently; for the current articara
+/// stack (CHAMP-style open-loop footstep + SRBD/FullC GRF closure)
+/// 0.05 is the empirically validated balance.
 ///
-/// `set_capture_point_gain(k)` is retained so callers can opt back into
-/// the legacy heuristic for A/B comparison (e.g. the GUI slider's
-/// `[default]` button uses 0.175).
-pub const DEFAULT_CAPTURE_POINT_GAIN_S: f64 = 0.0;
+/// `set_capture_point_gain(k)` is retained so callers can opt into
+/// the legacy 0.175 (`LEGACY_CAPTURE_POINT_GAIN_S`) or 0.0 for A/B
+/// comparison.
+pub const DEFAULT_CAPTURE_POINT_GAIN_S: f64 = 0.05;
 /// Legacy LIP-derived capture-point gain (= √(h/g) for h ≈ 0.30 m,
 /// g = 9.81 m/s²). Kept as a named constant so the GUI / scripts can
 /// restore the old behaviour for comparison without hard-coding a
-/// magic number.
+/// magic number. **Note**: for namiashi (m = 2.4 kg) this gain
+/// triggers a y-axis positive-feedback divergence regardless of
+/// input axis — see η experiment in
+/// `tests/integration_walk.rs::diag_external_force_robustness`.
 pub const LEGACY_CAPTURE_POINT_GAIN_S: f64 = 0.175;
 
 /// Minimum predicted GRF magnitude (Newtons) below which the WBC layer

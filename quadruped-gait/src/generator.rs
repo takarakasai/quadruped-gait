@@ -374,6 +374,41 @@ impl AnyGaitController {
             _ => None,
         }
     }
+
+    /// Toggle the FullCentroidal controller's legged_control-parity
+    /// path (per-step phase prediction + swing-leg vertical foot
+    /// velocity equality constraint). No-op outside of
+    /// [`GaitMode::FullCentroidal`].
+    pub fn set_legged_control_parity(&mut self, enable: bool) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_legged_control_parity(enable);
+        }
+    }
+
+    /// Read whether the FullCentroidal controller's parity path is
+    /// active. Returns `None` outside of [`GaitMode::FullCentroidal`].
+    pub fn legged_control_parity(&self) -> Option<bool> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.legged_control_parity()),
+            _ => None,
+        }
+    }
+
+    /// Toggle whether the parity path uses the URDF nominal pose as
+    /// the joint_q tracking reference (matches legged_control's
+    /// `DEFAULT_JOINT_STATE`). No-op outside FullCentroidal mode.
+    pub fn set_parity_use_nominal_q_ref(&mut self, enable: bool) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_parity_use_nominal_q_ref(enable);
+        }
+    }
+
+    pub fn parity_use_nominal_q_ref(&self) -> Option<bool> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.parity_use_nominal_q_ref()),
+            _ => None,
+        }
+    }
 }
 
 impl GaitGenerator for AnyGaitController {
