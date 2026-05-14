@@ -78,6 +78,18 @@ pub struct FullCentroidalMpcGaitController {
     knee_forward: [bool; 4],
 
     k_capture: f64,
+    /// Pulse-branch slope past `v_capture_deadband` (see
+    /// [`crate::mpc_controller::capture_point_step`]). 0 disables the
+    /// nonlinear pulse; the controller then falls back to a pure
+    /// linear `k_capture · v_err` response. Defaults to 0.
+    k_capture_pulse: f64,
+    /// Deadband (m/s) below which the pulse branch contributes
+    /// nothing. Defaults to 0 — i.e. the pulse acts on all v_err
+    /// magnitudes when `k_capture_pulse > 0`. Tuned to ≈ 0.05 m/s in
+    /// the η-2 experiment so cycle-noise on `v_err_y` doesn't trigger
+    /// a foothold shift while real pushes (> 0.05 m/s = ~ 4 N impulse)
+    /// still get the steeper response.
+    v_capture_deadband: f64,
     v_observed_world: Vector3<f64>,
     omega_observed_world: Vector3<f64>,
 
@@ -131,6 +143,8 @@ impl FullCentroidalMpcGaitController {
             cmd: VelocityCmd::zero(),
             knee_forward: [false; 4],
             k_capture: DEFAULT_CAPTURE_POINT_GAIN_S,
+            k_capture_pulse: 0.0,
+            v_capture_deadband: 0.0,
             v_observed_world: Vector3::zeros(),
             omega_observed_world: Vector3::zeros(),
             full_centroidal_mpc: FullCentroidalMpc::new(mpc_cfg),
@@ -274,6 +288,23 @@ impl FullCentroidalMpcGaitController {
     }
     pub fn set_capture_point_gain(&mut self, k: f64) {
         self.k_capture = k.max(0.0);
+    }
+
+    /// Read the nonlinear pulse branch parameters `(k_pulse, v_db)`.
+    /// `k_pulse = 0` means the pulse branch is inactive — the
+    /// controller uses pure linear capture-point.
+    pub fn capture_point_pulse(&self) -> (f64, f64) {
+        (self.k_capture_pulse, self.v_capture_deadband)
+    }
+    /// Configure the nonlinear pulse branch of the capture-point
+    /// feedback. `k_pulse` is the slope applied to `(|v_err| − v_db)`
+    /// for `|v_err| > v_db`; below the deadband the pulse contributes
+    /// 0 and the controller falls back to its linear `k_capture` gain
+    /// alone. Both are clamped to ≥ 0. See
+    /// [`crate::mpc_controller::capture_point_step`].
+    pub fn set_capture_point_pulse(&mut self, k_pulse: f64, v_db: f64) {
+        self.k_capture_pulse = k_pulse.max(0.0);
+        self.v_capture_deadband = v_db.max(0.0);
     }
 
     pub fn set_body_state_observed(
@@ -558,17 +589,34 @@ impl FullCentroidalMpcGaitController {
         let v_hip = v_body + omega.cross(&kin.hip_offset);
         let mut half = v_hip * (0.5 * stance_duration);
 
+        // Closed-loop foothold shift in the disturbance direction.
+        // Uses the linear `k_capture · v_err` + deadband-gated pulse
+        // branch from [`crate::mpc_controller::capture_point_step`]
+        // (η-2 experiment): the pulse lets the swing leg commit a
+        // larger lateral foothold for real pushes while keeping the
+        // small-v_err response gentle so cycle-noise on `v_err_y`
+        // can't accumulate into a cross-axis drift.
         let feedback_enabled = !self.cmd.is_zero();
         let mut feedback = Vector3::zeros();
         if feedback_enabled {
-            feedback.x = self.k_capture * v_err_body.x;
-            feedback.y = self.k_capture * v_err_body.y;
+            feedback.x = crate::mpc_controller::capture_point_step(
+                v_err_body.x,
+                self.k_capture,
+                self.k_capture_pulse,
+                self.v_capture_deadband,
+            );
+            feedback.y = crate::mpc_controller::capture_point_step(
+                v_err_body.y,
+                self.k_capture,
+                self.k_capture_pulse,
+                self.v_capture_deadband,
+            );
         }
         let horizon_weight = 1.0 / HORIZON_STEPS as f64;
         let mut horizon_bias = Vector3::zeros();
         if feedback_enabled {
-            horizon_bias.x = horizon_weight * self.k_capture * v_err_body.x;
-            horizon_bias.y = horizon_weight * self.k_capture * v_err_body.y;
+            horizon_bias.x = horizon_weight * feedback.x;
+            horizon_bias.y = horizon_weight * feedback.y;
         }
 
         let closed_loop = feedback + horizon_bias;

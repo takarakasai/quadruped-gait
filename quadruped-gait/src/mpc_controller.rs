@@ -92,6 +92,33 @@ pub const HORIZON_STEPS: usize = 4;
 /// forward push at startup so the body can accelerate up to `v_cmd`.
 pub(crate) const MIN_HALF_FRACTION: f64 = 0.5;
 
+/// Nonlinear capture-point step: linear `k_linear · v_err` for small
+/// disturbances + an additive `k_pulse · max(0, |v_err| − v_db) ·
+/// sign(v_err)` "pulse" branch for large ones. The two terms coexist
+/// (rather than the pulse replacing the linear), so callers can opt
+/// into a deadband+steeper response while keeping the existing
+/// linear baseline intact for small frame / observer noise that
+/// shouldn't trigger a foothold shift.
+///
+/// Default tunings (η experiment, 2026-05-15) show
+/// `k_linear = 0.05, k_pulse = 0.0, v_db = 0.0` is the noise-quiet
+/// baseline; raising `k_pulse` past about 0.20 with `v_db ≈ 0.05` m/s
+/// lets the swing leg commit a 5+ cm lateral foothold on a real 4 N
+/// push without amplifying the cycle-to-cycle drift seen at
+/// `k_linear ≥ 0.10` (see `tests/integration_walk.rs::
+/// diag_external_force_robustness`).
+pub fn capture_point_step(
+    v_err: f64,
+    k_linear: f64,
+    k_pulse: f64,
+    v_db: f64,
+) -> f64 {
+    let linear = k_linear * v_err;
+    let pulse_mag = (v_err.abs() - v_db).max(0.0);
+    let pulse = v_err.signum() * k_pulse * pulse_mag;
+    linear + pulse
+}
+
 /// Stateful MPC-flavoured gait controller. Same construction inputs
 /// as [`crate::ChampGaitController`] so the host can swap them via
 /// [`crate::AnyGaitController::set_mode`] without re-providing the
@@ -721,6 +748,55 @@ mod tests {
     use super::*;
     use crate::config::{GaitConfig, KinematicsConfig, LegId, LegKinematics};
     use approx::assert_relative_eq;
+
+    /// Pure linear regime: `k_pulse = 0` ⇒ output = `k_linear · v_err`,
+    /// matching the pre-η-2 capture-point behaviour.
+    #[test]
+    fn capture_point_step_linear_when_pulse_disabled() {
+        let out = capture_point_step(0.4, 0.05, 0.0, 0.0);
+        assert_relative_eq!(out, 0.020, epsilon = 1e-12);
+        let neg = capture_point_step(-0.3, 0.05, 0.0, 0.0);
+        assert_relative_eq!(neg, -0.015, epsilon = 1e-12);
+    }
+
+    /// Inside the deadband the pulse branch contributes 0; the linear
+    /// term still runs. This is the noise-rejection property the η-2
+    /// experiment leans on (small frame / observer noise on `v_err_y`
+    /// must not accumulate into a foothold shift).
+    #[test]
+    fn capture_point_step_pulse_zero_inside_deadband() {
+        // |v_err| = 0.03 < v_db = 0.05 → pulse = 0.
+        let out = capture_point_step(0.03, 0.05, 0.20, 0.05);
+        let expect_linear_only = 0.05 * 0.03;
+        assert_relative_eq!(out, expect_linear_only, epsilon = 1e-12);
+    }
+
+    /// Past the deadband the pulse contributes `k_pulse ·
+    /// (|v_err| − v_db) · sign(v_err)` on top of the linear term.
+    /// 4 N lateral impulse → Δv ≈ 0.333 m/s on namiashi; with
+    /// (k_linear, k_pulse, v_db) = (0.05, 0.20, 0.05) the foothold
+    /// shift jumps from 1.67 cm (linear-only) to 7.33 cm.
+    #[test]
+    fn capture_point_step_pulse_past_deadband() {
+        let v_err = 0.333_f64;
+        let out = capture_point_step(v_err, 0.05, 0.20, 0.05);
+        let expect = 0.05 * v_err + 0.20 * (v_err - 0.05);
+        assert_relative_eq!(out, expect, epsilon = 1e-12);
+        assert!(out > 0.05 * v_err, "pulse must add to the linear baseline");
+    }
+
+    /// Sign is preserved across the deadband — a negative `v_err`
+    /// past the (positive) `v_db` produces a negative pulse, not a
+    /// positive one. Guards against sign confusion in the
+    /// `signum() · max(0, |v|−v_db)` form.
+    #[test]
+    fn capture_point_step_pulse_sign_preserved() {
+        let out_pos = capture_point_step(0.30, 0.05, 0.20, 0.10);
+        let out_neg = capture_point_step(-0.30, 0.05, 0.20, 0.10);
+        assert!(out_pos > 0.0);
+        assert!(out_neg < 0.0);
+        assert_relative_eq!(out_pos, -out_neg, epsilon = 1e-12);
+    }
 
     fn build_kin() -> KinematicsConfig {
         let leg = |id: LegId, hip: Vector3<f64>| {
