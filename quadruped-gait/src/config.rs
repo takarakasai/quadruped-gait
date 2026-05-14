@@ -173,6 +173,19 @@ pub struct GaitConfig {
     /// Maximum forward step length (m). Footstep planner clamps to this so
     /// the robot can't ask for a larger swing than its leg geometry allows.
     pub max_step_length_m: f64,
+    /// Fraction of each leg's **stance phase** that is treated as a
+    /// load / unload transition. Reads only by the FullCentroidal
+    /// controller's legged_control-parity path (C1 experiment): at
+    /// touchdown the leg's GRF reference ramps from 0 → full over the
+    /// first `transition_fraction · stance_duration`, and ramps back
+    /// down → 0 over the last `transition_fraction · stance_duration`.
+    /// The stance-no-slip constraint stays active throughout so the
+    /// foot is still pinned; this is a **soft (cost-side)** smoother
+    /// that helps the MPC plan a less impulsive loading trajectory.
+    ///
+    /// Default `0.0` ⇒ no ramping (legacy step behaviour). Reasonable
+    /// values are `0.05`–`0.15`.
+    pub transition_fraction: f64,
 }
 
 impl GaitConfig {
@@ -184,6 +197,7 @@ impl GaitConfig {
             duty_factor: 0.5,
             swing_height_m: 0.04,
             max_step_length_m: 0.10,
+            transition_fraction: 0.0,
         }
     }
 
@@ -203,6 +217,34 @@ impl GaitConfig {
         self.max_step_length_m = m.max(0.0);
         self
     }
+    pub fn with_transition_fraction(mut self, tf: f64) -> Self {
+        self.transition_fraction = tf.clamp(0.0, 0.5);
+        self
+    }
+}
+
+/// Compute the stance-leg GRF load weight at a given stance
+/// `sub_fraction ∈ [0, 1]` (0 = just touched down, 1 = about to lift
+/// off), given the `transition_fraction tw ∈ [0, 0.5]`.
+///
+/// Returns a weight in `[0, 1]`:
+/// - Ramp up linearly from `0` → `1` over `[0, tw]`
+/// - Hold at `1` over `[tw, 1 − tw]`
+/// - Ramp down linearly from `1` → `0` over `[1 − tw, 1]`
+///
+/// `tw = 0` collapses to the legacy "always 1.0 in stance" behaviour.
+/// `tw ≥ 0.5` clamps the hold region to a single point (peak at
+/// `sub = 0.5`, ramping up over the first half and down over the
+/// second half).
+pub fn stance_weight_at(sub_fraction: f64, transition_fraction: f64) -> f64 {
+    let s = sub_fraction.clamp(0.0, 1.0);
+    let tw = transition_fraction.clamp(0.0, 0.5);
+    if tw <= 0.0 {
+        return 1.0;
+    }
+    let up = (s / tw).min(1.0);
+    let down = ((1.0 - s) / tw).min(1.0);
+    up.min(down).max(0.0)
 }
 
 /// Per-leg geometric configuration. Determined by the user-provided foot
@@ -491,5 +533,56 @@ mod tests {
         assert!((kin.nominal_foot_body.x - 0.18).abs() < 1e-9);
         assert!((kin.nominal_foot_body.y - 0.09).abs() < 1e-9);
         assert!((kin.nominal_foot_body.z - (-0.36)).abs() < 1e-9);
+    }
+
+    /// `transition_fraction = 0` collapses the weight to a constant
+    /// `1.0` over the whole stance phase — backward-compat default.
+    #[test]
+    fn stance_weight_at_zero_transition_is_constant_one() {
+        for k in 0..=10 {
+            let s = k as f64 / 10.0;
+            assert!((stance_weight_at(s, 0.0) - 1.0).abs() < 1e-12);
+        }
+    }
+
+    /// `transition_fraction = 0.1`: weight ramps 0→1 over `[0, 0.1]`,
+    /// is exactly 1 over `[0.1, 0.9]`, and ramps 1→0 over `[0.9, 1]`.
+    /// The endpoints are exactly zero so the touchdown / lift-off
+    /// step gets a zero GRF reference.
+    #[test]
+    fn stance_weight_at_ramps_at_boundaries() {
+        // Touchdown edge.
+        assert!((stance_weight_at(0.0, 0.1)).abs() < 1e-12);
+        assert!((stance_weight_at(0.05, 0.1) - 0.5).abs() < 1e-12);
+        assert!((stance_weight_at(0.10, 0.1) - 1.0).abs() < 1e-12);
+        // Mid stance (well inside the hold band).
+        assert!((stance_weight_at(0.5, 0.1) - 1.0).abs() < 1e-12);
+        // Lift-off edge.
+        assert!((stance_weight_at(0.90, 0.1) - 1.0).abs() < 1e-12);
+        assert!((stance_weight_at(0.95, 0.1) - 0.5).abs() < 1e-12);
+        assert!((stance_weight_at(1.00, 0.1)).abs() < 1e-12);
+    }
+
+    /// `transition_fraction = 0.5` is the degenerate maximum: the
+    /// ramps meet at `sub = 0.5` and the hold region shrinks to a
+    /// single point. Peak weight is 1.0 at `sub = 0.5`.
+    #[test]
+    fn stance_weight_at_clamps_at_half() {
+        // tw = 0.6 is clamped down to 0.5 internally.
+        assert!((stance_weight_at(0.5, 0.6) - 1.0).abs() < 1e-12);
+        // Mirror symmetry across sub = 0.5.
+        let a = stance_weight_at(0.25, 0.6);
+        let b = stance_weight_at(0.75, 0.6);
+        assert!((a - b).abs() < 1e-12);
+        assert!((a - 0.5).abs() < 1e-12);
+    }
+
+    /// `sub_fraction` is clamped to `[0, 1]` — passing `1.5` or `-0.5`
+    /// returns the same weight as `1.0` / `0.0`. Guards against the
+    /// caller accidentally over-shooting the stance fraction.
+    #[test]
+    fn stance_weight_at_clamps_sub_fraction() {
+        assert!((stance_weight_at(-0.5, 0.1) - stance_weight_at(0.0, 0.1)).abs() < 1e-12);
+        assert!((stance_weight_at(1.5, 0.1) - stance_weight_at(1.0, 0.1)).abs() < 1e-12);
     }
 }

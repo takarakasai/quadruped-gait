@@ -525,6 +525,12 @@ impl FullCentroidalMpcGaitController {
             is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             swing_z_velocity: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         };
+        // Per-(leg, step) stance sub-fraction, kept alongside the
+        // schedule so the C1 GRF-reference ramp can look up "how far
+        // through stance is this leg at step k". Filled only when the
+        // leg is in stance (swing entries are unused).
+        let mut stance_sub_fractions: [Vec<f64>; N_FEET] =
+            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let cycle_phase_now = self.phase_gen.cycle_phase();
         let cycle_period = self.cfg.cycle_period_s.max(1e-6);
         let duty = self.cfg.duty_factor.clamp(1e-6, 1.0 - 1e-6);
@@ -540,7 +546,10 @@ impl FullCentroidalMpcGaitController {
         for leg in 0..N_FEET {
             for k in 0..n {
                 let (in_stance, sub_frac, in_swing) = if holding {
-                    (true, 0.0_f64, false)
+                    // Holding (zero cmd): every leg is in mid-stance,
+                    // so the C1 GRF ramp picks weight = 1.0 and the
+                    // legacy even-split math is preserved exactly.
+                    (true, 0.5_f64, false)
                 } else if self.legged_control_parity {
                     // Project the cycle phase forward by k·dt_per_step.
                     // The k=0 row keeps the observed stance flag — the
@@ -564,9 +573,12 @@ impl FullCentroidalMpcGaitController {
                         }
                     }
                 } else if k == 0 {
-                    (stance_now[leg], 0.0, false)
+                    // Legacy path has no per-step phase info; pretend
+                    // mid-stance so C1 weight is 1.0 (transition_fraction
+                    // is parity-only by construction).
+                    (stance_now[leg], 0.5, false)
                 } else {
-                    (self.cfg.duty_factor > 0.5, 0.0, false)
+                    (self.cfg.duty_factor > 0.5, 0.5, false)
                 };
                 contact.is_stance[leg].push(in_stance);
                 let v_z = if in_swing && self.legged_control_parity {
@@ -575,6 +587,10 @@ impl FullCentroidalMpcGaitController {
                     0.0
                 };
                 contact.swing_z_velocity[leg].push(v_z);
+                // C1: stash the stance sub-fraction so the GRF
+                // reference loop below can apply the transition ramp.
+                // Swing entries get 0.0 (unused).
+                stance_sub_fractions[leg].push(if in_stance { sub_frac } else { 0.0 });
             }
         }
 
@@ -620,18 +636,37 @@ impl FullCentroidalMpcGaitController {
             }
             ref_states.push(sk);
 
-            // Gravity-balanced GRF reference: total = m·g, split across
-            // legs in stance at this step. Swing legs get 0.
-            let n_stance = (0..N_FEET).filter(|&l| contact.is_stance[l][k]).count();
-            let f_per_stance = if n_stance > 0 {
-                cfg.mass_kg * 9.81 / n_stance as f64
+            // Gravity-balanced GRF reference: total = m·g, split
+            // across stance legs at this step.
+            //
+            // **C1 (transition_fraction > 0)**: each stance leg's share
+            // is weighted by `stance_weight_at(sub_frac, tw)` — newly
+            // touched-down legs and about-to-lift legs get a smaller
+            // share so the MPC's GRF *target* trajectory ramps in /
+            // out rather than stepping. This is a soft (cost-side)
+            // smoother; the stance no-slip equality still pins the
+            // foot regardless of weight. Backward-compat: when
+            // `transition_fraction == 0` the weight is always 1.0 so
+            // the math reduces to the legacy even split.
+            let tw = self.cfg.transition_fraction;
+            let mut leg_weights = [0.0_f64; N_FEET];
+            let mut total_weight = 0.0_f64;
+            for leg in 0..N_FEET {
+                if contact.is_stance[leg][k] {
+                    let w = crate::config::stance_weight_at(stance_sub_fractions[leg][k], tw);
+                    leg_weights[leg] = w;
+                    total_weight += w;
+                }
+            }
+            let f_per_unit = if total_weight > 1e-9 {
+                cfg.mass_kg * 9.81 / total_weight
             } else {
                 0.0
             };
             let mut grfs = [Vector3::zeros(); N_FEET];
             for leg in 0..N_FEET {
                 if contact.is_stance[leg][k] {
-                    grfs[leg].z = f_per_stance;
+                    grfs[leg].z = leg_weights[leg] * f_per_unit;
                 }
             }
             ref_inputs.push(FullCentroidalInput {
