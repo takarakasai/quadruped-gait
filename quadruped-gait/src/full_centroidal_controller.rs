@@ -132,6 +132,23 @@ pub struct FullCentroidalMpcGaitController {
     /// uses [`Self::cmd`] verbatim (= legged_control's
     /// `cmdVelToTargetTrajectories` path).
     goal_pose: Option<GoalPoseWorld>,
+
+    /// When `true`, [`Self::compute_mpc_footstep`] adds a body-frame
+    /// correction term derived from the **MPC's predicted base
+    /// position** at one swing-duration ahead. This makes foot
+    /// placement track the body trajectory the MPC actually plans
+    /// (which already accounts for disturbances via the MPC's GRF +
+    /// state-cost loop), rather than the open-loop cmd + linear
+    /// capture-point heuristic — the same architectural pattern that
+    /// legged_control's `SwingTrajectoryPlanner` uses against OCS2's
+    /// predicted base trajectory. The capture-point feedback term is
+    /// suppressed internally while this flag is on so the two paths
+    /// don't double-correct.
+    ///
+    /// Default `false` for backward compatibility. Requires a
+    /// previously-solved MPC solution to read; if `last_solution` is
+    /// `None` the flag silently falls back to the cap-pt path.
+    use_mpc_predicted_footstep: bool,
 }
 
 /// Absolute target pose in the world frame, with traverse-speed limits.
@@ -186,7 +203,21 @@ impl FullCentroidalMpcGaitController {
             legged_control_parity: false,
             parity_use_nominal_q_ref: false,
             goal_pose: None,
+            use_mpc_predicted_footstep: false,
         }
+    }
+
+    pub fn use_mpc_predicted_footstep(&self) -> bool {
+        self.use_mpc_predicted_footstep
+    }
+    /// Toggle the "MPC-predicted base → footstep target" path
+    /// described on the struct field. When the flag is enabled the
+    /// linear cap-pt feedback is dropped from `compute_mpc_footstep`
+    /// — both paths target the same disturbance correction and
+    /// stacking them double-counts the response. The horizon-bias
+    /// term is dropped for the same reason.
+    pub fn set_use_mpc_predicted_footstep(&mut self, enable: bool) {
+        self.use_mpc_predicted_footstep = enable;
     }
 
     pub fn legged_control_parity(&self) -> bool {
@@ -707,6 +738,59 @@ impl FullCentroidalMpcGaitController {
     /// Footstep planner — identical to the 12-state version. Duplicated
     /// (not delegated) so the two controllers can be evaluated head-to-
     /// head without state leak.
+    /// Body-frame correction term derived from the MPC's previously-
+    /// predicted base trajectory, used by `compute_mpc_footstep` when
+    /// `use_mpc_predicted_footstep` is on.
+    ///
+    /// Idea: at touchdown time `t = swing_duration`, the body will be
+    /// at `predicted_base_world(t)`. The cmd-only Raibert formula
+    /// already accounts for `cmd · t` of that motion via the
+    /// `v_hip · 0.5·stance_duration` term, so we add only the
+    /// **disturbance-driven residual** = `(predicted − current) −
+    /// cmd · t`. Rotate that residual into the body frame so it
+    /// stacks linearly with the rest of `half`.
+    ///
+    /// Returns zero when `last_solution` is missing (first tick / MPC
+    /// hasn't run yet) so the caller silently falls back to the
+    /// cap-pt path.
+    fn mpc_predicted_footstep_correction(&self) -> Vector3<f64> {
+        let sol = match self.last_solution.as_ref() {
+            Some(s) if s.solved => s,
+            _ => return Vector3::zeros(),
+        };
+        let mpc_cfg = self.full_centroidal_mpc.config();
+        let swing_duration = self.cfg.cycle_period_s * (1.0 - self.cfg.duty_factor);
+        let dt_per_step = mpc_cfg.dt_per_step.max(1e-6);
+        // Pick the horizon index closest to one swing duration ahead.
+        // Clamped to the available prediction window so a horizon
+        // shorter than one swing doesn't panic.
+        let k_swing = ((swing_duration / dt_per_step).round() as usize).max(1);
+        let k = k_swing.min(sol.predicted_states.len().saturating_sub(1));
+        let predicted_world = sol.predicted_states[k].base_pos_world;
+        let current_world = self.body_state.world_position;
+        let delta_world = predicted_world - current_world;
+
+        // Subtract the open-loop cmd motion the Raibert baseline
+        // already covers (`v_hip · 0.5·stance_duration` is the
+        // cmd-derived `half`). The cmd is in body frame; rotate to
+        // world frame at the current yaw.
+        let t_lookahead = (k + 1) as f64 * dt_per_step;
+        let cmd_world = body_to_world_horizontal(
+            Vector3::new(self.cmd.vx, self.cmd.vy, 0.0),
+            self.body_state.world_yaw,
+        );
+        let expected_world = cmd_world * t_lookahead;
+        let residual_world = Vector3::new(
+            delta_world.x - expected_world.x,
+            delta_world.y - expected_world.y,
+            0.0,
+        );
+
+        // World → body frame so the term composes with Raibert's
+        // body-frame `half`.
+        world_to_body_horizontal(residual_world, self.body_state.world_yaw)
+    }
+
     fn compute_mpc_footstep(
         &self,
         kin: &LegKinematics,
@@ -718,37 +802,50 @@ impl FullCentroidalMpcGaitController {
         let v_hip = v_body + omega.cross(&kin.hip_offset);
         let mut half = v_hip * (0.5 * stance_duration);
 
-        // Closed-loop foothold shift in the disturbance direction.
-        // Uses the linear `k_capture · v_err` + deadband-gated pulse
-        // branch from [`crate::mpc_controller::capture_point_step`]
-        // (η-2 experiment): the pulse lets the swing leg commit a
-        // larger lateral foothold for real pushes while keeping the
-        // small-v_err response gentle so cycle-noise on `v_err_y`
-        // can't accumulate into a cross-axis drift.
         let feedback_enabled = !self.cmd.is_zero();
-        let mut feedback = Vector3::zeros();
-        if feedback_enabled {
-            feedback.x = crate::mpc_controller::capture_point_step(
-                v_err_body.x,
-                self.k_capture,
-                self.k_capture_pulse,
-                self.v_capture_deadband,
-            );
-            feedback.y = crate::mpc_controller::capture_point_step(
-                v_err_body.y,
-                self.k_capture,
-                self.k_capture_pulse,
-                self.v_capture_deadband,
-            );
-        }
-        let horizon_weight = 1.0 / HORIZON_STEPS as f64;
-        let mut horizon_bias = Vector3::zeros();
-        if feedback_enabled {
-            horizon_bias.x = horizon_weight * feedback.x;
-            horizon_bias.y = horizon_weight * feedback.y;
-        }
 
-        let closed_loop = feedback + horizon_bias;
+        // legged_control-style path: drop cap-pt and instead derive
+        // the foothold correction from the MPC's predicted base
+        // displacement over one swing duration. The MPC has already
+        // planned how the GRF + state cost will pull the body back
+        // from a disturbance, so the predicted base at touchdown is
+        // "where the body will be after the MPC's own recovery
+        // response" — much more informative than `k · v_err` linear
+        // extrapolation from now. Mirrors OCS2 SwingTrajectoryPlanner.
+        let closed_loop = if self.use_mpc_predicted_footstep && feedback_enabled {
+            self.mpc_predicted_footstep_correction()
+        } else {
+            // Closed-loop foothold shift in the disturbance direction.
+            // Uses the linear `k_capture · v_err` + deadband-gated pulse
+            // branch from [`crate::mpc_controller::capture_point_step`]
+            // (η-2 experiment): the pulse lets the swing leg commit a
+            // larger lateral foothold for real pushes while keeping the
+            // small-v_err response gentle so cycle-noise on `v_err_y`
+            // can't accumulate into a cross-axis drift.
+            let mut feedback = Vector3::zeros();
+            if feedback_enabled {
+                feedback.x = crate::mpc_controller::capture_point_step(
+                    v_err_body.x,
+                    self.k_capture,
+                    self.k_capture_pulse,
+                    self.v_capture_deadband,
+                );
+                feedback.y = crate::mpc_controller::capture_point_step(
+                    v_err_body.y,
+                    self.k_capture,
+                    self.k_capture_pulse,
+                    self.v_capture_deadband,
+                );
+            }
+            let horizon_weight = 1.0 / HORIZON_STEPS as f64;
+            let mut horizon_bias = Vector3::zeros();
+            if feedback_enabled {
+                horizon_bias.x = horizon_weight * feedback.x;
+                horizon_bias.y = horizon_weight * feedback.y;
+            }
+            feedback + horizon_bias
+        };
+
         let raw_half = half + closed_loop;
         let mut combined = raw_half;
         let min_x = MIN_HALF_FRACTION * half.x;

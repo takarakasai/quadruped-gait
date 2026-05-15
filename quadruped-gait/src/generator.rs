@@ -365,6 +365,23 @@ impl AnyGaitController {
         }
     }
 
+    /// Toggle the FullCentroidal controller's "use MPC-predicted base
+    /// for footstep target" path (legged_control-style swing planner
+    /// against MPC's optimized body trajectory). No-op for other
+    /// modes — only FullCentroidal carries an MPC prediction the
+    /// footstep planner can read.
+    pub fn set_use_mpc_predicted_footstep(&mut self, enable: bool) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_use_mpc_predicted_footstep(enable);
+        }
+    }
+    pub fn use_mpc_predicted_footstep(&self) -> Option<bool> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.use_mpc_predicted_footstep()),
+            _ => None,
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).
