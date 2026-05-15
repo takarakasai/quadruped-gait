@@ -135,6 +135,9 @@ impl Default for SrbdMpcConfig {
             dt_per_step: 0.030,
             mass_kg: 9.0,
             inertia_diag_body: Vector3::new(0.07, 0.26, 0.242),
+            // Match the sim's ground geom friction (= 0.5, set
+            // explicitly in src/mjcf.rs to align with realistic
+            // rubber-on-lab-floor values).
             friction_mu: 0.5,
             max_normal_force: 200.0,
             // Cheetah-3 baseline (Di Carlo 2018 §V) with lateral /

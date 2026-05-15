@@ -221,7 +221,18 @@ pub struct FullCentroidalMpcConfig {
     pub centroidal_inertia_body: Matrix3<f64>,
     /// CoM position relative to base origin, in body frame (m).
     pub com_offset_body: Vector3<f64>,
-    /// Friction coefficient for the pyramid constraint.
+    /// Friction coefficient for the pyramid constraint. Default 0.5
+    /// matches both the explicit sim ground-geom friction set by
+    /// `src/mjcf.rs` and a realistic real-robot expectation for
+    /// rubber on a typical lab floor (linoleum / sealed concrete).
+    /// Keeping MPC and sim in sync avoids both directions of mismatch:
+    ///
+    /// - **MPC > sim friction**: MPC plans GRFs that the sim physics
+    ///   can't deliver → lateral slip → tracking error.
+    /// - **MPC < sim friction**: MPC is unnecessarily conservative,
+    ///   leaving lateral authority on the table → poor disturbance
+    ///   recovery (the failure mode at the 0.5/1.0 split before this
+    ///   was unified to 0.5 on both sides).
     pub friction_mu: f64,
     /// Max normal force per foot (N). 0 disables.
     pub max_normal_force: f64,

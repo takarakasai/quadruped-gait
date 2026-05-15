@@ -229,6 +229,7 @@ impl Default for CentroidalMpcConfig {
             mass_kg: 9.0,
             centroidal_inertia_body: Matrix3::from_diagonal(&Vector3::new(0.07, 0.26, 0.242)),
             com_offset_body: Vector3::zeros(),
+            // Match the sim's ground geom friction (= 0.5).
             friction_mu: 0.5,
             max_normal_force: 200.0,
             horizon_steps: 10,
