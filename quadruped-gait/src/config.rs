@@ -199,6 +199,62 @@ pub struct GaitConfig {
     /// Default `false` keeps the legacy global `max_normal_force` as
     /// the only upper bound — backward compatible.
     pub transition_enforce_constraint: bool,
+    /// **A3 — friction cone soft + slack** (FullCentroidal MPC).
+    ///
+    /// When `true`, the FullCentroidal controller flips
+    /// [`crate::full_centroidal_mpc::FullCentroidalMpcConfig::friction_cone_soft`]
+    /// for every MPC tick — the pyramid friction inequalities switch
+    /// to a slack-relaxed form (`|f_x| ≤ μ·f_z + s`, `s ≥ 0`) with a
+    /// quadratic cost on each slack. Useful when the GRF demand at
+    /// the pyramid corner regularly reaches √2 of the SOC cone
+    /// (lateral 4–6 N push regime on namiashi, per
+    /// `diag_friction_cone_utilization`), because the hard form
+    /// either over-tracks (clarabel returns AlmostSolved) or falls
+    /// back to the reference solution.
+    ///
+    /// Default `false` ⇒ legacy hard pyramid, unchanged behaviour.
+    pub friction_cone_soft: bool,
+    /// Quadratic penalty weight applied to each friction-cone slack.
+    /// See [`crate::full_centroidal_mpc::FullCentroidalMpcConfig::friction_cone_slack_penalty`].
+    /// Only used when [`Self::friction_cone_soft`] is `true`. Default
+    /// `1000.0` is the same as the MPC default — calibrated against
+    /// the default `r_diag[GRF] = 1e-3`.
+    pub friction_cone_slack_penalty: f64,
+    /// **B3 — MPC warm-start** (FullCentroidal MPC).
+    ///
+    /// When `true`, the FullCentroidal controller mirrors the flag
+    /// onto its MPC config so each solve seeds its SQP loop from the
+    /// previous tick's predicted trajectory (shifted by one step) as
+    /// the iter-0 reference. Reduces effective iterations needed for
+    /// convergence — see
+    /// [`crate::full_centroidal_mpc::FullCentroidalMpcConfig::warm_start`].
+    ///
+    /// Default `false` keeps the legacy cold-start path so existing
+    /// baselines stay bit-stable.
+    pub warm_start: bool,
+    /// **A1 — MPC-optimised footstep XY** (FullCentroidal MPC).
+    ///
+    /// When `true`, the FullCentroidal controller fills the per-leg
+    /// touchdown XY target on the MPC's contact schedule (from the
+    /// existing Raibert + cap-pt planner) and flips the MPC config's
+    /// `q_foot_xy_world` to [`Self::q_foot_xy_world`]. The MPC adds
+    /// a quadratic cost on the residual between its predicted foot
+    /// landing and the planner target, letting it deviate the swing-
+    /// leg joint trajectory to actively choose the footstep. This is
+    /// the structural fix the P2 / `use_mpc_predicted_footstep`
+    /// negative result identified as missing.
+    ///
+    /// Holding (cmd == 0) skips this block — there's no swing then.
+    /// Default `false` keeps the legacy open-loop footstep regime.
+    pub mpc_optimized_footstep: bool,
+    /// Weight on the foot-XY tracking cost when
+    /// [`Self::mpc_optimized_footstep`] is on. See
+    /// [`crate::full_centroidal_mpc::FullCentroidalMpcConfig::q_foot_xy_world`].
+    /// Default `500.0` — strong enough that a 1 cm landing error
+    /// costs as much as a 1 N²·s² GRF deviation (`r_diag[GRF] = 1e-3`,
+    /// so 1 N² ≡ 0.001; 0.01² · 500 = 0.05 ≫ 0.001) without
+    /// drowning out the body-tracking terms.
+    pub q_foot_xy_world: f64,
 }
 
 impl GaitConfig {
@@ -212,6 +268,11 @@ impl GaitConfig {
             max_step_length_m: 0.10,
             transition_fraction: 0.0,
             transition_enforce_constraint: false,
+            friction_cone_soft: false,
+            friction_cone_slack_penalty: 1000.0,
+            warm_start: false,
+            mpc_optimized_footstep: false,
+            q_foot_xy_world: 500.0,
         }
     }
 

@@ -345,9 +345,37 @@ impl FullCentroidalMpcGaitController {
     pub fn config(&self) -> &GaitConfig {
         &self.cfg
     }
+    /// Apply a new gait config. The MPC's per-tick flags that mirror
+    /// fields on `GaitConfig` (currently A3 friction-cone-soft +
+    /// slack penalty) are pushed into the live MPC config here so a
+    /// single `set_config` round-trip is enough to flip them — the
+    /// existing UI/Rhai/test paths already use this method as the
+    /// single entry point for config edits.
     pub fn set_config(&mut self, cfg: GaitConfig) {
         self.cfg = cfg.clone();
         self.phase_gen = PhaseGenerator::new(cfg);
+        let mut mpc_cfg = self.full_centroidal_mpc.config().clone();
+        mpc_cfg.friction_cone_soft = self.cfg.friction_cone_soft;
+        mpc_cfg.friction_cone_slack_penalty = self.cfg.friction_cone_slack_penalty;
+        let warm_start_was_on = mpc_cfg.warm_start;
+        mpc_cfg.warm_start = self.cfg.warm_start;
+        // A1: only push q_foot_xy_world to the MPC when the
+        // controller-side toggle is on. Off ⇒ keep MPC value at 0
+        // (no foot-XY cost) regardless of what `q_foot_xy_world`
+        // holds on the gait config (lets the GUI keep the slider
+        // value visible while disabled).
+        mpc_cfg.q_foot_xy_world = if self.cfg.mpc_optimized_footstep {
+            self.cfg.q_foot_xy_world
+        } else {
+            0.0
+        };
+        self.full_centroidal_mpc.set_config(mpc_cfg);
+        // When warm-start is freshly turned off, drop any stale cache
+        // so a later re-enable doesn't replay an old trajectory the
+        // operator didn't ask for.
+        if warm_start_was_on && !self.cfg.warm_start {
+            self.full_centroidal_mpc.clear_warm_start();
+        }
     }
 
     pub fn kinematics(&self) -> &KinematicsConfig {
@@ -556,6 +584,7 @@ impl FullCentroidalMpcGaitController {
             is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             swing_z_velocity: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             stance_f_max: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            foot_xy_target_world: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         };
         // Per-(leg, step) stance sub-fraction, kept alongside the
         // schedule so the C1 GRF-reference ramp can look up "how far
@@ -644,6 +673,80 @@ impl FullCentroidalMpcGaitController {
                     f64::INFINITY
                 };
                 contact.stance_f_max[leg].push(f_max_cell);
+                // A1: foot XY target — populated below per touchdown
+                // step when `mpc_optimized_footstep` is on. Push None
+                // here as the per-step default so the length asserts
+                // match `n`.
+                contact.foot_xy_target_world[leg].push(None);
+            }
+        }
+
+        // A1: when MPC-optimised footstep is enabled, fill the
+        // touchdown-step XY target for each leg from the existing
+        // footstep planner. The MPC's foot-XY soft cost then drives
+        // the swing-leg joint trajectory to land at that target,
+        // self-consistently considering the predicted base motion.
+        //
+        // Touchdown step = first step where this leg is in stance
+        // *and* the previous step was in swing (or it's step 0 and
+        // the leg is starting stance). Open-loop the planner already
+        // computes a body-frame `touch_down` per leg from the Raibert
+        // + cap-pt formula; we rotate that into the world frame at
+        // the predicted yaw (= ref_traj yaw at that step) and pass it
+        // as the cost target. Skipping when the cmd is zero (holding
+        // pose) since there's no swing then.
+        if self.cfg.mpc_optimized_footstep && !holding {
+            // Re-derive body-frame velocity error from the latest
+            // observed CoM velocity and the current cmd — same form
+            // as the in-tick computation in `tick`, but `tick`'s
+            // local has gone out of scope by the time the MPC build
+            // runs.
+            let v_obs_body_now = world_to_body_horizontal(
+                self.v_observed_world,
+                self.body_state.world_yaw,
+            );
+            let v_cmd_now = Vector3::new(self.cmd.vx, self.cmd.vy, 0.0);
+            let v_err_body = v_obs_body_now - v_cmd_now;
+            let v_cmd_world = body_to_world_horizontal(
+                Vector3::new(self.cmd.vx, self.cmd.vy, 0.0),
+                self.body_state.world_yaw,
+            );
+            for leg in 0..N_FEET {
+                let kin_leg = self.kin.leg(LegId::ALL[leg]);
+                // Find the first stance step preceded by swing (or
+                // step 0 starting stance). Returns `None` if the leg
+                // stays in one phase across the whole horizon.
+                let mut touchdown_k: Option<usize> = None;
+                let mut prev_stance: Option<bool> = None;
+                for k in 0..n {
+                    let s_k = contact.is_stance[leg][k];
+                    let is_touchdown = match prev_stance {
+                        Some(prev) => s_k && !prev,
+                        None => false, // first observed step is current — skip
+                    };
+                    if is_touchdown {
+                        touchdown_k = Some(k);
+                        break;
+                    }
+                    prev_stance = Some(s_k);
+                }
+                let Some(k_td) = touchdown_k else { continue; };
+
+                let footstep = self.compute_mpc_footstep(kin_leg, &v_err_body);
+                let touch_down_body = footstep.touch_down; // body frame
+                // Project base pose to the touchdown step using the
+                // open-loop cmd integration (same as the reference
+                // trajectory the MPC linearises around).
+                let t_td = (k_td + 1) as f64 * dt_per_step;
+                let yaw_td = self.body_state.world_yaw + self.cmd.wz * t_td;
+                let (s, c) = yaw_td.sin_cos();
+                let base_world_td = self.body_state.world_position + v_cmd_world * t_td;
+                let target_world_x =
+                    base_world_td.x + c * touch_down_body.x - s * touch_down_body.y;
+                let target_world_y =
+                    base_world_td.y + s * touch_down_body.x + c * touch_down_body.y;
+                contact.foot_xy_target_world[leg][k_td] =
+                    Some([target_world_x, target_world_y]);
             }
         }
 
