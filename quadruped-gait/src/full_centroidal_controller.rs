@@ -58,7 +58,7 @@ use crate::full_centroidal_mpc::{
     FullCentroidalMpcConfig, FullCentroidalMpcSolution, FullCentroidalReference,
     FullCentroidalState, N_FEET, N_LEG_JOINTS,
 };
-use crate::ik::{foot_jacobian_body, solve_leg_ik, LegIkSolution};
+use crate::ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolution};
 use crate::mpc_controller::{
     body_to_world_horizontal, effective_swing_height, make_leg_output,
     world_to_body_horizontal, DEFAULT_CAPTURE_POINT_GAIN_S, HORIZON_STEPS,
@@ -97,6 +97,22 @@ pub struct FullCentroidalMpcGaitController {
     last_solution: Option<FullCentroidalMpcSolution>,
     last_solution_compat: Option<MpcSolution>,
     mpc_solve_accumulator_s: f64,
+
+    /// **A1 lock-at-swing-entry**: per-leg cache of the body-frame
+    /// touch_down captured at the moment a swing phase begins. While
+    /// `mpc_optimized_footstep` is on, the per-tick swing IK target
+    /// reads this cache instead of recomputing from the latest MPC
+    /// prediction every 2 ms — otherwise mid-swing wobble (the MPC
+    /// solves on a 30 ms cadence and its predicted joint_q at
+    /// step k_td shifts each solve, while sub_fraction's tick-rate
+    /// advance also re-aims k_td) drives oscillation that the v3
+    /// bench showed amounts to a full body topple. Cleared at
+    /// touchdown so the next swing captures a fresh value.
+    swing_locked_touch_down_body: [Option<Vector3<f64>>; N_FEET],
+    /// **A1 lock state**: previous tick's `is_stance` per leg, used
+    /// only to detect the stance→swing transition that triggers
+    /// the [`Self::swing_locked_touch_down_body`] capture.
+    prev_leg_is_stance: [bool; N_FEET],
 
     /// When `true`, the MPC's contact schedule is built from a per-leg
     /// per-step phase projection (matching legged_control's
@@ -200,6 +216,8 @@ impl FullCentroidalMpcGaitController {
             last_solution: None,
             last_solution_compat: None,
             mpc_solve_accumulator_s: f64::INFINITY,
+            swing_locked_touch_down_body: [None; N_FEET],
+            prev_leg_is_stance: [true; N_FEET],
             legged_control_parity: false,
             parity_use_nominal_q_ref: false,
             goal_pose: None,
@@ -452,6 +470,8 @@ impl FullCentroidalMpcGaitController {
         self.last_solution = None;
         self.last_solution_compat = None;
         self.mpc_solve_accumulator_s = f64::INFINITY;
+        self.swing_locked_touch_down_body = [None; N_FEET];
+        self.prev_leg_is_stance = [true; N_FEET];
     }
 
     pub fn tick(&mut self, dt: f64) -> ControllerOutput {
@@ -477,10 +497,46 @@ impl FullCentroidalMpcGaitController {
         let v_err_body = v_obs_body - v_cmd;
 
         let phases = self.phase_gen.legs();
+        let swing_duration = self.cfg.cycle_period_s * (1.0 - self.cfg.duty_factor);
         let mut legs: [Option<LegOutput>; 4] = [None, None, None, None];
         for ps in phases.iter() {
             let kin_leg = self.kin.leg(ps.leg);
-            let footstep = self.compute_mpc_footstep(kin_leg, &v_err_body);
+            let mut footstep = self.compute_mpc_footstep(kin_leg, &v_err_body);
+            // **A1 closed-loop foothold (lock-at-swing-entry)**.
+            // When the MPC-optimised footstep mode is on, capture the
+            // MPC's predicted foot position **once** at the stance →
+            // swing transition and reuse it for the whole swing. The
+            // v3 bench showed that recomputing per-tick (the MPC
+            // solves every 30 ms while sub_fraction advances every 2
+            // ms) produces a moving target that the swing curve
+            // chases until the body tips. Locking at swing entry
+            // removes the wobble entirely: the foot aims at a fixed
+            // point inside the body frame chosen with the freshest
+            // possible MPC prediction, and the stance no-slip pin
+            // (which uses cmd-extrap, separate axis) keeps the body
+            // honest during stance.
+            let slot = crate::controller::slot_of(ps.leg);
+            if self.cfg.mpc_optimized_footstep && !ps.is_stance {
+                if self.prev_leg_is_stance[slot] {
+                    // Transition stance → swing: latch a fresh
+                    // prediction. sub_fraction ≈ 0 at this instant,
+                    // so the helper picks `k_td ≈ swing_duration /
+                    // dt_per_step` — the touchdown step in the
+                    // current MPC plan.
+                    self.swing_locked_touch_down_body[slot] = self
+                        .mpc_predicted_swing_target_body(
+                            ps.leg, 0.0, swing_duration,
+                        );
+                }
+                if let Some(td_body) = self.swing_locked_touch_down_body[slot] {
+                    footstep.touch_down = td_body;
+                }
+            } else if ps.is_stance {
+                // Clear the lock once the leg is back on the ground —
+                // the next swing entry will capture a fresh value.
+                self.swing_locked_touch_down_body[slot] = None;
+            }
+            self.prev_leg_is_stance[slot] = ps.is_stance;
             let target = if ps.is_stance {
                 footstep.stance_at(ps.sub_fraction)
             } else {
@@ -584,7 +640,7 @@ impl FullCentroidalMpcGaitController {
             is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             swing_z_velocity: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             stance_f_max: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            foot_xy_target_world: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            foot_xy_target_body_offset: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         };
         // Per-(leg, step) stance sub-fraction, kept alongside the
         // schedule so the C1 GRF-reference ramp can look up "how far
@@ -677,7 +733,7 @@ impl FullCentroidalMpcGaitController {
                 // step when `mpc_optimized_footstep` is on. Push None
                 // here as the per-step default so the length asserts
                 // match `n`.
-                contact.foot_xy_target_world[leg].push(None);
+                contact.foot_xy_target_body_offset[leg].push(None);
             }
         }
 
@@ -696,33 +752,24 @@ impl FullCentroidalMpcGaitController {
         // as the cost target. Skipping when the cmd is zero (holding
         // pose) since there's no swing then.
         if self.cfg.mpc_optimized_footstep && !holding {
-            // Re-derive body-frame velocity error from the latest
-            // observed CoM velocity and the current cmd — same form
-            // as the in-tick computation in `tick`, but `tick`'s
-            // local has gone out of scope by the time the MPC build
-            // runs.
+            // Body-frame velocity error from the latest observed CoM
+            // velocity and the current cmd.
             let v_obs_body_now = world_to_body_horizontal(
                 self.v_observed_world,
                 self.body_state.world_yaw,
             );
             let v_cmd_now = Vector3::new(self.cmd.vx, self.cmd.vy, 0.0);
             let v_err_body = v_obs_body_now - v_cmd_now;
-            let v_cmd_world = body_to_world_horizontal(
-                Vector3::new(self.cmd.vx, self.cmd.vy, 0.0),
-                self.body_state.world_yaw,
-            );
             for leg in 0..N_FEET {
                 let kin_leg = self.kin.leg(LegId::ALL[leg]);
-                // Find the first stance step preceded by swing (or
-                // step 0 starting stance). Returns `None` if the leg
-                // stays in one phase across the whole horizon.
+                // Find the first stance step preceded by swing.
                 let mut touchdown_k: Option<usize> = None;
                 let mut prev_stance: Option<bool> = None;
                 for k in 0..n {
                     let s_k = contact.is_stance[leg][k];
                     let is_touchdown = match prev_stance {
                         Some(prev) => s_k && !prev,
-                        None => false, // first observed step is current — skip
+                        None => false,
                     };
                     if is_touchdown {
                         touchdown_k = Some(k);
@@ -732,21 +779,18 @@ impl FullCentroidalMpcGaitController {
                 }
                 let Some(k_td) = touchdown_k else { continue; };
 
+                // Pass the **body-frame** foot offset (Raibert + cap-pt)
+                // to the MPC. The MPC will combine it with its iterated
+                // `ref_traj.states[k_td].base_pos_world` each SQP step
+                // to form the world target, so when the predicted base
+                // drifts from the open-loop cmd extrapolation under
+                // disturbance the foothold target follows along
+                // automatically.
                 let footstep = self.compute_mpc_footstep(kin_leg, &v_err_body);
-                let touch_down_body = footstep.touch_down; // body frame
-                // Project base pose to the touchdown step using the
-                // open-loop cmd integration (same as the reference
-                // trajectory the MPC linearises around).
-                let t_td = (k_td + 1) as f64 * dt_per_step;
-                let yaw_td = self.body_state.world_yaw + self.cmd.wz * t_td;
-                let (s, c) = yaw_td.sin_cos();
-                let base_world_td = self.body_state.world_position + v_cmd_world * t_td;
-                let target_world_x =
-                    base_world_td.x + c * touch_down_body.x - s * touch_down_body.y;
-                let target_world_y =
-                    base_world_td.y + s * touch_down_body.x + c * touch_down_body.y;
-                contact.foot_xy_target_world[leg][k_td] =
-                    Some([target_world_x, target_world_y]);
+                let touch_down_body = footstep.touch_down;
+                contact.foot_xy_target_body_offset[leg][k_td] =
+                    Some([touch_down_body.x, touch_down_body.y]);
+                let _ = dt_per_step; // kept for symmetry with neighbouring blocks
             }
         }
 
@@ -856,6 +900,46 @@ impl FullCentroidalMpcGaitController {
     /// Returns zero when `last_solution` is missing (first tick / MPC
     /// hasn't run yet) so the caller silently falls back to the
     /// cap-pt path.
+    /// **A1**: body-frame foot position the MPC predicts for `leg` at
+    /// its next touchdown step, derived from
+    /// `last_solution.predicted_states[k_td].leg_joint_q` via the
+    /// per-leg FK. Returns `None` when A1 is off, no solved solution
+    /// is cached yet, or the touchdown step falls outside the
+    /// horizon. The result is in the **predicted body frame** at
+    /// `k_td`; using it as the swing curve's `touch_down` slot is the
+    /// closed-loop completion of A1 — the IK swing target picks up
+    /// the MPC's joint plan instead of the open-loop Raibert target.
+    fn mpc_predicted_swing_target_body(
+        &self,
+        leg: LegId,
+        sub_fraction: f64,
+        swing_duration: f64,
+    ) -> Option<Vector3<f64>> {
+        let sol = self.last_solution.as_ref()?;
+        if !sol.solved {
+            return None;
+        }
+        let dt_per_step = self.full_centroidal_mpc.config().dt_per_step.max(1e-6);
+        // Time remaining until this leg touches down (sub_fraction
+        // walks 0 → 1 over one swing), rounded to the nearest MPC
+        // step and clamped to the available prediction horizon.
+        let time_to_td = (1.0 - sub_fraction.clamp(0.0, 1.0)) * swing_duration;
+        let k_td_raw = (time_to_td / dt_per_step).round() as usize;
+        let k_td = k_td_raw.min(sol.predicted_states.len().saturating_sub(1));
+        let slot = crate::controller::slot_of(leg);
+        let [hip, thigh, calf] = sol.predicted_states[k_td].leg_joint_q(slot);
+        let kin = self.kin.leg(leg);
+        let foot_body = forward_leg_kinematics(kin, hip, thigh, calf);
+        // Sanity: if the predicted foot has drifted into a
+        // non-physical position (z above the base, gross workspace
+        // violation), fall through to the open-loop footstep — the
+        // MPC's predicted joint_q can be noisy under cold-start.
+        if foot_body.z > -0.05 || !foot_body.x.is_finite() || !foot_body.y.is_finite() {
+            return None;
+        }
+        Some(foot_body)
+    }
+
     fn mpc_predicted_footstep_correction(&self) -> Vector3<f64> {
         let sol = match self.last_solution.as_ref() {
             Some(s) if s.solved => s,

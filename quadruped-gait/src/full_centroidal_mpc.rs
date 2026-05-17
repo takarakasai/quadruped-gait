@@ -324,7 +324,7 @@ pub struct FullCentroidalMpcConfig {
     /// Quadratic cost weight on the world-frame XY residual between
     /// the MPC's predicted foot position and a planner-supplied
     /// target. The cost is added at each (leg, k) where
-    /// [`FullCentroidalContactSchedule::foot_xy_target_world`] is
+    /// [`FullCentroidalContactSchedule::foot_xy_target_body_offset`] is
     /// `Some([x, y])`. When zero (default), no cost is added and the
     /// MPC reverts to the legacy "footstep is an open-loop input"
     /// regime where joint_q reference is held constant and the
@@ -343,7 +343,7 @@ pub struct FullCentroidalMpcConfig {
     /// Reasonable range: `50.0` (gentle pull) to `5_000.0` (strong
     /// tracking, may overshoot if the planner target is jumpy).
     /// Default `0.0` ⇒ disabled, preserving backward compatibility
-    /// for callers that don't populate `foot_xy_target_world`.
+    /// for callers that don't populate `foot_xy_target_body_offset`.
     pub q_foot_xy_world: f64,
 }
 
@@ -706,17 +706,24 @@ pub struct FullCentroidalContactSchedule {
     pub is_stance: [Vec<bool>; N_FEET],
     pub swing_z_velocity: [Vec<f64>; N_FEET],
     pub stance_f_max: [Vec<f64>; N_FEET],
-    /// **A1**: per-(leg, step) world-frame XY foothold target. When
-    /// `Some([x, y])`, the MPC adds a soft quadratic cost
-    /// `q_foot_xy_world · ‖foot_xy_world(leg, k) − [x, y]‖²` to the
-    /// objective, encouraging the optimiser to deviate the swing-leg
-    /// joint trajectory so the foot lands at the planned location.
+    /// **A1**: per-(leg, step) **body-frame** XY foothold target,
+    /// expressed as the desired foot position relative to the body's
+    /// own origin at step k. When `Some([x, y])`, the MPC adds a soft
+    /// quadratic cost `q_foot_xy_world · ‖foot_xy_world(leg, k) −
+    /// target_world(k)‖²` to the objective, where
+    /// `target_world(k) = ref_traj.states[k].base_pos_xy +
+    /// R_z(ref_yaw[k]) · [x, y]`. Computing the world target
+    /// **inside** the MPC from `ref_traj` (which the SQP loop iterates)
+    /// makes the foothold self-consistent with the MPC's own
+    /// predicted base motion — the disturbance-aware closed-loop
+    /// behaviour legged_control achieves via CppAd on the trajectory.
+    ///
     /// `None` ⇒ no cost added at that (leg, k). Typical caller
     /// pattern: set `Some` only at the touchdown step (first stance
     /// step of the next stance phase per leg) and leave every other
     /// step `None`; the stance no-slip equality then pins the foot
     /// at the achieved touchdown for the rest of the stance.
-    pub foot_xy_target_world: [Vec<Option<[f64; 2]>>; N_FEET],
+    pub foot_xy_target_body_offset: [Vec<Option<[f64; 2]>>; N_FEET],
 }
 
 impl FullCentroidalContactSchedule {
@@ -740,7 +747,7 @@ impl FullCentroidalContactSchedule {
                 vec![f64::INFINITY; horizon_steps],
                 vec![f64::INFINITY; horizon_steps],
             ],
-            foot_xy_target_world: [
+            foot_xy_target_body_offset: [
                 vec![None; horizon_steps],
                 vec![None; horizon_steps],
                 vec![None; horizon_steps],
@@ -862,7 +869,7 @@ impl FullCentroidalMpc {
             assert_eq!(contact.is_stance[leg].len(), n);
             assert_eq!(contact.swing_z_velocity[leg].len(), n);
             assert_eq!(contact.stance_f_max[leg].len(), n);
-            assert_eq!(contact.foot_xy_target_world[leg].len(), n);
+            assert_eq!(contact.foot_xy_target_body_offset[leg].len(), n);
         }
 
         let n_iter = self.cfg.sqp_iterations.max(1);
@@ -1160,7 +1167,7 @@ fn add_foot_xy_soft_cost(
 
     for k in 0..n {
         for leg in 0..N_FEET {
-            let Some(target_xy) = contact.foot_xy_target_world[leg][k] else {
+            let Some(target_body_offset) = contact.foot_xy_target_body_offset[leg][k] else {
                 continue;
             };
             let psi_ref = ref_traj.states[k].base_euler_zyx.z;
@@ -1174,6 +1181,17 @@ fn add_foot_xy_soft_cost(
             let q_ref_leg = Vector3::new(qhip, qthigh, qcalf);
             let foot_world_ref = r_z * foot_body_ref;
             let j_times_qref = r_z_j * q_ref_leg;
+            // Compute the world-frame target from the body-frame offset
+            // **at the linearisation point** — `ref_traj.states[k]`
+            // gives the base_pos / yaw the SQP is currently linearising
+            // around, so iter 0 uses the caller's reference (open-loop
+            // cmd extrapolation) and iter ≥1 uses the previous iter's
+            // predicted base (closed-loop self-consistent foothold).
+            let target_world_x = ref_traj.states[k].base_pos_world.x
+                + c * target_body_offset[0] - s * target_body_offset[1];
+            let target_world_y = ref_traj.states[k].base_pos_world.y
+                + s * target_body_offset[0] + c * target_body_offset[1];
+            let target_xy = [target_world_x, target_world_y];
 
             for ax in 0..2 {
                 // Build the selector vector e_xy that maps a per-step
@@ -2634,7 +2652,7 @@ mod tests {
         // Plus base_pos.z = 0.30 ⇒ foot z = 0.0, xy = (0.25, -0.25).
         let nominal_world_xy = [0.25_f64, -0.25_f64];
         let target_offset_x = 0.05_f64;
-        contact.foot_xy_target_world[1][n - 1] =
+        contact.foot_xy_target_body_offset[1][n - 1] =
             Some([nominal_world_xy[0] + target_offset_x, nominal_world_xy[1]]);
 
         let mut mpc = FullCentroidalMpc::new(cfg.clone());
