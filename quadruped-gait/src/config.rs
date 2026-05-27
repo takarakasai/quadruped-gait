@@ -84,20 +84,28 @@ impl VelocityCmd {
 pub enum GaitType {
     /// Diagonal pairs in phase: FL+RR ↔ FR+RL. Stable, agile, common.
     Trot,
-    /// All four legs phased ¼ cycle apart. Slowest, most statically stable.
+    /// All four legs phased ¼ cycle apart. Slow, statically stable.
     Walk,
     /// Lateral pairs in phase: FL+RL ↔ FR+RR. Camel-style.
     Pace,
     /// Front pair + rear pair anti-phase. Bunny hop.
     Bound,
+    /// **Static crawl.** Same diagonal-sequence offsets as [`Self::Walk`]
+    /// (lift order RL → FR → RR → FL) but with a higher default duty
+    /// factor (`0.85`) so swings never overlap and the support polygon
+    /// always covers three feet. Pair with a long [`GaitConfig::cycle_period_s`]
+    /// and a small [`GaitConfig::swing_height_m`] — the trunk barely
+    /// rolls/pitches and moves forward smoothly. Slowest of the family.
+    Crawl,
 }
 
 impl GaitType {
-    pub const ALL: [GaitType; 4] = [
+    pub const ALL: [GaitType; 5] = [
         GaitType::Trot,
         GaitType::Walk,
         GaitType::Pace,
         GaitType::Bound,
+        GaitType::Crawl,
     ];
 
     pub fn label(self) -> &'static str {
@@ -106,6 +114,7 @@ impl GaitType {
             GaitType::Walk => "Walk",
             GaitType::Pace => "Pace",
             GaitType::Bound => "Bound",
+            GaitType::Crawl => "Crawl",
         }
     }
 
@@ -139,17 +148,25 @@ impl GaitType {
                 (LegId::RL, 0.5),
                 (LegId::RR, 0.5),
             ],
+            // Crawl shares Walk's diagonal-sequence offsets — see GaitType::Crawl.
+            GaitType::Crawl => [
+                (LegId::FL, 0.0),
+                (LegId::RR, 0.25),
+                (LegId::FR, 0.5),
+                (LegId::RL, 0.75),
+            ],
         }
     }
 
     /// Default duty factor (fraction of cycle each foot spends in stance).
-    /// 0.5 = symmetric (trot/pace/bound); higher = more stable (walk).
+    /// 0.5 = symmetric (trot/pace/bound); higher = more stable (walk/crawl).
     pub fn default_duty_factor(self) -> f64 {
         match self {
             GaitType::Trot => 0.5,
             GaitType::Walk => 0.75,
             GaitType::Pace => 0.5,
             GaitType::Bound => 0.5,
+            GaitType::Crawl => 0.85,
         }
     }
 }
@@ -255,6 +272,21 @@ pub struct GaitConfig {
     /// so 1 N² ≡ 0.001; 0.01² · 500 = 0.05 ≫ 0.001) without
     /// drowning out the body-tracking terms.
     pub q_foot_xy_world: f64,
+    /// **LinearCrawl-only**: fraction of each per-leg sub-cycle
+    /// (`T/4`) held in 4-support before that leg lifts. Range `(0, 1)`;
+    /// `0.5` is the default. Only [`crate::linear_crawl::LinearCrawlController`]
+    /// reads this field — the body-velocity-tracking controllers
+    /// (CHAMP / MPC / Centroidal / FullCentroidal) derive their support
+    /// schedule from `gait_type.phase_offsets()` + `duty_factor` and
+    /// ignore this knob, so changing it has no effect outside
+    /// [`crate::GaitMode::LinearCrawl`].
+    #[cfg_attr(feature = "serde", serde(default = "default_four_support_fraction"))]
+    pub four_support_fraction: f64,
+}
+
+#[cfg(feature = "serde")]
+fn default_four_support_fraction() -> f64 {
+    0.5
 }
 
 impl GaitConfig {
@@ -273,6 +305,120 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            four_support_fraction: 0.5,
+        }
+    }
+
+    /// 4-beat Walk preset. Same diagonal-sequence offsets as [`Self::crawl`]
+    /// but a shorter cycle and a slightly lower duty (`0.75`) so the
+    /// support polygon flips through three-leg / four-leg phases instead
+    /// of always sitting on three. Reasonable speed/stability trade-off
+    /// for a small quadruped.
+    pub fn walk() -> Self {
+        Self {
+            gait_type: GaitType::Walk,
+            cycle_period_s: 0.6,
+            duty_factor: 0.75,
+            swing_height_m: 0.035,
+            max_step_length_m: 0.08,
+            transition_fraction: 0.0,
+            transition_enforce_constraint: false,
+            friction_cone_soft: false,
+            friction_cone_slack_penalty: 1000.0,
+            warm_start: false,
+            mpc_optimized_footstep: false,
+            q_foot_xy_world: 500.0,
+            four_support_fraction: 0.5,
+        }
+    }
+
+    /// Pace preset. Lateral pairs in phase (`FL+RL ↔ FR+RR`) — camel-
+    /// style. Same timing/sizing as [`Self::trot`]; only the leg phasing
+    /// differs. Tends to roll the trunk more than trot since both
+    /// supporting legs are on the same side at a time.
+    pub fn pace() -> Self {
+        Self {
+            gait_type: GaitType::Pace,
+            cycle_period_s: 0.4,
+            duty_factor: 0.5,
+            swing_height_m: 0.04,
+            max_step_length_m: 0.10,
+            transition_fraction: 0.0,
+            transition_enforce_constraint: false,
+            friction_cone_soft: false,
+            friction_cone_slack_penalty: 1000.0,
+            warm_start: false,
+            mpc_optimized_footstep: false,
+            q_foot_xy_world: 500.0,
+            four_support_fraction: 0.5,
+        }
+    }
+
+    /// Bound preset. Front pair vs rear pair anti-phase ("bunny hop").
+    /// Shorter cycle, taller swing, larger stride than trot — fastest
+    /// of the family. Not statically stable; relies on body inertia.
+    pub fn bound() -> Self {
+        Self {
+            gait_type: GaitType::Bound,
+            cycle_period_s: 0.3,
+            duty_factor: 0.5,
+            swing_height_m: 0.05,
+            max_step_length_m: 0.12,
+            transition_fraction: 0.0,
+            transition_enforce_constraint: false,
+            friction_cone_soft: false,
+            friction_cone_slack_penalty: 1000.0,
+            warm_start: false,
+            mpc_optimized_footstep: false,
+            q_foot_xy_world: 500.0,
+            four_support_fraction: 0.5,
+        }
+    }
+
+    /// Dispatch by gait family — returns the canonical preset for `ty`.
+    /// Use in GUIs / scripting where the user picks a [`GaitType`] and
+    /// wants all the family-typical timing/sizing defaults at once
+    /// rather than just the phase offsets.
+    pub fn for_type(ty: GaitType) -> Self {
+        match ty {
+            GaitType::Trot => Self::trot(),
+            GaitType::Walk => Self::walk(),
+            GaitType::Pace => Self::pace(),
+            GaitType::Bound => Self::bound(),
+            GaitType::Crawl => Self::crawl(),
+        }
+    }
+
+    /// Static crawl preset. Diagonal-sequence 4-beat with `duty=0.85`
+    /// so swings never overlap (3 feet always on the ground), a long
+    /// cycle so the body translates slowly, and a low swing height so
+    /// the trunk barely pitches/rolls as each foot lifts. Use when you
+    /// want the robot to walk straight forward with minimal sway —
+    /// classical "creeping" gait.
+    pub fn crawl() -> Self {
+        Self {
+            gait_type: GaitType::Crawl,
+            // LinearCrawl-tuned defaults (validated on Go2 with vx=0.05
+            // m/s, see `examples/go2_linear_crawl_sweep.rs`):
+            //   T = 1.667 s, α = 0.85
+            //     ⇒ t3 = 0.0625 s (3-leg support / swing),
+            //       t4 = 0.3542 s (4-leg support)
+            //   swing_h = 0.005 m ⇒ low trunk pitch/roll from leg lift
+            // This combination gave the lowest |yaw|max and highest
+            // forward grip in the sweep. Pair with actuator Kp ≈ 1000
+            // for tightest body-velocity tracking.
+            cycle_period_s: 1.667,
+            duty_factor: 0.85,
+            swing_height_m: 0.005,
+            max_step_length_m: 0.06,
+            transition_fraction: 0.0,
+            transition_enforce_constraint: false,
+            friction_cone_soft: false,
+            friction_cone_slack_penalty: 1000.0,
+            warm_start: false,
+            mpc_optimized_footstep: false,
+            q_foot_xy_world: 500.0,
+            four_support_fraction: 0.85,
         }
     }
 
@@ -298,6 +444,12 @@ impl GaitConfig {
     }
     pub fn with_transition_enforce_constraint(mut self, enable: bool) -> Self {
         self.transition_enforce_constraint = enable;
+        self
+    }
+    /// LinearCrawl-only knob — see [`Self::four_support_fraction`].
+    /// Clamped to `[0.05, 0.95]`.
+    pub fn with_four_support_fraction(mut self, f: f64) -> Self {
+        self.four_support_fraction = f.clamp(0.05, 0.95);
         self
     }
 }
@@ -663,5 +815,110 @@ mod tests {
     fn stance_weight_at_clamps_sub_fraction() {
         assert!((stance_weight_at(-0.5, 0.1) - stance_weight_at(0.0, 0.1)).abs() < 1e-12);
         assert!((stance_weight_at(1.5, 0.1) - stance_weight_at(1.0, 0.1)).abs() < 1e-12);
+    }
+
+    /// Crawl shares Walk's diagonal-sequence offsets but with a higher
+    /// default duty factor — pin the contract so a future refactor
+    /// can't silently change the lift order or the stability margin.
+    #[test]
+    fn crawl_phase_offsets_match_walk() {
+        let crawl = GaitType::Crawl.phase_offsets();
+        let walk = GaitType::Walk.phase_offsets();
+        let mut c = std::collections::HashMap::new();
+        let mut w = std::collections::HashMap::new();
+        for (leg, off) in crawl {
+            c.insert(leg, off);
+        }
+        for (leg, off) in walk {
+            w.insert(leg, off);
+        }
+        for leg in [LegId::FL, LegId::FR, LegId::RL, LegId::RR] {
+            assert_eq!(c[&leg], w[&leg], "crawl phase for {:?} != walk", leg);
+        }
+    }
+
+    #[test]
+    fn crawl_default_duty_is_static_stable() {
+        // duty ≥ 0.75 + (small margin) ⇒ at most one foot in swing at a
+        // time (three legs always supporting the body).
+        let duty = GaitType::Crawl.default_duty_factor();
+        assert!(duty > 0.75, "crawl duty {duty} would allow overlapping swings");
+        assert!(duty < 1.0, "duty must leave some swing window");
+    }
+
+    /// `GaitConfig::crawl()` packages the preset the way the host app
+    /// expects: smooth/slow body motion with low swing height.
+    #[test]
+    fn crawl_preset_is_slow_and_low() {
+        let c = GaitConfig::crawl();
+        assert_eq!(c.gait_type, GaitType::Crawl);
+        assert!(c.cycle_period_s > GaitConfig::trot().cycle_period_s);
+        assert!(c.duty_factor > 0.75);
+        assert!(c.swing_height_m < GaitConfig::trot().swing_height_m);
+        assert!(c.max_step_length_m < GaitConfig::trot().max_step_length_m);
+    }
+
+    /// `GaitConfig::for_type(t)` matches the direct preset constructor —
+    /// pin this contract so consumers can route a `GaitType` selection
+    /// through the dispatcher without subtle drift from the per-family
+    /// builder.
+    #[test]
+    fn for_type_dispatches_to_each_preset() {
+        for ty in GaitType::ALL {
+            let cfg = GaitConfig::for_type(ty);
+            assert_eq!(cfg.gait_type, ty);
+            assert_eq!(cfg.duty_factor, ty.default_duty_factor());
+        }
+    }
+
+    /// Each preset's `gait_type` matches the constructor name — guards
+    /// against accidental copy/paste between `walk()` / `pace()` /
+    /// `bound()` / `crawl()` (they share a lot of boilerplate).
+    #[test]
+    fn each_preset_carries_its_own_type() {
+        assert_eq!(GaitConfig::trot().gait_type, GaitType::Trot);
+        assert_eq!(GaitConfig::walk().gait_type, GaitType::Walk);
+        assert_eq!(GaitConfig::pace().gait_type, GaitType::Pace);
+        assert_eq!(GaitConfig::bound().gait_type, GaitType::Bound);
+        assert_eq!(GaitConfig::crawl().gait_type, GaitType::Crawl);
+    }
+
+    /// Sanity bands so a future tweak doesn't silently swap Bound's
+    /// "fast and bouncy" character for Walk's "slow and stable" one.
+    #[test]
+    fn preset_family_characters() {
+        let crawl = GaitConfig::crawl();
+        let walk = GaitConfig::walk();
+        let trot = GaitConfig::trot();
+        let bound = GaitConfig::bound();
+
+        // Cycle ordering: bound < trot ≤ walk < crawl.
+        assert!(bound.cycle_period_s < trot.cycle_period_s);
+        assert!(trot.cycle_period_s <= walk.cycle_period_s);
+        assert!(walk.cycle_period_s < crawl.cycle_period_s);
+
+        // Duty ordering: bound = trot < walk < crawl.
+        assert!(bound.duty_factor < walk.duty_factor);
+        assert!(walk.duty_factor < crawl.duty_factor);
+
+        // Bound is the highest-swing & longest-stride preset.
+        assert!(bound.swing_height_m > trot.swing_height_m);
+        assert!(bound.max_step_length_m > trot.max_step_length_m);
+
+        // Crawl is the lowest-swing & shortest-stride preset.
+        assert!(crawl.swing_height_m < trot.swing_height_m);
+        assert!(crawl.max_step_length_m < trot.max_step_length_m);
+    }
+
+    /// Walk-and-Crawl share offsets but every leg has a *distinct* phase
+    /// — that's what makes them 4-beat. (Trot/Pace/Bound are 2-beat.)
+    #[test]
+    fn crawl_is_four_beat() {
+        let offsets = GaitType::Crawl.phase_offsets();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for (_leg, off) in offsets {
+            seen.insert((off * 1000.0) as i64);
+        }
+        assert_eq!(seen.len(), 4, "crawl must use four distinct phase offsets");
     }
 }

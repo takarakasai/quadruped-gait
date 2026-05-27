@@ -149,6 +149,15 @@ pub enum GaitMode {
     /// and forward-dy cross-coupling that empirical tuning + 12-state
     /// SQP could not eliminate.
     FullCentroidal,
+    /// Open-loop "linear-trunk" crawl ([`crate::linear_crawl`]). Holds
+    /// the trunk on a strictly +X linear trajectory and serves the legs
+    /// around it. Uses [`crate::GaitConfig::four_support_fraction`]
+    /// to size the 4-support / 3-support windows. Companion preset is
+    /// [`crate::GaitConfig::crawl`] though any preset's
+    /// `cycle_period_s` + `swing_height_m` will work; the gait type's
+    /// phase offsets are ignored (the linear planner uses its own
+    /// diagonal-sequence order).
+    LinearCrawl,
 }
 
 impl Default for GaitMode {
@@ -165,13 +174,15 @@ impl GaitMode {
             GaitMode::Mpc => "MPC (capture-point)",
             GaitMode::CentroidalSrbd => "MPC (centroidal-SRBD)",
             GaitMode::FullCentroidal => "MPC (full-centroidal 24s)",
+            GaitMode::LinearCrawl => "Linear crawl (open-loop)",
         }
     }
-    pub const ALL: [GaitMode; 4] = [
+    pub const ALL: [GaitMode; 5] = [
         GaitMode::Champ,
         GaitMode::Mpc,
         GaitMode::CentroidalSrbd,
         GaitMode::FullCentroidal,
+        GaitMode::LinearCrawl,
     ];
 }
 
@@ -185,6 +196,7 @@ pub enum AnyGaitController {
     Mpc(crate::MpcGaitController),
     CentroidalSrbd(crate::CentroidalMpcGaitController),
     FullCentroidal(crate::FullCentroidalMpcGaitController),
+    LinearCrawl(crate::linear_crawl::LinearCrawlGen),
 }
 
 impl AnyGaitController {
@@ -202,6 +214,9 @@ impl AnyGaitController {
             GaitMode::FullCentroidal => AnyGaitController::FullCentroidal(
                 crate::FullCentroidalMpcGaitController::new(cfg, kin),
             ),
+            GaitMode::LinearCrawl => AnyGaitController::LinearCrawl(
+                crate::linear_crawl::LinearCrawlGen::new(cfg, kin),
+            ),
         }
     }
 
@@ -211,6 +226,7 @@ impl AnyGaitController {
             AnyGaitController::Mpc(_) => GaitMode::Mpc,
             AnyGaitController::CentroidalSrbd(_) => GaitMode::CentroidalSrbd,
             AnyGaitController::FullCentroidal(_) => GaitMode::FullCentroidal,
+            AnyGaitController::LinearCrawl(_) => GaitMode::LinearCrawl,
         }
     }
 
@@ -246,6 +262,8 @@ impl AnyGaitController {
             AnyGaitController::Mpc(c) => c.predicted_grfs(),
             AnyGaitController::CentroidalSrbd(c) => c.predicted_grfs(),
             AnyGaitController::FullCentroidal(c) => c.predicted_grfs(),
+            // Open-loop kinematic — no MPC, no GRF prediction.
+            AnyGaitController::LinearCrawl(_) => None,
         }
     }
 
@@ -286,6 +304,8 @@ impl AnyGaitController {
             AnyGaitController::Mpc(c) => c.stance_grf_torques(output),
             AnyGaitController::CentroidalSrbd(c) => c.stance_grf_torques(output),
             AnyGaitController::FullCentroidal(c) => c.stance_grf_torques(output),
+            // Open-loop kinematic — no GRF / no τ_ff.
+            AnyGaitController::LinearCrawl(_) => [None; 4],
         }
     }
 
@@ -319,6 +339,8 @@ impl AnyGaitController {
             AnyGaitController::Mpc(c) => c.set_capture_point_gain(k),
             AnyGaitController::CentroidalSrbd(c) => c.set_capture_point_gain(k),
             AnyGaitController::FullCentroidal(c) => c.set_capture_point_gain(k),
+            // No closed-loop footstep correction in open-loop crawl.
+            AnyGaitController::LinearCrawl(_) => {}
         }
     }
 
@@ -478,6 +500,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.tick(dt),
             AnyGaitController::CentroidalSrbd(c) => c.tick(dt),
             AnyGaitController::FullCentroidal(c) => c.tick(dt),
+
+            AnyGaitController::LinearCrawl(c) => c.tick(dt),
         }
     }
     fn set_velocity_cmd(&mut self, cmd: VelocityCmd) {
@@ -486,6 +510,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.set_velocity_cmd(cmd),
             AnyGaitController::CentroidalSrbd(c) => c.set_velocity_cmd(cmd),
             AnyGaitController::FullCentroidal(c) => c.set_velocity_cmd(cmd),
+
+            AnyGaitController::LinearCrawl(c) => c.set_velocity_cmd(cmd),
         }
     }
     fn velocity_cmd(&self) -> VelocityCmd {
@@ -494,6 +520,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.velocity_cmd(),
             AnyGaitController::CentroidalSrbd(c) => c.velocity_cmd(),
             AnyGaitController::FullCentroidal(c) => c.velocity_cmd(),
+
+            AnyGaitController::LinearCrawl(c) => c.velocity_cmd(),
         }
     }
     fn reset(&mut self) {
@@ -502,6 +530,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.reset(),
             AnyGaitController::CentroidalSrbd(c) => c.reset(),
             AnyGaitController::FullCentroidal(c) => c.reset(),
+
+            AnyGaitController::LinearCrawl(c) => c.reset(),
         }
     }
     fn config(&self) -> &GaitConfig {
@@ -510,6 +540,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.config(),
             AnyGaitController::CentroidalSrbd(c) => c.config(),
             AnyGaitController::FullCentroidal(c) => c.config(),
+
+            AnyGaitController::LinearCrawl(c) => c.config(),
         }
     }
     fn set_config(&mut self, cfg: GaitConfig) {
@@ -518,6 +550,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.set_config(cfg),
             AnyGaitController::CentroidalSrbd(c) => c.set_config(cfg),
             AnyGaitController::FullCentroidal(c) => c.set_config(cfg),
+
+            AnyGaitController::LinearCrawl(c) => c.set_config(cfg),
         }
     }
     fn kinematics(&self) -> &KinematicsConfig {
@@ -526,6 +560,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.kinematics(),
             AnyGaitController::CentroidalSrbd(c) => c.kinematics(),
             AnyGaitController::FullCentroidal(c) => c.kinematics(),
+
+            AnyGaitController::LinearCrawl(c) => c.kinematics(),
         }
     }
     fn set_kinematics(&mut self, kin: KinematicsConfig) {
@@ -534,6 +570,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.set_kinematics(kin),
             AnyGaitController::CentroidalSrbd(c) => c.set_kinematics(kin),
             AnyGaitController::FullCentroidal(c) => c.set_kinematics(kin),
+
+            AnyGaitController::LinearCrawl(c) => c.set_kinematics(kin),
         }
     }
     fn set_knee_forward(&mut self, leg: LegId, forward: bool) {
@@ -542,6 +580,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.set_knee_forward(leg, forward),
             AnyGaitController::CentroidalSrbd(c) => c.set_knee_forward(leg, forward),
             AnyGaitController::FullCentroidal(c) => c.set_knee_forward(leg, forward),
+
+            AnyGaitController::LinearCrawl(c) => c.set_knee_forward(leg, forward),
         }
     }
     fn set_knee_pattern(&mut self, pattern: KneePattern) {
@@ -550,6 +590,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.set_knee_pattern(pattern),
             AnyGaitController::CentroidalSrbd(c) => c.set_knee_pattern(pattern),
             AnyGaitController::FullCentroidal(c) => c.set_knee_pattern(pattern),
+
+            AnyGaitController::LinearCrawl(c) => c.set_knee_pattern(pattern),
         }
     }
     fn knee_pattern(&self) -> KneePattern {
@@ -558,6 +600,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.knee_pattern(),
             AnyGaitController::CentroidalSrbd(c) => c.knee_pattern(),
             AnyGaitController::FullCentroidal(c) => c.knee_pattern(),
+
+            AnyGaitController::LinearCrawl(c) => c.knee_pattern(),
         }
     }
     fn knee_forward(&self) -> [bool; 4] {
@@ -566,6 +610,8 @@ impl GaitGenerator for AnyGaitController {
             AnyGaitController::Mpc(c) => c.knee_forward(),
             AnyGaitController::CentroidalSrbd(c) => c.knee_forward(),
             AnyGaitController::FullCentroidal(c) => c.knee_forward(),
+
+            AnyGaitController::LinearCrawl(c) => c.knee_forward(),
         }
     }
     fn set_body_state_observed(
@@ -580,6 +626,10 @@ impl GaitGenerator for AnyGaitController {
                 c.set_body_state_observed(v_world, omega_world)
             }
             AnyGaitController::FullCentroidal(c) => {
+                c.set_body_state_observed(v_world, omega_world)
+            }
+
+            AnyGaitController::LinearCrawl(c) => {
                 c.set_body_state_observed(v_world, omega_world)
             }
         }
@@ -599,6 +649,10 @@ impl GaitGenerator for AnyGaitController {
                 c.set_body_pose_observed(world_yaw, world_position)
             }
             AnyGaitController::FullCentroidal(c) => {
+                c.set_body_pose_observed(world_yaw, world_position)
+            }
+
+            AnyGaitController::LinearCrawl(c) => {
                 c.set_body_pose_observed(world_yaw, world_position)
             }
         }

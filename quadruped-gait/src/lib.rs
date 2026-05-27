@@ -56,6 +56,7 @@ pub mod body_state;
 pub mod config;
 pub mod controller;
 pub mod footstep;
+pub mod linear_crawl;
 pub mod generator;
 pub mod centroidal_controller;
 pub mod centroidal_mpc;
@@ -78,6 +79,7 @@ pub use config::{
 // name (`GaitController`) and the new explicit name (`ChampGaitController`)
 // so older callers keep working while new code can name the choice.
 pub use controller::{ControllerOutput, GaitController, GaitController as ChampGaitController, LegOutput};
+pub use linear_crawl::{LinearCrawlConfig, LinearCrawlController, LinearCrawlOutput};
 pub use footstep::{compute_footstep, Footstep};
 pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
 pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolution};
