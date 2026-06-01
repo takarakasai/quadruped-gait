@@ -282,6 +282,14 @@ pub struct GaitConfig {
     /// [`crate::GaitMode::LinearCrawl`].
     #[cfg_attr(feature = "serde", serde(default = "default_four_support_fraction"))]
     pub four_support_fraction: f64,
+
+    /// **LinearCrawl-only.** Lateral body-sway amplitude, m. When non-zero the
+    /// trunk shifts sideways toward the support side before each leg lifts, so
+    /// the CoM stays inside the 3-foot support triangle (classical static
+    /// crawl). `0.0` (default) keeps the legacy no-sway behaviour. Other gait
+    /// modes ignore this knob.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub lateral_sway_m: f64,
 }
 
 #[cfg(feature = "serde")]
@@ -306,6 +314,7 @@ impl GaitConfig {
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
+            lateral_sway_m: 0.0,
         }
     }
 
@@ -329,6 +338,7 @@ impl GaitConfig {
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
+            lateral_sway_m: 0.0,
         }
     }
 
@@ -351,6 +361,7 @@ impl GaitConfig {
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
+            lateral_sway_m: 0.0,
         }
     }
 
@@ -372,6 +383,7 @@ impl GaitConfig {
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
+            lateral_sway_m: 0.0,
         }
     }
 
@@ -419,6 +431,7 @@ impl GaitConfig {
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.85,
+            lateral_sway_m: 0.0,
         }
     }
 
@@ -450,6 +463,12 @@ impl GaitConfig {
     /// Clamped to `[0.05, 0.95]`.
     pub fn with_four_support_fraction(mut self, f: f64) -> Self {
         self.four_support_fraction = f.clamp(0.05, 0.95);
+        self
+    }
+    /// LinearCrawl-only knob — see [`Self::lateral_sway_m`]. Lateral body-sway
+    /// amplitude (m); `0.0` disables sway. Clamped non-negative.
+    pub fn with_lateral_sway(mut self, m: f64) -> Self {
+        self.lateral_sway_m = m.max(0.0);
         self
     }
 }

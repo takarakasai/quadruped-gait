@@ -107,6 +107,11 @@ pub struct LinearCrawlConfig {
     /// Set to `0.0` to disable the ramp (legacy behaviour). Default
     /// `0.5 s` is conservative on Go2-class robots with stiff PD.
     pub soft_start_duration_s: f64,
+    /// Lateral body-sway amplitude, m. When non-zero the trunk shifts toward
+    /// the support side during the 4-support window before each leg lifts, so
+    /// the CoM sits inside the 3-foot support triangle. `0.0` (default) keeps
+    /// the legacy behaviour (no lateral motion).
+    pub lateral_sway_m: f64,
 }
 
 impl Default for LinearCrawlConfig {
@@ -128,6 +133,7 @@ impl Default for LinearCrawlConfig {
             leg_order: [LegId::RL, LegId::FR, LegId::RR, LegId::FL],
             knee_forward: [false; 4],
             soft_start_duration_s: 0.5,
+            lateral_sway_m: 0.0,
         }
     }
 }
@@ -295,6 +301,40 @@ impl LinearCrawlController {
         out
     }
 
+    /// Lateral trunk-sway offset (world `+Y`, m) at a given cycle phase.
+    ///
+    /// Returns `0.0` when [`LinearCrawlConfig::lateral_sway_m`] is zero. Each
+    /// quarter-cycle `sub` lifts one leg; the trunk target for that quarter is a
+    /// shift *away* from the lifting leg (toward the opposite support side),
+    /// magnitude `lateral_sway_m`. Within a quarter the offset ramps from the
+    /// previous quarter's target to this one across the 4-support window
+    /// `[0, α)` (smoothstep) and then holds through the swing window, so the CoM
+    /// is already over the support triangle by the time the foot leaves.
+    fn lateral_sway_at(&self, cycle_phase: f64, alpha: f64) -> f64 {
+        let amp = self.cfg.lateral_sway_m;
+        if amp == 0.0 {
+            return 0.0;
+        }
+        let target_for = |sub: usize| -> f64 {
+            let leg = (0..4)
+                .find(|&l| self.sub_cycle_index[l] == sub)
+                .unwrap_or(0);
+            -self.nominal_body[leg].y.signum() * amp
+        };
+        let sub_f = cycle_phase * 4.0;
+        let sub_i = (sub_f.floor() as usize) % 4;
+        let u = sub_f - sub_f.floor(); // position within this quarter, [0, 1)
+        let t_prev = target_for((sub_i + 3) % 4);
+        let t_cur = target_for(sub_i);
+        let blend = if u < alpha {
+            let s = (u / alpha).clamp(0.0, 1.0);
+            s * s * (3.0 - 2.0 * s)
+        } else {
+            1.0
+        };
+        t_prev + (t_cur - t_prev) * blend
+    }
+
     /// Compute the controller output at absolute time `t` without
     /// mutating the internal clock. Useful for tests, look-ahead, and
     /// plotting the planned trajectory.
@@ -307,6 +347,13 @@ impl LinearCrawlController {
         let stance_dur_phase = 1.0 - swing_dur_phase;
         let trunk_x = v * t;
         let cycle_phase = (t / big_t).rem_euclid(1.0);
+
+        // Lateral body sway (world `+Y`). When enabled, the trunk shifts toward
+        // the support side during the 4-support window that precedes each leg's
+        // lift, then holds through the swing, so the CoM stays inside the 3-foot
+        // support triangle. A trunk shift of `+sway_y` moves every foot's body-
+        // frame Y by `−sway_y`, leaving the planted feet fixed in the world.
+        let sway_y = self.lateral_sway_at(cycle_phase, alpha);
 
         let mut angles = [(0.0f64, 0.0f64, 0.0f64); 4];
         let mut in_swing = [false; 4];
@@ -365,8 +412,9 @@ impl LinearCrawlController {
                 (bx, nominal.z)
             };
 
-            let target_body = Vector3::new(body_x, nominal.y, body_z);
-            foot_body_xyz[leg_i] = [body_x, nominal.y, body_z];
+            let foot_y = nominal.y - sway_y;
+            let target_body = Vector3::new(body_x, foot_y, body_z);
+            foot_body_xyz[leg_i] = [body_x, foot_y, body_z];
 
             let kin_leg = match leg_i {
                 0 => &self.kin.fl,
@@ -384,7 +432,7 @@ impl LinearCrawlController {
         LinearCrawlOutput {
             angles,
             in_swing,
-            trunk_world_xyz: [trunk_x, 0.0, self.cfg.body_height_m],
+            trunk_world_xyz: [trunk_x, sway_y, self.cfg.body_height_m],
             foot_body_xyz,
             foot_reachable,
         }
@@ -469,6 +517,7 @@ impl LinearCrawlGen {
             leg_order: [LegId::RL, LegId::FR, LegId::RR, LegId::FL],
             knee_forward: knee.to_knee_forward(),
             soft_start_duration_s: 0.5,
+            lateral_sway_m: host.lateral_sway_m.max(0.0),
         }
     }
 
