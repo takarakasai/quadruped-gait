@@ -57,6 +57,7 @@ pub mod config;
 pub mod controller;
 pub mod footstep;
 pub mod linear_crawl;
+pub mod autodetect;
 pub mod generator;
 pub mod centroidal_controller;
 pub mod centroidal_mpc;
@@ -70,6 +71,7 @@ pub mod srbd_mpc;
 pub mod swing_traj;
 pub mod wbc;
 
+pub use autodetect::{auto_detect_kinematics_config, auto_detect_leg_kinematics, joint_signs};
 pub use body_state::BodyState;
 pub use config::{
     GaitConfig, GaitType, KinematicsConfig, KneePattern, LegId, LegKinematics,
