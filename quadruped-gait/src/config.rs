@@ -290,6 +290,15 @@ pub struct GaitConfig {
     /// modes ignore this knob.
     #[cfg_attr(feature = "serde", serde(default))]
     pub lateral_sway_m: f64,
+
+    /// **LinearCrawl-only.** Use a C² vertical swing profile (zero velocity and
+    /// zero acceleration at lift-off / touchdown) instead of the legacy
+    /// `sin²` bump (zero velocity, non-zero acceleration). Removes the small
+    /// vertical kick at the 3↔4-support transitions that rocks the trunk.
+    /// `false` (default) keeps the validated behaviour. Other gait modes ignore
+    /// this knob. See [`crate::linear_crawl::LinearCrawlConfig::smooth_swing`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub smooth_swing: bool,
 }
 
 #[cfg(feature = "serde")]
@@ -315,6 +324,7 @@ impl GaitConfig {
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
+            smooth_swing: false,
         }
     }
 
@@ -339,6 +349,7 @@ impl GaitConfig {
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
+            smooth_swing: false,
         }
     }
 
@@ -362,6 +373,7 @@ impl GaitConfig {
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
+            smooth_swing: false,
         }
     }
 
@@ -384,6 +396,7 @@ impl GaitConfig {
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
+            smooth_swing: false,
         }
     }
 
@@ -432,6 +445,7 @@ impl GaitConfig {
             q_foot_xy_world: 500.0,
             four_support_fraction: 0.85,
             lateral_sway_m: 0.0,
+            smooth_swing: false,
         }
     }
 
@@ -469,6 +483,12 @@ impl GaitConfig {
     /// amplitude (m); `0.0` disables sway. Clamped non-negative.
     pub fn with_lateral_sway(mut self, m: f64) -> Self {
         self.lateral_sway_m = m.max(0.0);
+        self
+    }
+    /// LinearCrawl-only knob — see [`Self::smooth_swing`]. Enables the C²
+    /// (zero accel at the endpoints) vertical swing profile.
+    pub fn with_smooth_swing(mut self, on: bool) -> Self {
+        self.smooth_swing = on;
         self
     }
 }

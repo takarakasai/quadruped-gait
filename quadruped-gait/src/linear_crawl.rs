@@ -112,6 +112,16 @@ pub struct LinearCrawlConfig {
     /// the CoM sits inside the 3-foot support triangle. `0.0` (default) keeps
     /// the legacy behaviour (no lateral motion).
     pub lateral_sway_m: f64,
+    /// Use a **C²** vertical swing profile (zero velocity *and* zero
+    /// acceleration at lift-off and touchdown) instead of the legacy
+    /// `sin²(π·u)` bump (zero velocity but non-zero acceleration at the ends).
+    /// The legacy bump leaves a finite vertical acceleration the instant the
+    /// foot leaves / meets the ground, which shows up as a small upward kick
+    /// that rocks the trunk during the 3-leg phase. The C² flat-top profile
+    /// removes that acceleration step (and clears slightly higher mid-swing).
+    /// `false` (default) keeps the validated `sin²` behaviour.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub smooth_swing: bool,
 }
 
 impl Default for LinearCrawlConfig {
@@ -134,6 +144,7 @@ impl Default for LinearCrawlConfig {
             knee_forward: [false; 4],
             soft_start_duration_s: 0.5,
             lateral_sway_m: 0.0,
+            smooth_swing: false,
         }
     }
 }
@@ -186,6 +197,19 @@ pub struct LinearCrawlController {
     /// again, so the next `tick()` resumes the gait from where it was
     /// frozen.
     holding: bool,
+}
+
+/// C² vertical swing shape on `u ∈ [0, 1]`: rises from 0 to a peak of 1 at
+/// `u = 0.5` and back to 0, with **zero first and second derivative** at both
+/// ends (and at the apex). Built from the quintic smootherstep
+/// `S(x) = 6x⁵ − 15x⁴ + 10x³` (which has `S' = S'' = 0` at `x = 0` and `x = 1`)
+/// applied to the up-ramp `x = 2u` and the down-ramp `x = 2(1−u)`. Compared to
+/// `sin²`, it removes the acceleration step at lift-off / touchdown and holds
+/// the foot a little higher through mid-swing (flatter top).
+#[inline]
+fn c2_bump(u: f64) -> f64 {
+    let x = if u <= 0.5 { 2.0 * u } else { 2.0 * (1.0 - u) };
+    x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
 }
 
 #[inline]
@@ -392,10 +416,18 @@ impl LinearCrawlController {
                 //   body_x(u) = lift + (land−lift)·u − v·T·sin(2π·u)/(2π)
                 let tau = std::f64::consts::TAU;
                 let bx = lift + (land - lift) * u - v * big_t * (tau * u).sin() / tau;
-                // Same continuity trick on Z: sin²(π·u) peaks at u=0.5
-                // with amplitude `swing_height_m`, slope 0 at endpoints.
-                let sz = (std::f64::consts::PI * u).sin();
-                let bz = nominal.z + self.cfg.swing_height_m * sz * sz;
+                // Vertical bump. Legacy: sin²(π·u) — slope 0 at the ends but
+                // a finite second derivative (2π²h/T²), i.e. an acceleration
+                // step the instant the foot leaves / meets the ground. Smooth:
+                // a flat-top C² profile (zero velocity AND zero acceleration at
+                // both ends and at the apex) that removes that kick.
+                let shape = if self.cfg.smooth_swing {
+                    c2_bump(u)
+                } else {
+                    let s = (std::f64::consts::PI * u).sin();
+                    s * s
+                };
+                let bz = nominal.z + self.cfg.swing_height_m * shape;
                 (bx, bz)
             } else {
                 // Stance midpoint is the geometric midpoint of the
@@ -518,6 +550,7 @@ impl LinearCrawlGen {
             knee_forward: knee.to_knee_forward(),
             soft_start_duration_s: 0.5,
             lateral_sway_m: host.lateral_sway_m.max(0.0),
+            smooth_swing: host.smooth_swing,
         }
     }
 
@@ -698,6 +731,29 @@ mod tests {
     use super::*;
     use crate::config::LegKinematics;
     use nalgebra::Vector3;
+
+    /// The C² bump hits the expected endpoints/peak and — unlike `sin²` — has
+    /// near-zero *second* derivative at lift-off and touchdown (no acceleration
+    /// step at the ground transition).
+    #[test]
+    fn c2_bump_is_smooth_at_ends() {
+        // Value: 0 at the ends, peak 1 at the apex.
+        assert!((c2_bump(0.0)).abs() < 1e-12);
+        assert!((c2_bump(1.0)).abs() < 1e-12);
+        assert!((c2_bump(0.5) - 1.0).abs() < 1e-12);
+
+        let h = 1e-3;
+        // Central second difference a hair inside an endpoint.
+        let accel = |f: &dyn Fn(f64) -> f64, u: f64| (f(u + h) - 2.0 * f(u) + f(u - h)) / (h * h);
+        let sin2 = |u: f64| (std::f64::consts::PI * u).sin().powi(2);
+        let bump = |u: f64| c2_bump(u);
+
+        // C² profile: end acceleration ≈ 0. sin² would give |accel| ≈ 2π² ≈ 19.7.
+        assert!(accel(&bump, h).abs() < 0.5, "C² lift-off accel not ~0");
+        assert!(accel(&bump, 1.0 - h).abs() < 0.5, "C² touchdown accel not ~0");
+        // Sanity: the legacy sin² bump really does have a large end accel.
+        assert!(accel(&sin2, h).abs() > 5.0, "sin² should have non-zero end accel");
+    }
 
     fn dummy_kin() -> KinematicsConfig {
         let mk = |leg: LegId, hx: f64| {
