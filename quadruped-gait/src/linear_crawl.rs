@@ -122,6 +122,14 @@ pub struct LinearCrawlConfig {
     /// `false` (default) keeps the validated `sin²` behaviour.
     #[cfg_attr(feature = "serde", serde(default))]
     pub smooth_swing: bool,
+    /// Lateral stance widening, m: how far **outward** (away from the body
+    /// centerline) to push each foot's nominal/planted Y. Widening the stance
+    /// enlarges the 3-foot support triangle so the CoM stays inside it during
+    /// the swing phase, reducing roll **without moving the trunk** (unlike
+    /// [`Self::lateral_sway_m`]). `0.0` (default) keeps the auto-detected
+    /// stance. Costs hip-abduction range, so keep it within the leg's reach.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub stance_widen_m: f64,
 }
 
 impl Default for LinearCrawlConfig {
@@ -145,6 +153,7 @@ impl Default for LinearCrawlConfig {
             soft_start_duration_s: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
+            stance_widen_m: 0.0,
         }
     }
 }
@@ -229,8 +238,16 @@ impl LinearCrawlController {
             sub_cycle_index[leg_arr_idx(*l)] = i;
         }
         let h = cfg.body_height_m;
+        let widen = cfg.stance_widen_m;
         let nb = |lk: &crate::config::LegKinematics| {
-            Vector3::new(lk.nominal_foot_body.x, lk.nominal_foot_body.y, -h)
+            // Push the foot outward (away from the centerline) by `widen`,
+            // preserving the leg's side. Enlarges the support polygon.
+            let lateral_sign = if lk.leg.is_left() { 1.0 } else { -1.0 };
+            Vector3::new(
+                lk.nominal_foot_body.x,
+                lk.nominal_foot_body.y + lateral_sign * widen,
+                -h,
+            )
         };
         let nominal_body = [nb(&kin.fl), nb(&kin.fr), nb(&kin.rl), nb(&kin.rr)];
         Self {
@@ -551,6 +568,7 @@ impl LinearCrawlGen {
             soft_start_duration_s: 0.5,
             lateral_sway_m: host.lateral_sway_m.max(0.0),
             smooth_swing: host.smooth_swing,
+            stance_widen_m: host.stance_widen_m,
         }
     }
 

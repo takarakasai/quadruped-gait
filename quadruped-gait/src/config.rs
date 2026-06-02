@@ -299,6 +299,15 @@ pub struct GaitConfig {
     /// this knob. See [`crate::linear_crawl::LinearCrawlConfig::smooth_swing`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub smooth_swing: bool,
+
+    /// **LinearCrawl-only.** Lateral stance widening, m — pushes each foot
+    /// outward from the centerline, enlarging the support triangle so the CoM
+    /// stays inside it during swing. Reduces roll *without* moving the trunk
+    /// (cf. [`Self::lateral_sway_m`]). `0.0` (default) keeps the detected
+    /// stance. Other gait modes ignore this knob. See
+    /// [`crate::linear_crawl::LinearCrawlConfig::stance_widen_m`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub stance_widen_m: f64,
 }
 
 #[cfg(feature = "serde")]
@@ -325,6 +334,7 @@ impl GaitConfig {
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
+            stance_widen_m: 0.0,
         }
     }
 
@@ -350,6 +360,7 @@ impl GaitConfig {
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
+            stance_widen_m: 0.0,
         }
     }
 
@@ -374,6 +385,7 @@ impl GaitConfig {
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
+            stance_widen_m: 0.0,
         }
     }
 
@@ -397,6 +409,7 @@ impl GaitConfig {
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
+            stance_widen_m: 0.0,
         }
     }
 
@@ -446,6 +459,7 @@ impl GaitConfig {
             four_support_fraction: 0.85,
             lateral_sway_m: 0.0,
             smooth_swing: false,
+            stance_widen_m: 0.0,
         }
     }
 
@@ -489,6 +503,12 @@ impl GaitConfig {
     /// (zero accel at the endpoints) vertical swing profile.
     pub fn with_smooth_swing(mut self, on: bool) -> Self {
         self.smooth_swing = on;
+        self
+    }
+    /// LinearCrawl-only knob — see [`Self::stance_widen_m`]. Lateral stance
+    /// widening (m); clamped to a safe band so IK stays reachable.
+    pub fn with_stance_width(mut self, m: f64) -> Self {
+        self.stance_widen_m = m.clamp(-0.05, 0.12);
         self
     }
 }
