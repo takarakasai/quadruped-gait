@@ -20,6 +20,10 @@ clarabel = { version = "0.11", features = ["serde"] }
 [features]
 default = []
 serde = ["dep:serde"]
+# Serde derive for the live-visualization wire type (`viz::GaitVizFrame`) only,
+# without turning on the crate-wide `serde` feature (which would pull serde into
+# the nalgebra-bearing config types too). Enabled by the viz publisher/viewer.
+viz = ["dep:serde"]
 
 [dev-dependencies]
 approx = "0.5"
