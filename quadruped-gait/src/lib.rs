@@ -52,6 +52,7 @@
 //! See `tests/` for unit-tested behaviour and the `articara` GUI for an
 //! interactive driver.
 
+pub mod async_solver;
 pub mod body_state;
 pub mod config;
 pub mod controller;

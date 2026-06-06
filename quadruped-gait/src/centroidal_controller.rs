@@ -24,6 +24,7 @@
 
 use nalgebra::Vector3;
 
+use crate::async_solver::AsyncJobWorker;
 use crate::body_state::BodyState;
 use crate::centroidal_mpc::{
     CentroidalContactSchedule, CentroidalFootOffsets, CentroidalMpc, CentroidalMpcConfig,
@@ -68,6 +69,13 @@ pub struct CentroidalMpcGaitController {
     /// `last_solution` after each solve.
     last_solution_compat: Option<MpcSolution>,
     mpc_solve_accumulator_s: f64,
+    /// Background worker that runs the centroidal QP off the caller's
+    /// thread (GUI responsiveness). See [`crate::async_solver`] and
+    /// [`Self::set_async_mpc`].
+    mpc_worker: AsyncJobWorker<CentroidalMpcSolution>,
+    /// When `true`, solve on [`Self::mpc_worker`] instead of inline.
+    /// Default `false` (synchronous, deterministic).
+    async_mpc: bool,
 }
 
 impl CentroidalMpcGaitController {
@@ -87,7 +95,16 @@ impl CentroidalMpcGaitController {
             last_solution: None,
             last_solution_compat: None,
             mpc_solve_accumulator_s: f64::INFINITY,
+            mpc_worker: AsyncJobWorker::new(),
+            async_mpc: false,
         }
+    }
+
+    /// Enable/disable solving the MPC QP on a background thread. Off by
+    /// default (synchronous). The `articara` GUI enables it so a slow
+    /// solve can't stall the eframe update loop and freeze the window.
+    pub fn set_async_mpc(&mut self, enabled: bool) {
+        self.async_mpc = enabled;
     }
 
     /// Predicted GRFs as [`MpcSolution`] (SRBD-shaped) for WBC compat.
@@ -225,6 +242,9 @@ impl CentroidalMpcGaitController {
         self.last_solution = None;
         self.last_solution_compat = None;
         self.mpc_solve_accumulator_s = f64::INFINITY;
+        // Discard any in-flight background solve so its (now stale) result
+        // can't repopulate the just-cleared solution.
+        self.mpc_worker.reset();
         // Drop the SQP warm-start so the next solve starts at the
         // reference trajectory's yaw (cold start). Reset is typically
         // called on mode switch or large state jumps where the
@@ -275,23 +295,56 @@ impl CentroidalMpcGaitController {
             body_state: self.body_state,
         };
 
+        // Adopt any solution the background worker finished (async only).
+        if let Some(sol) = self.mpc_worker.poll() {
+            self.last_solution_compat = Some(to_compat_mpc_solution(&sol));
+            self.last_solution = Some(sol);
+        }
         let dt_per_step = self.centroidal_mpc.config().dt_per_step;
         self.mpc_solve_accumulator_s += dt;
         if self.mpc_solve_accumulator_s >= dt_per_step {
-            let centroidal_sol = self.solve_centroidal_mpc(&output);
-            self.last_solution_compat = Some(to_compat_mpc_solution(&centroidal_sol));
-            self.last_solution = Some(centroidal_sol);
-            self.mpc_solve_accumulator_s = 0.0;
+            if self.async_mpc {
+                // Off-thread solve: queue only when idle, keep the previous
+                // solution (ZOH) until the fresh one lands. The cloned
+                // solver carries the current warm-start trajectory.
+                if !self.mpc_worker.is_busy() {
+                    let (s_now, reference, contact, feet) =
+                        self.build_centroidal_inputs(&output);
+                    let mut solver = self.centroidal_mpc.clone();
+                    self.mpc_worker.submit(move || {
+                        solver.solve(s_now, &reference, &contact, &feet)
+                    });
+                    self.mpc_solve_accumulator_s = 0.0;
+                }
+            } else {
+                // Synchronous solve (default): deterministic, used by
+                // headless benchmarks / tests / hardware. Blocks the caller.
+                let (s_now, reference, contact, feet) =
+                    self.build_centroidal_inputs(&output);
+                let centroidal_sol =
+                    self.centroidal_mpc.solve(s_now, &reference, &contact, &feet);
+                self.last_solution_compat = Some(to_compat_mpc_solution(&centroidal_sol));
+                self.last_solution = Some(centroidal_sol);
+                self.mpc_solve_accumulator_s = 0.0;
+            }
         }
 
         output
     }
 
-    /// Build the centroidal MPC inputs from current state and call
-    /// the QP solver. Mirror of [`crate::MpcGaitController::solve_srbd_mpc`].
-    /// `&mut self` because the underlying `CentroidalMpc` carries a
-    /// warm-start trajectory that the solver mutates per call.
-    fn solve_centroidal_mpc(&mut self, output: &ControllerOutput) -> CentroidalMpcSolution {
+    /// Build the centroidal MPC inputs from current state. The caller then
+    /// either solves synchronously or hands a clone of the solver + these
+    /// inputs to the background worker. Mirror of
+    /// [`crate::MpcGaitController::build_srbd_inputs`].
+    fn build_centroidal_inputs(
+        &self,
+        output: &ControllerOutput,
+    ) -> (
+        CentroidalState,
+        CentroidalReference,
+        CentroidalContactSchedule,
+        CentroidalFootOffsets,
+    ) {
         let cfg = self.centroidal_mpc.config().clone();
         let n = cfg.horizon_steps;
 
@@ -361,7 +414,7 @@ impl CentroidalMpcGaitController {
         ];
         let feet = CentroidalFootOffsets::constant_per_leg(foot_rel_com_world, n);
 
-        self.centroidal_mpc.solve(s_now, &reference, &contact, &feet)
+        (s_now, reference, contact, feet)
     }
 
     /// Footstep planner identical to

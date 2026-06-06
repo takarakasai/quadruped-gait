@@ -31,6 +31,7 @@
 
 use nalgebra::Vector3;
 
+use crate::async_solver::AsyncJobWorker;
 use crate::body_state::BodyState;
 use crate::config::{GaitConfig, KinematicsConfig, LegId, LegKinematics, VelocityCmd};
 use crate::controller::{ControllerOutput, LegOutput};
@@ -182,6 +183,16 @@ pub struct MpcGaitController {
     /// noise into τ_ff. Cap at one solve per ZOH window matches the
     /// classical ZOH MPC implementation in Di Carlo et al.
     mpc_solve_accumulator_s: f64,
+    /// Background worker that runs the SRBD QP off the caller's thread so
+    /// a slow solve can't stall the GUI's update loop. The control loop
+    /// keeps using `last_mpc_solution` (ZOH) until a fresh solve lands.
+    /// See [`crate::async_solver`].
+    mpc_worker: AsyncJobWorker<MpcSolution>,
+    /// When `true`, the MPC QP is solved on [`Self::mpc_worker`] instead of
+    /// inline. Default `false` (synchronous, deterministic) for headless
+    /// benchmarks / tests / hardware; the GUI flips it on so a slow solve
+    /// can't freeze the update loop. See [`Self::set_async_mpc`].
+    async_mpc: bool,
 }
 
 impl MpcGaitController {
@@ -203,7 +214,16 @@ impl MpcGaitController {
             srbd_mpc: SrbdMpc::new(SrbdMpcConfig::default()),
             last_mpc_solution: None,
             mpc_solve_accumulator_s: f64::INFINITY,
+            mpc_worker: AsyncJobWorker::new(),
+            async_mpc: false,
         }
+    }
+
+    /// Enable/disable solving the MPC QP on a background thread. Off by
+    /// default (synchronous). The `articara` GUI enables it so a slow
+    /// solve can't stall the eframe update loop and freeze the window.
+    pub fn set_async_mpc(&mut self, enabled: bool) {
+        self.async_mpc = enabled;
     }
 
     /// Predicted ground reaction forces from the most recent MPC
@@ -388,6 +408,9 @@ impl MpcGaitController {
         self.v_observed_world = Vector3::zeros();
         self.omega_observed_world = Vector3::zeros();
         self.last_mpc_solution = None;
+        // Discard any in-flight background solve so its (now stale) result
+        // can't repopulate the just-cleared solution.
+        self.mpc_worker.reset();
         // Force a re-solve on the next tick after reset.
         self.mpc_solve_accumulator_s = f64::INFINITY;
     }
@@ -459,20 +482,52 @@ impl MpcGaitController {
         // Failures (clarabel didn't converge, ill-conditioned QP, …)
         // leave the previous solution in place — the GRFs are best-
         // effort, not a safety-critical signal.
+        // Adopt any solution the background worker finished since last
+        // tick (async mode only; a no-op when solving synchronously).
+        if let Some(sol) = self.mpc_worker.poll() {
+            self.last_mpc_solution = Some(sol);
+        }
         let dt_per_step = self.srbd_mpc.config().dt_per_step;
         self.mpc_solve_accumulator_s += dt;
         if self.mpc_solve_accumulator_s >= dt_per_step {
-            self.last_mpc_solution = Some(self.solve_srbd_mpc(&output));
-            self.mpc_solve_accumulator_s = 0.0;
+            if self.async_mpc {
+                // Off-thread solve: only queue when the worker is idle and
+                // keep using the previous solution (zero-order hold) until
+                // the fresh one lands. A slow QP delays the next solution
+                // rather than stalling this caller — this is what keeps the
+                // GUI's update loop responsive. SRBD's `solve` is `&self`
+                // (no warm-start), so the clone is a pure config snapshot.
+                if !self.mpc_worker.is_busy() {
+                    let (s_now, reference, contact, feet) =
+                        self.build_srbd_inputs(&output);
+                    let solver = self.srbd_mpc.clone();
+                    self.mpc_worker.submit(move || {
+                        solver.solve(s_now, &reference, &contact, &feet)
+                    });
+                    self.mpc_solve_accumulator_s = 0.0;
+                }
+            } else {
+                // Synchronous solve (default): deterministic, used by the
+                // headless benchmarks / tests / hardware runner. Blocks the
+                // caller for the solve duration.
+                let (s_now, reference, contact, feet) = self.build_srbd_inputs(&output);
+                self.last_mpc_solution =
+                    Some(self.srbd_mpc.solve(s_now, &reference, &contact, &feet));
+                self.mpc_solve_accumulator_s = 0.0;
+            }
         }
 
         output
     }
 
     /// Build the inputs for [`SrbdMpc::solve`] from the current state
-    /// + phase + footstep planning, then call clarabel. See
-    /// [`Self::predicted_grfs`].
-    fn solve_srbd_mpc(&self, output: &ControllerOutput) -> MpcSolution {
+    /// + phase + footstep planning. The caller then either solves
+    /// synchronously or hands a clone of the solver + these inputs to the
+    /// background worker. See [`Self::predicted_grfs`].
+    fn build_srbd_inputs(
+        &self,
+        output: &ControllerOutput,
+    ) -> (SrbdState, ReferenceTrajectory, ContactSchedule, FootOffsets) {
         let cfg = self.srbd_mpc.config();
         let n = cfg.horizon_steps;
 
@@ -564,7 +619,7 @@ impl MpcGaitController {
         ];
         let feet = FootOffsets::constant_per_leg(foot_world, n);
 
-        self.srbd_mpc.solve(s_now, &reference, &contact, &feet)
+        (s_now, reference, contact, feet)
     }
 
     /// Footstep planner with capture-point feedback + LIP horizon

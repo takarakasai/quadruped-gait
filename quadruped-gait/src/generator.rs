@@ -344,6 +344,20 @@ impl AnyGaitController {
         }
     }
 
+    /// Enable/disable solving the MPC QP on a background thread. Only the
+    /// MPC-family controllers have a solver; the open-loop modes ignore
+    /// it. The `articara` GUI turns this on so a slow solve can't freeze
+    /// the update loop (see [`crate::async_solver`]).
+    pub fn set_async_mpc(&mut self, enabled: bool) {
+        match self {
+            AnyGaitController::Champ(_) => {}
+            AnyGaitController::Mpc(c) => c.set_async_mpc(enabled),
+            AnyGaitController::CentroidalSrbd(c) => c.set_async_mpc(enabled),
+            AnyGaitController::FullCentroidal(c) => c.set_async_mpc(enabled),
+            AnyGaitController::LinearCrawl(_) => {}
+        }
+    }
+
     /// Configure the FullCentroidal controller's nonlinear pulse
     /// branch of the capture-point feedback (η-2 experiment, see
     /// [`crate::mpc_controller::capture_point_step`]). No-op for any
