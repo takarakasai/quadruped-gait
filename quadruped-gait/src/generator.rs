@@ -358,6 +358,19 @@ impl AnyGaitController {
         }
     }
 
+    /// Set the trunk stance height (m) — the height the body is held at
+    /// above the feet. Only [`GaitMode::LinearCrawl`] holds an explicit
+    /// trunk-height target; the other modes derive their stance from the
+    /// kinematics / SRBD state and ignore this. Clamped to a sane minimum
+    /// by the underlying controller. No-op when unset (the LinearCrawl
+    /// default is the auto-detected nominal foot height).
+    pub fn set_body_height_m(&mut self, h: f64) {
+        match self {
+            AnyGaitController::LinearCrawl(g) => g.set_body_height_m(h),
+            _ => {}
+        }
+    }
+
     /// Configure the FullCentroidal controller's nonlinear pulse
     /// branch of the capture-point feedback (η-2 experiment, see
     /// [`crate::mpc_controller::capture_point_step`]). No-op for any
