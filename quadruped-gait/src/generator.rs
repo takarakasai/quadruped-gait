@@ -344,6 +344,50 @@ impl AnyGaitController {
         }
     }
 
+    /// Feed the observed body **velocity** (world frame): linear `v_world`
+    /// and angular `omega_world`. The MPC modes use it for closed-loop
+    /// velocity / yaw-rate tracking (capture-point feedback). No-op for the
+    /// open-loop CHAMP / LinearCrawl modes, which ignore observed state.
+    pub fn set_body_state_observed(
+        &mut self,
+        v_world: nalgebra::Vector3<f64>,
+        omega_world: nalgebra::Vector3<f64>,
+    ) {
+        match self {
+            AnyGaitController::Champ(_) => {}
+            AnyGaitController::Mpc(c) => c.set_body_state_observed(v_world, omega_world),
+            AnyGaitController::CentroidalSrbd(c) => {
+                c.set_body_state_observed(v_world, omega_world)
+            }
+            AnyGaitController::FullCentroidal(c) => {
+                c.set_body_state_observed(v_world, omega_world)
+            }
+            AnyGaitController::LinearCrawl(_) => {}
+        }
+    }
+
+    /// Feed the observed body **pose**: world-frame `world_yaw` (rad) and
+    /// `world_position` (m). The MPC modes use the real pose instead of
+    /// integrating the velocity command (which drifts). No-op for the
+    /// open-loop CHAMP / LinearCrawl modes.
+    pub fn set_body_pose_observed(
+        &mut self,
+        world_yaw: f64,
+        world_position: nalgebra::Vector3<f64>,
+    ) {
+        match self {
+            AnyGaitController::Champ(_) => {}
+            AnyGaitController::Mpc(c) => c.set_body_pose_observed(world_yaw, world_position),
+            AnyGaitController::CentroidalSrbd(c) => {
+                c.set_body_pose_observed(world_yaw, world_position)
+            }
+            AnyGaitController::FullCentroidal(c) => {
+                c.set_body_pose_observed(world_yaw, world_position)
+            }
+            AnyGaitController::LinearCrawl(_) => {}
+        }
+    }
+
     /// Enable/disable solving the MPC QP on a background thread. Only the
     /// MPC-family controllers have a solver; the open-loop modes ignore
     /// it. The `articara` GUI turns this on so a slow solve can't freeze
