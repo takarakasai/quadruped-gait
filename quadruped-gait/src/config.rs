@@ -308,11 +308,33 @@ pub struct GaitConfig {
     /// [`crate::linear_crawl::LinearCrawlConfig::stance_widen_m`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub stance_widen_m: f64,
+
+    /// **LinearCrawl-only.** Swing-foot feasibility limit: the maximum
+    /// body-frame **foot-tip speed** (m/s) the swing trajectory is allowed
+    /// to command. Raising [`Self::four_support_fraction`] toward 1 shrinks
+    /// the swing window, so the foot must cover the same stride in less
+    /// time — the peak swing speed grows as ≈ `8·v / (1 − α)` and quickly
+    /// exceeds what the actuators can track, which on hardware shows up as
+    /// the whole body shaking during swing. When this limit is `> 0` the
+    /// controller caps the **forward speed** so the peak swing-foot speed
+    /// stays within it (the robot crawls slower but smoothly); the chosen
+    /// `α` is preserved. `0.0` disables the guard (legacy behaviour — the
+    /// swing speed is unbounded). Default `3.0` m/s suits a Go2-class leg
+    /// under Position-PD. Other gait modes ignore this knob. See
+    /// [`crate::linear_crawl::LinearCrawlConfig::max_swing_foot_speed_mps`].
+    #[cfg_attr(feature = "serde", serde(default = "default_max_swing_foot_speed"))]
+    pub max_swing_foot_speed_mps: f64,
 }
 
 #[cfg(feature = "serde")]
 fn default_four_support_fraction() -> f64 {
     0.5
+}
+
+/// Default swing-foot feasibility cap (m/s). Also used to backfill the
+/// field when deserialising configs saved before it existed.
+pub fn default_max_swing_foot_speed() -> f64 {
+    3.0
 }
 
 impl GaitConfig {
@@ -335,6 +357,7 @@ impl GaitConfig {
             lateral_sway_m: 0.0,
             smooth_swing: false,
             stance_widen_m: 0.0,
+            max_swing_foot_speed_mps: default_max_swing_foot_speed(),
         }
     }
 
@@ -361,6 +384,7 @@ impl GaitConfig {
             lateral_sway_m: 0.0,
             smooth_swing: false,
             stance_widen_m: 0.0,
+            max_swing_foot_speed_mps: default_max_swing_foot_speed(),
         }
     }
 
@@ -386,6 +410,7 @@ impl GaitConfig {
             lateral_sway_m: 0.0,
             smooth_swing: false,
             stance_widen_m: 0.0,
+            max_swing_foot_speed_mps: default_max_swing_foot_speed(),
         }
     }
 
@@ -410,6 +435,7 @@ impl GaitConfig {
             lateral_sway_m: 0.0,
             smooth_swing: false,
             stance_widen_m: 0.0,
+            max_swing_foot_speed_mps: default_max_swing_foot_speed(),
         }
     }
 
@@ -460,6 +486,7 @@ impl GaitConfig {
             lateral_sway_m: 0.0,
             smooth_swing: false,
             stance_widen_m: 0.0,
+            max_swing_foot_speed_mps: default_max_swing_foot_speed(),
         }
     }
 
@@ -509,6 +536,13 @@ impl GaitConfig {
     /// widening (m); clamped to a safe band so IK stays reachable.
     pub fn with_stance_width(mut self, m: f64) -> Self {
         self.stance_widen_m = m.clamp(-0.05, 0.12);
+        self
+    }
+    /// LinearCrawl-only knob — see [`Self::max_swing_foot_speed_mps`].
+    /// Swing-foot feasibility cap (m/s); `0.0` disables the guard. Clamped
+    /// non-negative.
+    pub fn with_max_swing_foot_speed(mut self, m: f64) -> Self {
+        self.max_swing_foot_speed_mps = m.max(0.0);
         self
     }
 }

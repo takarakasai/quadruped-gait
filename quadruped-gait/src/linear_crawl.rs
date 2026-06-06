@@ -130,6 +130,22 @@ pub struct LinearCrawlConfig {
     /// stance. Costs hip-abduction range, so keep it within the leg's reach.
     #[cfg_attr(feature = "serde", serde(default))]
     pub stance_widen_m: f64,
+    /// Swing-foot feasibility cap: the maximum body-frame **foot-tip speed**
+    /// (m/s) the swing trajectory may command. As
+    /// [`Self::four_support_fraction`] (`α`) rises toward 1 the swing window
+    /// `(1−α)·T/4` collapses, so the foot must cover the same stance stride
+    /// in less time and the peak swing speed grows as ≈ `8·v / (1 − α)`.
+    /// Past the leg's actuator limit (~4–6 m/s on a Go2-class leg) the motors
+    /// saturate, the foot lands late/hard, and the whole body shakes during
+    /// the swing. When this cap is `> 0` the planner reduces the **forward
+    /// speed** so the peak swing-foot speed stays within it — the robot
+    /// crawls slower but smoothly, and the chosen `α` is preserved. `0.0`
+    /// disables the guard (legacy unbounded behaviour). Note the peak swing
+    /// speed is **independent of `cycle_period_s`** (both the stride and the
+    /// swing time scale with `T`), so slowing the cadence does *not* help —
+    /// only a lower forward speed or a lower `α` does.
+    #[cfg_attr(feature = "serde", serde(default = "crate::config::default_max_swing_foot_speed"))]
+    pub max_swing_foot_speed_mps: f64,
 }
 
 impl Default for LinearCrawlConfig {
@@ -154,6 +170,7 @@ impl Default for LinearCrawlConfig {
             lateral_sway_m: 0.0,
             smooth_swing: false,
             stance_widen_m: 0.0,
+            max_swing_foot_speed_mps: crate::config::default_max_swing_foot_speed(),
         }
     }
 }
@@ -288,7 +305,33 @@ impl LinearCrawlController {
 
     /// Trunk world X target at the current time.
     pub fn trunk_world_x(&self) -> f64 {
-        self.cfg.speed_mps * self.t
+        self.effective_speed() * self.t
+    }
+
+    /// Forward speed the planner actually uses: the commanded
+    /// [`LinearCrawlConfig::speed_mps`], reduced if necessary so the peak
+    /// body-frame swing-foot speed stays within
+    /// [`LinearCrawlConfig::max_swing_foot_speed_mps`]. Returns the command
+    /// unchanged when the cap is `≤ 0` (guard disabled).
+    ///
+    /// Peak body-frame foot speed over a swing is
+    /// `|v|·(2 − s)/s` with `s = (1−α)/4` the swing-window phase fraction
+    /// (the `+1` comes from the `−cos(2πu)` term in the C¹ profile peaking
+    /// at mid-swing). Inverting for `|v|` gives the feasible forward speed.
+    pub fn effective_speed(&self) -> f64 {
+        let v_cmd = self.cfg.speed_mps;
+        let vmax = self.cfg.max_swing_foot_speed_mps;
+        if vmax <= 0.0 {
+            return v_cmd;
+        }
+        let alpha = self.cfg.four_support_fraction.clamp(0.05, 0.95);
+        let s = (1.0 - alpha) * 0.25; // swing-window phase fraction
+        if s <= 0.0 {
+            return v_cmd;
+        }
+        let gain = (2.0 - s) / s; // peak foot speed per unit forward speed
+        let v_feasible = vmax / gain;
+        v_cmd.signum() * v_cmd.abs().min(v_feasible)
     }
 
     /// Live-update the forward speed without disturbing cycle phase.
@@ -380,7 +423,12 @@ impl LinearCrawlController {
     /// mutating the internal clock. Useful for tests, look-ahead, and
     /// plotting the planned trajectory.
     pub fn output_at(&self, t: f64) -> LinearCrawlOutput {
-        let v = self.cfg.speed_mps;
+        // Feasibility-limited forward speed: keeps the peak swing-foot speed
+        // within `max_swing_foot_speed_mps`. Both the foot planning and the
+        // trunk translation below use this same `v`, so they stay consistent
+        // (no foot slip) — the robot simply advances slower when the cap
+        // engages. See `effective_speed`.
+        let v = self.effective_speed();
         let big_t = self.cfg.cycle_period_s.max(1e-6);
         let alpha = self.cfg.four_support_fraction.clamp(0.05, 0.95);
         // Each per-leg sub-cycle is T/4; swing is (1−α) of that.
@@ -569,6 +617,7 @@ impl LinearCrawlGen {
             lateral_sway_m: host.lateral_sway_m.max(0.0),
             smooth_swing: host.smooth_swing,
             stance_widen_m: host.stance_widen_m,
+            max_swing_foot_speed_mps: host.max_swing_foot_speed_mps.max(0.0),
         }
     }
 
@@ -603,7 +652,14 @@ impl GaitGenerator for LinearCrawlGen {
         // velocity command without rebuilding the whole config.
         self.ctrl.set_speed(self.cmd.vx);
         let out = self.ctrl.tick(dt);
-        self.body_state.integrate(&self.cmd, dt);
+        // Integrate the body pose at the **feasibility-limited** speed the
+        // planner actually used (the swing-foot cap may have reduced it), so
+        // the reported body velocity and the footstep telemetry below match
+        // the trunk motion the legs are really producing.
+        let v_eff = self.ctrl.effective_speed();
+        let mut eff_cmd = self.cmd;
+        eff_cmd.vx = v_eff;
+        self.body_state.integrate(&eff_cmd, dt);
 
         let kin = self.ctrl.kin.clone();
         let kin_legs = [&kin.fl, &kin.fr, &kin.rl, &kin.rr];
@@ -622,7 +678,7 @@ impl GaitGenerator for LinearCrawlGen {
                 out.foot_body_xyz[i][2],
             );
             let nominal_x = lk.nominal_foot_body.x;
-            let v = self.cmd.vx;
+            let v = v_eff;
             let big_t = self.ctrl.config().cycle_period_s;
             let half_exc = v * stance_dur_phase * big_t / 2.0;
             // Footstep convention: lift_off = rear of stride (where the
@@ -860,6 +916,48 @@ mod tests {
                 expected_swing_s_per_leg
             );
         }
+    }
+
+    /// The swing-foot feasibility cap reduces the forward speed so the peak
+    /// body-frame swing-foot speed stays within `max_swing_foot_speed_mps`,
+    /// preserves the chosen `α`, leaves the validated low-speed regime
+    /// untouched, and is a no-op when the cap is disabled (`0.0`).
+    #[test]
+    fn swing_foot_speed_cap_limits_forward_speed() {
+        let peak_for = |v: f64, alpha: f64| {
+            let s = (1.0 - alpha) * 0.25;
+            v.abs() * (2.0 - s) / s
+        };
+
+        // α = 0.9, v = 0.15 would peak ≈ 11.7 m/s uncapped. With a 3 m/s cap
+        // the forward speed must drop until the peak sits at the cap.
+        let mut cfg = LinearCrawlConfig::default();
+        cfg.four_support_fraction = 0.9;
+        cfg.max_swing_foot_speed_mps = 3.0;
+        cfg.speed_mps = 0.15;
+        let c = LinearCrawlController::new(dummy_kin(), cfg.clone());
+        let v_eff = c.effective_speed();
+        assert!(v_eff.abs() < 0.15, "forward speed should be reduced: {v_eff}");
+        assert!(
+            peak_for(v_eff, 0.9) <= 3.0 + 1e-9,
+            "peak swing speed {} exceeds cap",
+            peak_for(v_eff, 0.9)
+        );
+        // Cap engaged ⇒ peak sits right at the limit (not over-reduced).
+        assert!((peak_for(v_eff, 0.9) - 3.0).abs() < 1e-6);
+
+        // Disabled cap (0.0) ⇒ command passes through unchanged.
+        let mut cfg_off = cfg.clone();
+        cfg_off.max_swing_foot_speed_mps = 0.0;
+        let c_off = LinearCrawlController::new(dummy_kin(), cfg_off);
+        assert!((c_off.effective_speed() - 0.15).abs() < 1e-12);
+
+        // Validated regime (α = 0.85, v = 0.05, peak ≈ 2.6 < 3.0) untouched.
+        let c_val = LinearCrawlController::new(dummy_kin(), LinearCrawlConfig::default());
+        assert!(
+            (c_val.effective_speed() - 0.05).abs() < 1e-12,
+            "validated default config must not be clamped"
+        );
     }
 
     /// The body-frame foot X position is continuous across the
