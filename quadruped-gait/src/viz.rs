@@ -43,8 +43,13 @@ pub struct GaitVizFrame {
     /// Body world pose `[x, y, z, yaw]` — metres and radians. `z` is the trunk
     /// height above the ground (the gait integrates only `x, y`).
     pub pose: [f64; 4],
-    /// 12 joint angles (rad), IK / gait convention, slot order
-    /// **FL, FR, RL, RR** × (hip, thigh, calf). See the module docs.
+    /// 12 joint angles (rad), slot order **FL, FR, RL, RR** × (hip, thigh,
+    /// calf). Intended to be settable directly as a viewer's URDF/model joint
+    /// positions. NOTE: [`Self::from_output`] fills these from the controller
+    /// in the **gait/IK convention**; a publisher driving a robot model should
+    /// sign-correct them to the model convention first (multiply by the
+    /// `joint_signs` IK→model table — the same correction the hardware path
+    /// applies), otherwise sign-flipped joints (e.g. the knee) render mirrored.
     pub joints: [f64; 12],
     /// Per-slot stance flag (FL, FR, RL, RR); `true` = foot planted. For the
     /// viewer to colour stance vs swing legs.
