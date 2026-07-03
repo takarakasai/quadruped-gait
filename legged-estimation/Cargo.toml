@@ -9,3 +9,6 @@ description = "State estimation for legged robots: 18-state linear Kalman filter
 [dependencies]
 nalgebra = "0.34.2"
 quadruped-gait = { path = "../quadruped-gait" }
+
+[dev-dependencies]
+approx = "0.5"
