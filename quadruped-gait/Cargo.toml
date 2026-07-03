@@ -10,6 +10,8 @@ log = "0.4"
 nalgebra = "0.34.2"
 misarta = { git = "https://github.com/takarakasai/misarta.git", features = ["clarabel"] }
 serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+zenoh = { version = "1.9", optional = true }
 # Convex MPC backend: clarabel solves the SRBD QP that
 # `mpc_controller::SrbdMpc` builds each tick (Di Carlo et al. 2018).
 # Already a transitive dep through misarta when its `clarabel` feature
@@ -24,6 +26,10 @@ serde = ["dep:serde"]
 # without turning on the crate-wide `serde` feature (which would pull serde into
 # the nalgebra-bearing config types too). Enabled by the viz publisher/viewer.
 viz = ["dep:serde"]
+# Zenoh subscriber for the viz stream (`viz_sub::VizSubscriber`): pure-Rust
+# transport for viewers. Separate from `viz` so publishers / wire-type-only
+# consumers don't pull zenoh.
+viz-sub = ["viz", "dep:zenoh", "dep:serde_json"]
 
 [dev-dependencies]
 approx = "0.5"

@@ -56,6 +56,8 @@ pub mod async_solver;
 pub mod body_state;
 /// Live gait-visualization wire format (see [`viz::GaitVizFrame`]).
 pub mod viz;
+#[cfg(feature = "viz-sub")]
+pub mod viz_sub;
 pub mod config;
 pub mod controller;
 pub mod footstep;
