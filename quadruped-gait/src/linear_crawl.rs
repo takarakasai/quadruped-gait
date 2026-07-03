@@ -1027,7 +1027,7 @@ mod tests {
     /// no phantom swing motion while the robot is held still.
     #[test]
     fn standstill_freezes_at_all_stance() {
-        let mut cfg = CrawlR001Cfg();
+        let mut cfg = crawl_r001_cfg();
         cfg.speed_mps = 0.0;
         let mut c = LinearCrawlController::new(dummy_kin(), cfg);
         // At t=0, cycle_phase=0 is the 4-support window of sub-cycle 0,
@@ -1053,7 +1053,7 @@ mod tests {
     /// controller must NOT teleport the foot to the ground.
     #[test]
     fn stop_request_completes_current_swing() {
-        let mut c = LinearCrawlController::new(dummy_kin(), CrawlR001Cfg());
+        let mut c = LinearCrawlController::new(dummy_kin(), crawl_r001_cfg());
         c.set_speed(0.1);
         // Spin up enough to enter a swing window. With α=0.5 the first
         // swing starts at phase 0.125 of cycle 0 (=0.125 s for T=1.0).
@@ -1088,7 +1088,7 @@ mod tests {
     fn resume_from_standstill_continues_cycle() {
         // Soft-start is irrelevant here — disable it so the dt
         // advance equality below is exact.
-        let mut cfg = CrawlR001Cfg();
+        let mut cfg = crawl_r001_cfg();
         cfg.speed_mps = 0.0;
         cfg.soft_start_duration_s = 0.0;
         let mut c = LinearCrawlController::new(dummy_kin(), cfg);
@@ -1107,7 +1107,7 @@ mod tests {
     /// Helper: builder for a non-default-speed config used by the
     /// standstill tests above (Default has `speed_mps = 0.1`, but the
     /// tests want to override it independently).
-    fn CrawlR001Cfg() -> LinearCrawlConfig {
+    fn crawl_r001_cfg() -> LinearCrawlConfig {
         LinearCrawlConfig::default()
     }
 

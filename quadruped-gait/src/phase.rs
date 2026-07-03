@@ -263,7 +263,6 @@ impl ContactDrivenPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::GaitType;
 
     fn pg() -> PhaseGenerator {
         PhaseGenerator::new(GaitConfig::trot())
