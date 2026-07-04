@@ -3,6 +3,8 @@ name = "legged-estimation"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+keywords = ["robotics", "legged", "estimation", "kalman", "odometry"]
+categories = ["science::robotics"]
 authors = ["Takara Kasai <takara.kasai@gmail.com>"]
 description = "State estimation for legged robots: 18-state linear Kalman filter (legged_control port), IMU attitude estimation, and contact-based leg odometry. Simulator- and GUI-independent."
 

@@ -2,8 +2,11 @@
 name = "quadruped-gait"
 version = "0.1.0"
 edition = "2024"
-description = "Quadruped gait generation library (CHAMP-equivalent), built on misarta primitives"
-license = "MIT OR Apache-2.0"
+description = "Quadruped gait generation and locomotion control: CHAMP-equivalent trot / linear-crawl planners, SRBD / centroidal / full-centroidal MPC, hierarchical whole-body control, and a live gait-viz wire format. Built on misarta rigid-body primitives."
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+keywords = ["robotics", "quadruped", "gait", "mpc", "locomotion"]
+categories = ["science::robotics"]
 
 [dependencies]
 log = "0.4"
