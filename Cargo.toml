@@ -4,5 +4,5 @@
 # git dependency; the behavioural walk-regression suite (MuJoCo) stays
 # in the articara repo, which consumes these crates via git.
 [workspace]
-members = ["quadruped-gait", "legged-estimation"]
+members = ["quadruped-gait", "legged-estimation", "policy-runtime"]
 resolver = "3"

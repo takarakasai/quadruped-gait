@@ -1,0 +1,18 @@
+[package]
+name = "policy-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Deploy-side runtime for RL locomotion policies exported to ONNX: observation assembly (Isaac joint order, projected gravity), tract-onnx inference, action mapping with hardware limits, plausibility screening, and CSV logging. Shared by the Go2 hardware runner and the MuJoCo sim-deploy path so both drive the identical I/O code."
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+keywords = ["robotics", "onnx", "quadruped", "deployment", "rl"]
+categories = ["science::robotics"]
+
+[dependencies]
+# Pure-Rust ONNX runtime — no C deps, cross-compiles cleanly to the Go2's
+# aarch64.
+tract-onnx = "0.21"
+
+[dev-dependencies]
+# Reference implementation for the gravity-projection cross-check.
+nalgebra = "0.34.2"
