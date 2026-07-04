@@ -54,6 +54,8 @@
 
 // ── Public modules (the front door, together with the re-exports below) ──
 
+/// Metadata-driven experimental research knobs (see [`exp::ExpKey`]).
+pub mod exp;
 /// Live gait-visualization wire format (see [`viz::GaitVizFrame`]).
 pub mod viz;
 #[cfg(feature = "viz-sub")]
@@ -97,6 +99,7 @@ pub use config::{
 // name (`GaitController`) and the new explicit name (`ChampGaitController`)
 // so older callers keep working while new code can name the choice.
 pub use controller::{ControllerOutput, GaitController, GaitController as ChampGaitController, LegOutput};
+pub use exp::{ExpError, ExpKey, ExpKind, ExpValue};
 pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
 pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolution};
 pub use mpc_controller::capture_point_step;
