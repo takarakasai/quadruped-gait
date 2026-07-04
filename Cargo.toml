@@ -1,0 +1,8 @@
+# Virtual workspace for the quadruped locomotion stack, split out of the
+# articara repo (2026-07): `quadruped-gait` (gait generation + MPC) and
+# `legged-estimation` (state estimation). Both consume `misarta` as a
+# git dependency; the behavioural walk-regression suite (MuJoCo) stays
+# in the articara repo, which consumes these crates via git.
+[workspace]
+members = ["quadruped-gait", "legged-estimation"]
+resolver = "3"
