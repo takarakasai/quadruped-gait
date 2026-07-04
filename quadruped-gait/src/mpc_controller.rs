@@ -63,6 +63,7 @@ use crate::swing_traj::swing_position;
 /// the legacy 0.175 (`LEGACY_CAPTURE_POINT_GAIN_S`) or 0.0 for A/B
 /// comparison.
 pub const DEFAULT_CAPTURE_POINT_GAIN_S: f64 = 0.05;
+#[cfg(test)] // test-only reference implementation / helper
 /// Legacy LIP-derived capture-point gain (= √(h/g) for h ≈ 0.30 m,
 /// g = 9.81 m/s²). Kept as a named constant so the GUI / scripts can
 /// restore the old behaviour for comparison without hard-coding a

@@ -52,32 +52,43 @@
 //! See `tests/` for unit-tested behaviour and the `articara` GUI for an
 //! interactive driver.
 
-pub mod async_solver;
-pub mod body_state;
+// ── Public modules (the front door, together with the re-exports below) ──
+
 /// Live gait-visualization wire format (see [`viz::GaitVizFrame`]).
 pub mod viz;
 #[cfg(feature = "viz-sub")]
 pub mod viz_sub;
-pub mod config;
-pub mod controller;
-pub mod footstep;
-pub mod linear_crawl;
-pub mod autodetect;
-pub mod generator;
-pub mod centroidal_controller;
-pub mod centroidal_mpc;
-pub mod full_centroidal_controller;
-pub mod full_centroidal_mpc;
-pub mod ik;
-pub mod mpc_controller;
-pub mod mpc_reference;
-pub mod phase;
-pub mod srbd_mpc;
-pub mod swing_traj;
+/// Hierarchical whole-body-control QP solver.
 pub mod wbc;
 
+// ── Internal modules ──
+//
+// Private on purpose: consumers (the articara GUI, go2-gait-runner,
+// legged-estimation) go through the curated re-exports below, so the
+// solver / controller internals can be reshaped without breaking them.
+
+mod async_solver;
+mod autodetect;
+mod body_state;
+mod centroidal_controller;
+mod centroidal_mpc;
+mod config;
+mod controller;
+mod footstep;
+mod full_centroidal_controller;
+mod full_centroidal_mpc;
+mod generator;
+mod ik;
+mod linear_crawl;
+mod mpc_controller;
+mod mpc_reference;
+mod phase;
+mod srbd_mpc;
+mod swing_traj;
+
+// ── Curated re-exports ──
+
 pub use autodetect::{auto_detect_kinematics_config, auto_detect_leg_kinematics, joint_signs};
-pub use body_state::BodyState;
 pub use config::{
     GaitConfig, GaitType, KinematicsConfig, KneePattern, LegId, LegKinematics,
     VelocityCmd, DEFAULT_FOOT_LINKS,
@@ -86,27 +97,16 @@ pub use config::{
 // name (`GaitController`) and the new explicit name (`ChampGaitController`)
 // so older callers keep working while new code can name the choice.
 pub use controller::{ControllerOutput, GaitController, GaitController as ChampGaitController, LegOutput};
-pub use linear_crawl::{LinearCrawlConfig, LinearCrawlController, LinearCrawlOutput};
-pub use footstep::{compute_footstep, Footstep};
 pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
 pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolution};
-pub use mpc_controller::MpcGaitController;
+pub use mpc_controller::capture_point_step;
 pub use mpc_reference::JointReference;
-pub use phase::{ContactDrivenPhase, PhaseGenerator, PhaseState};
-pub use centroidal_controller::CentroidalMpcGaitController;
-pub use centroidal_mpc::{
-    centroidal_dynamics, predicted_base_accel_world_centroidal, CentroidalContactSchedule,
-    CentroidalFootOffsets, CentroidalInput, CentroidalMpc, CentroidalMpcConfig,
-    CentroidalMpcSolution, CentroidalReference, CentroidalState,
-};
-pub use full_centroidal_controller::{FullCentroidalMpcGaitController, GoalPoseWorld};
-pub use full_centroidal_mpc::{
-    full_centroidal_dynamics, FullCentroidalContactSchedule, FullCentroidalInput,
-    FullCentroidalMpc, FullCentroidalMpcConfig, FullCentroidalMpcSolution,
-    FullCentroidalReference, FullCentroidalState,
-};
-pub use srbd_mpc::{
-    predicted_base_accel_world, ContactSchedule, FootOffsets, MpcSolution,
-    ReferenceTrajectory, SrbdMpc, SrbdMpcConfig, SrbdState,
-};
-pub use swing_traj::{stance_position, swing_position};
+pub use phase::ContactDrivenPhase;
+// MPC tuning configs + the solution / prediction types the GUI reads
+// back for overlays. The solvers themselves (SrbdMpc / CentroidalMpc /
+// FullCentroidalMpc) and their input / reference / schedule types are
+// internal.
+pub use centroidal_mpc::{predicted_base_accel_world_centroidal, CentroidalMpcConfig};
+pub use full_centroidal_controller::GoalPoseWorld;
+pub use full_centroidal_mpc::FullCentroidalMpcConfig;
+pub use srbd_mpc::{predicted_base_accel_world, MpcSolution, SrbdMpcConfig, SrbdState};

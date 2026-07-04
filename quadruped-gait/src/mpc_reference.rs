@@ -35,7 +35,6 @@
 
 use nalgebra::Vector3;
 
-use crate::config::LegId;
 use crate::controller::ControllerOutput;
 
 /// Per-leg per-actuator joint reference in **URDF sign convention**
@@ -107,12 +106,6 @@ impl JointReference {
     }
 }
 
-/// Convenience: index helper that maps `slot` (FL=0, FR=1, RL=2, RR=3)
-/// to the corresponding [`LegId`] (so callers iterating both
-/// representations don't have to maintain a parallel mapping).
-pub fn leg_id_for_slot(slot: usize) -> LegId {
-    LegId::ALL[slot]
-}
 
 // Suppress unused-warning when `Vector3` is only conditionally used.
 #[allow(dead_code)]

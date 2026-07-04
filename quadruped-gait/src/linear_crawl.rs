@@ -186,7 +186,9 @@ pub struct LinearCrawlOutput {
     /// legs. Indexed `[FL, FR, RL, RR]`.
     pub in_swing: [bool; 4],
     /// Trunk world target pose `(x, y, z)`. Orientation is the identity
-    /// rotation by construction.
+    /// rotation by construction. Diagnostic output; currently only the
+    /// unit tests read it back.
+    #[allow(dead_code)]
     pub trunk_world_xyz: [f64; 3],
     /// Per-leg body-frame foot target before IK, useful for diagnostics
     /// / plotting. Indexed `[FL, FR, RL, RR]`.
@@ -289,24 +291,14 @@ impl LinearCrawlController {
         self.wall_t = 0.0;
         self.holding = false;
     }
-    /// Equivalent to [`Self::reset`]. Kept for parity with the
-    /// existing `GaitController::enable` ergonomics.
-    pub fn enable(&mut self) {
-        self.t = 0.0;
-        self.wall_t = 0.0;
-        self.holding = false;
-    }
 
+    #[cfg(test)] // test-only reference implementation / helper
     /// `true` while the controller has frozen the cycle (= robot is
     /// standing still pending the next non-zero `set_speed` call).
     pub fn is_holding(&self) -> bool {
         self.holding
     }
 
-    /// Trunk world X target at the current time.
-    pub fn trunk_world_x(&self) -> f64 {
-        self.effective_speed() * self.t
-    }
 
     /// Forward speed the planner actually uses: the commanded
     /// [`LinearCrawlConfig::speed_mps`], reduced if necessary so the peak

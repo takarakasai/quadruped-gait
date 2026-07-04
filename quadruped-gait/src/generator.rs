@@ -8,7 +8,7 @@
 //!   Bezier-swing pipeline. Open-loop in body frame, hands joint angle
 //!   targets to a position-controlled actuator stack. Same code path
 //!   articara has shipped since v0.
-//! - [`crate::MpcGaitController`] — adds the **capture-point feedback**
+//! - [`crate::mpc_controller::MpcGaitController`] — adds the **capture-point feedback**
 //!   term (`√(h/g) · (v_actual − v_cmd)`) to the Raibert footstep
 //!   formula plus a multi-step LIP horizon for the next swing target,
 //!   making the gait closed-loop on the host's reported body velocity.
@@ -29,7 +29,7 @@ use crate::controller::{ControllerOutput, GaitController as ChampGaitController}
 /// Methods in the **observation** group ([`Self::set_body_state_observed`])
 /// are no-ops for open-loop controllers ([`ChampGaitController`]) and
 /// drive the feedback term in closed-loop ones
-/// ([`crate::MpcGaitController`]). Hosts can call them
+/// ([`crate::mpc_controller::MpcGaitController`]). Hosts can call them
 /// unconditionally without checking the active mode.
 pub trait GaitGenerator {
     /// Advance the gait by `dt` seconds; return the per-leg outputs
@@ -193,9 +193,9 @@ impl GaitMode {
 /// model.
 pub enum AnyGaitController {
     Champ(ChampGaitController),
-    Mpc(crate::MpcGaitController),
-    CentroidalSrbd(crate::CentroidalMpcGaitController),
-    FullCentroidal(crate::FullCentroidalMpcGaitController),
+    Mpc(crate::mpc_controller::MpcGaitController),
+    CentroidalSrbd(crate::centroidal_controller::CentroidalMpcGaitController),
+    FullCentroidal(crate::full_centroidal_controller::FullCentroidalMpcGaitController),
     LinearCrawl(crate::linear_crawl::LinearCrawlGen),
 }
 
@@ -206,13 +206,13 @@ impl AnyGaitController {
                 AnyGaitController::Champ(ChampGaitController::new(cfg, kin))
             }
             GaitMode::Mpc => {
-                AnyGaitController::Mpc(crate::MpcGaitController::new(cfg, kin))
+                AnyGaitController::Mpc(crate::mpc_controller::MpcGaitController::new(cfg, kin))
             }
             GaitMode::CentroidalSrbd => AnyGaitController::CentroidalSrbd(
-                crate::CentroidalMpcGaitController::new(cfg, kin),
+                crate::centroidal_controller::CentroidalMpcGaitController::new(cfg, kin),
             ),
             GaitMode::FullCentroidal => AnyGaitController::FullCentroidal(
-                crate::FullCentroidalMpcGaitController::new(cfg, kin),
+                crate::full_centroidal_controller::FullCentroidalMpcGaitController::new(cfg, kin),
             ),
             GaitMode::LinearCrawl => AnyGaitController::LinearCrawl(
                 crate::linear_crawl::LinearCrawlGen::new(cfg, kin),

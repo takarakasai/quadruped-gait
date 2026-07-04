@@ -66,7 +66,9 @@
 
 use clarabel::algebra::CscMatrix;
 use clarabel::solver::{DefaultSettings, DefaultSolver, IPSolver, SolverStatus, SupportedConeT};
-use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix3, Vector3};
+#[cfg(test)]
+use nalgebra::Rotation3;
 
 /// 12-dim centroidal state.
 ///
@@ -130,6 +132,7 @@ impl CentroidalState {
     }
 }
 
+#[cfg(test)] // test-only reference implementation / helper
 /// 12-dim centroidal input: world-frame GRF per foot.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CentroidalInput {
@@ -138,6 +141,7 @@ pub struct CentroidalInput {
     pub grfs_world: [Vector3<f64>; 4],
 }
 
+#[cfg(test)] // test-only reference implementation / helper
 impl CentroidalInput {
     /// Pack into a flat 12-vector.
     pub fn to_vec12(&self) -> [f64; 12] {
@@ -258,6 +262,7 @@ impl Default for CentroidalMpcConfig {
     }
 }
 
+#[cfg(test)] // test-only reference implementation / helper
 /// Continuous-time centroidal-SRBD dynamics: ẋ = f(x, u).
 ///
 /// Type-1 SRBD: centroidal inertia is treated as constant
@@ -339,6 +344,7 @@ pub fn centroidal_dynamics(
     }
 }
 
+#[cfg(test)] // test-only reference implementation / helper
 /// Convert a world-frame angular velocity into ZYX-Euler-angle
 /// derivatives. Convention: `R = R_z(yaw) · R_y(pitch) · R_x(roll)`,
 /// `euler = [roll, pitch, yaw]`.
@@ -450,6 +456,7 @@ pub struct CentroidalReference {
 }
 
 impl CentroidalReference {
+    #[cfg(test)] // test-only reference implementation / helper
     /// Static reference: constant `s` over the horizon. Used for hover
     /// or hold-position tests.
     pub fn constant(s: CentroidalState, horizon_steps: usize) -> Self {
@@ -525,6 +532,7 @@ pub struct CentroidalContactSchedule {
 }
 
 impl CentroidalContactSchedule {
+    #[cfg(test)] // test-only reference implementation / helper
     pub fn all_stance(horizon_steps: usize) -> Self {
         Self {
             is_stance: [

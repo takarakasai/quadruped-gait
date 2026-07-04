@@ -412,6 +412,7 @@ impl FullCentroidalMpcConfig {
     }
 }
 
+#[cfg(test)] // test-only reference implementation / helper
 /// Continuous-time full-centroidal dynamics: ẋ = f(x, u).
 ///
 /// Differs from [`crate::centroidal_mpc::centroidal_dynamics`] in three
@@ -672,18 +673,6 @@ pub struct FullCentroidalReference {
     pub inputs: Vec<FullCentroidalInput>,
 }
 
-impl FullCentroidalReference {
-    /// Constant reference: same state and zero input over the horizon.
-    /// Useful for unit tests; production code fills joint_q from IK
-    /// per step.
-    pub fn constant(state: FullCentroidalState, horizon_steps: usize) -> Self {
-        Self {
-            states: vec![state; horizon_steps],
-            inputs: vec![FullCentroidalInput::default(); horizon_steps],
-        }
-    }
-}
-
 /// Per-leg per-step stance schedule (same shape as the 12-state version).
 ///
 /// `swing_z_velocity` is the per-step planned world-frame vertical foot
@@ -727,6 +716,7 @@ pub struct FullCentroidalContactSchedule {
 }
 
 impl FullCentroidalContactSchedule {
+    #[cfg(test)] // test-only reference implementation / helper
     pub fn all_stance(horizon_steps: usize) -> Self {
         Self {
             is_stance: [

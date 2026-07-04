@@ -36,6 +36,7 @@
 
 use nalgebra::Vector3;
 
+#[cfg(test)] // test-only reference implementation / helper
 /// Stance foot trajectory: a straight line from `lift_off` to `touch_down`.
 ///
 /// `frac` is the leg's stance sub-phase, 0 → just hit the ground,

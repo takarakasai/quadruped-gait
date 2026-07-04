@@ -49,7 +49,6 @@ use clarabel::solver::{
 };
 use nalgebra::{DMatrix, DVector, Vector3};
 
-use crate::config::LegId;
 
 /// 13-dim SRBD state.
 #[derive(Clone, Copy, Debug, Default)]
@@ -208,6 +207,7 @@ pub struct ContactSchedule {
 }
 
 impl ContactSchedule {
+    #[cfg(test)] // test-only reference implementation / helper
     /// All four feet in stance for every step (used as a sanity-check
     /// fallback / initial guess when phase data isn't available).
     pub fn all_stance(horizon_steps: usize) -> Self {
@@ -230,6 +230,7 @@ pub struct ReferenceTrajectory {
 }
 
 impl ReferenceTrajectory {
+    #[cfg(test)] // test-only reference implementation / helper
     /// Constant-state reference (everything stays at `s` over the
     /// horizon). Useful for hover / standing.
     pub fn constant(s: SrbdState, horizon_steps: usize) -> Self {
@@ -1008,8 +1009,6 @@ fn dense_to_csc_full(a: &DMatrix<f64>) -> CscMatrix<f64> {
 
 // ─── Convenience helpers ──────────────────────────────────────────────
 
-/// Map per-leg outputs to the canonical [FL, FR, RL, RR] slot.
-pub const LEG_SLOTS: [LegId; 4] = [LegId::FL, LegId::FR, LegId::RL, LegId::RR];
 
 // Trait bound to satisfy clarabel's generics — sanity check that f64
 // satisfies it; never actually called.
