@@ -1,0 +1,23 @@
+name: CI
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Warning-zero policy: any rustc warning in this repo is a regression.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (workspace, all targets, all features)
+        run: cargo check --workspace --all-targets --all-features
+      - name: Test
+        run: cargo test --workspace --all-features
+      # NOTE: this repo carries unit tests only. The behavioural
+      # walk-regression net (MuJoCo) lives in the articara repo, which
+      # consumes these crates — breaking changes surface there.
