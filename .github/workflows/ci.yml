@@ -21,3 +21,25 @@ jobs:
       # NOTE: this repo carries unit tests only. The behavioural
       # walk-regression net (MuJoCo) lives in the articara repo, which
       # consumes these crates — breaking changes surface there.
+
+  # Workspace coverage via cargo-llvm-cov; uploaded to Codecov over
+  # OIDC (no token secret). Unit-level only — the MuJoCo behavioural
+  # suites in the articara repo are not counted here.
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure coverage
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          use_oidc: true

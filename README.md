@@ -1,6 +1,6 @@
 # quadruped-gait
 
-[![CI](https://github.com/takarakasai/quadruped-gait/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/quadruped-gait/actions/workflows/ci.yml)
+[![CI](https://github.com/takarakasai/quadruped-gait/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/takarakasai/quadruped-gait/actions/workflows/ci.yml) [![coverage](https://codecov.io/gh/takarakasai/quadruped-gait/graph/badge.svg)](https://codecov.io/gh/takarakasai/quadruped-gait)
 
 Quadruped locomotion stack for [articara](https://github.com/takarakasai/articara)
 and [go2-gait-runner](https://github.com/takarakasai/go2-gait-runner):
