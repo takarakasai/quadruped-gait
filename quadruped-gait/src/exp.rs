@@ -322,7 +322,7 @@ mod tests {
         }
     }
 
-    fn build_fullc() -> AnyGaitController {
+    pub(super) fn build_fullc() -> AnyGaitController {
         AnyGaitController::new(GaitMode::FullCentroidal, GaitConfig::trot(), build_kin())
     }
 
@@ -359,5 +359,241 @@ mod tests {
         let c = AnyGaitController::new(GaitMode::Champ, GaitConfig::trot(), build_kin());
         assert!(c.experimental_keys().is_empty());
         assert_eq!(c.get_experimental("warm_start"), None);
+    }
+}
+
+// ═════════════════════════ Presets ══════════════════════════════════════
+
+/// A named snapshot of experimental-knob values.
+///
+/// Presets make a tuned knob combination reproducible across sessions
+/// and hosts: the GUI saves the current Experimental section under a
+/// name, and the headless sweeper / runner recalls it by name. Values
+/// are stored per key so a preset written against one controller
+/// version applies cleanly to a newer one (unknown keys are reported,
+/// not fatal).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpPreset {
+    pub name: String,
+    /// `(key, value)` pairs in file order.
+    pub values: Vec<(String, ExpValue)>,
+}
+
+impl AnyGaitController {
+    /// Snapshot the current experimental-knob values as a preset.
+    pub fn snapshot_experimental(&self, name: impl Into<String>) -> ExpPreset {
+        let values = self
+            .experimental_keys()
+            .iter()
+            .filter_map(|k| self.get_experimental(k.key).map(|v| (k.key.to_string(), v)))
+            .collect();
+        ExpPreset {
+            name: name.into(),
+            values,
+        }
+    }
+
+    /// Apply a preset to the active controller. Returns the number of
+    /// knobs applied plus the keys that were skipped (unknown to the
+    /// current mode / controller version, or wrong value kind) — the
+    /// caller decides whether skips are worth surfacing.
+    pub fn apply_experimental(&mut self, preset: &ExpPreset) -> (usize, Vec<String>) {
+        let mut applied = 0;
+        let mut skipped = Vec::new();
+        for (key, value) in &preset.values {
+            match self.set_experimental(key, *value) {
+                Ok(()) => applied += 1,
+                Err(_) => skipped.push(key.clone()),
+            }
+        }
+        (applied, skipped)
+    }
+}
+
+/// Replace the preset with the same name, or append. Keeps file order
+/// stable for the existing entries.
+pub fn upsert_preset(presets: &mut Vec<ExpPreset>, preset: ExpPreset) {
+    match presets.iter_mut().find(|p| p.name == preset.name) {
+        Some(slot) => *slot = preset,
+        None => presets.push(preset),
+    }
+}
+
+/// Serialise presets to the on-disk text form.
+///
+/// The format is a TOML subset kept hand-parsable so this crate stays
+/// dependency-free:
+///
+/// ```text
+/// # quadruped-gait experimental presets
+/// [lateral-robust]
+/// transition_fraction = 0.05
+/// transition_enforce_constraint = true
+/// ```
+///
+/// One `[section]` per preset; each line is `key = true|false|<f64>`.
+pub fn format_presets(presets: &[ExpPreset]) -> String {
+    let mut s = String::from("# quadruped-gait experimental presets\n");
+    for p in presets {
+        s.push_str(&format!("\n[{}]\n", p.name));
+        for (key, value) in &p.values {
+            match value {
+                ExpValue::Bool(b) => s.push_str(&format!("{key} = {b}\n")),
+                ExpValue::F64(v) => {
+                    // Keep integral values readable but unambiguously
+                    // float-typed on re-parse (`1.0`, not `1`).
+                    if v.fract() == 0.0 && v.is_finite() {
+                        s.push_str(&format!("{key} = {v:.1}\n"));
+                    } else {
+                        s.push_str(&format!("{key} = {v}\n"));
+                    }
+                }
+            }
+        }
+    }
+    s
+}
+
+/// Parse the text form produced by [`format_presets`] (see there for
+/// the grammar). Unknown *keys* are kept — validity against a concrete
+/// controller is [`AnyGaitController::apply_experimental`]'s job — but
+/// malformed *syntax* is an error with a line number.
+pub fn parse_presets(text: &str) -> Result<Vec<ExpPreset>, String> {
+    let mut presets: Vec<ExpPreset> = Vec::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(format!("line {}: empty preset name", lineno + 1));
+            }
+            presets.push(ExpPreset {
+                name: name.to_string(),
+                values: Vec::new(),
+            });
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("line {}: expected 'key = value': {raw}", lineno + 1));
+        };
+        let Some(preset) = presets.last_mut() else {
+            return Err(format!(
+                "line {}: key/value before any [preset] section",
+                lineno + 1
+            ));
+        };
+        let key = key.trim().to_string();
+        let value = value.trim();
+        let value = match value {
+            "true" => ExpValue::Bool(true),
+            "false" => ExpValue::Bool(false),
+            v => ExpValue::F64(v.parse::<f64>().map_err(|e| {
+                format!("line {}: bad value '{v}' for '{key}': {e}", lineno + 1)
+            })?),
+        };
+        preset.values.push((key, value));
+    }
+    Ok(presets)
+}
+
+/// Load presets from a file. A missing file is an empty preset list
+/// (the natural first-run state), not an error.
+pub fn load_presets(path: &std::path::Path) -> Result<Vec<ExpPreset>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    parse_presets(&text)
+}
+
+/// Save presets to a file (overwrites).
+pub fn save_presets(path: &std::path::Path, presets: &[ExpPreset]) -> Result<(), String> {
+    std::fs::write(path, format_presets(presets))
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::tests::build_fullc;
+    use super::*;
+
+    #[test]
+    fn presets_round_trip_through_text() {
+        let presets = vec![
+            ExpPreset {
+                name: "lateral-robust".into(),
+                values: vec![
+                    ("transition_fraction".into(), ExpValue::F64(0.05)),
+                    ("transition_enforce_constraint".into(), ExpValue::Bool(true)),
+                    ("friction_cone_slack_penalty".into(), ExpValue::F64(1000.0)),
+                ],
+            },
+            ExpPreset {
+                name: "baseline".into(),
+                values: vec![("warm_start".into(), ExpValue::Bool(false))],
+            },
+        ];
+        let text = format_presets(&presets);
+        let back = parse_presets(&text).unwrap();
+        assert_eq!(back, presets);
+    }
+
+    #[test]
+    fn parse_rejects_malformed_lines() {
+        assert!(parse_presets("[ok]\nnot a kv line").is_err());
+        assert!(parse_presets("orphan = 1.0").is_err());
+        assert!(parse_presets("[]\n").is_err());
+        assert!(parse_presets("[ok]\nkey = maybe").is_err());
+    }
+
+    #[test]
+    fn snapshot_apply_round_trip_on_controller() {
+        let mut c = build_fullc();
+        c.set_experimental("transition_fraction", ExpValue::F64(0.05))
+            .unwrap();
+        c.set_experimental("transition_enforce_constraint", ExpValue::Bool(true))
+            .unwrap();
+        let preset = c.snapshot_experimental("tuned");
+        assert!(!preset.values.is_empty());
+
+        // Fresh controller: apply and compare every knob.
+        let mut fresh = build_fullc();
+        let (applied, skipped) = fresh.apply_experimental(&preset);
+        assert_eq!(applied, preset.values.len());
+        assert_eq!(skipped, Vec::<String>::new());
+        for (key, value) in &preset.values {
+            assert_eq!(fresh.get_experimental(key), Some(*value), "key {key}");
+        }
+    }
+
+    #[test]
+    fn apply_reports_unknown_keys_without_failing() {
+        let mut c = build_fullc();
+        let preset = ExpPreset {
+            name: "future".into(),
+            values: vec![
+                ("warm_start".into(), ExpValue::Bool(true)),
+                ("knob_from_the_future".into(), ExpValue::F64(1.0)),
+            ],
+        };
+        let (applied, skipped) = c.apply_experimental(&preset);
+        assert_eq!(applied, 1);
+        assert_eq!(skipped, vec!["knob_from_the_future".to_string()]);
+    }
+
+    #[test]
+    fn upsert_replaces_by_name() {
+        let mut v = vec![ExpPreset { name: "a".into(), values: vec![] }];
+        upsert_preset(&mut v, ExpPreset {
+            name: "a".into(),
+            values: vec![("warm_start".into(), ExpValue::Bool(true))],
+        });
+        upsert_preset(&mut v, ExpPreset { name: "b".into(), values: vec![] });
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].values.len(), 1);
     }
 }

@@ -99,7 +99,10 @@ pub use config::{
 // name (`GaitController`) and the new explicit name (`ChampGaitController`)
 // so older callers keep working while new code can name the choice.
 pub use controller::{ControllerOutput, GaitController, GaitController as ChampGaitController, LegOutput};
-pub use exp::{ExpError, ExpKey, ExpKind, ExpValue};
+pub use exp::{
+    format_presets, load_presets, parse_presets, save_presets, upsert_preset, ExpError, ExpKey,
+    ExpKind, ExpPreset, ExpValue,
+};
 pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
 pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolution};
 pub use mpc_controller::capture_point_step;
