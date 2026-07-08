@@ -385,17 +385,28 @@ fn right_null_space(m: &DMatrix<f64>) -> DMatrix<f64> {
     }
     let g = m.transpose() * m;
     let eig = g.symmetric_eigen();
-    // Eigenvalues are singular-values-squared. Threshold using the
-    // largest eigenvalue's square root to be invariant to scaling.
+    // Eigenvalues are singular-values-squared. Threshold **relative to
+    // the spectrum**: forming the Gram matrix `mᵀm` squares the
+    // condition number, so an exact-zero singular value surfaces as an
+    // eigenvalue near `λ_max · ε` (~1e-16·λ_max), not near 0. An
+    // absolute `(ε·σ_max)²` tol therefore fails to catch it on
+    // ill-conditioned data and *undercounts* the null space — starving
+    // lower-priority tasks of freedom. A relative `1e-9·λ_max` cleanly
+    // separates the numerically-zero eigenvalues from the genuine ones
+    // (structured robot Jacobians rank identically under either rule —
+    // the gap is far wider). An absolute floor keeps the all-zero case
+    // sane.
     let lambda_max = eig
         .eigenvalues
         .iter()
         .cloned()
         .fold(0.0_f64, f64::max)
         .max(0.0);
-    let s_max = lambda_max.sqrt();
-    let tol = (rows.max(cols) as f64) * f64::EPSILON * s_max.max(1.0);
-    let tol2 = tol * tol;
+    let abs_floor = {
+        let s = (rows.max(cols) as f64) * f64::EPSILON;
+        s * s
+    };
+    let tol2 = (1e-9 * lambda_max).max(abs_floor);
     // Collect indices of eigenvectors with eigenvalue ≈ 0.
     let kernel_cols: Vec<usize> = eig
         .eigenvalues
