@@ -12,6 +12,7 @@ categories = ["science::robotics"]
 log = "0.4"
 nalgebra = "0.34.2"
 misarta = { git = "https://github.com/takarakasai/misarta.git", features = ["clarabel"] }
+misa-wbc = { git = "https://github.com/takarakasai/misa-wbc.git" }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 zenoh = { version = "1.9", optional = true }

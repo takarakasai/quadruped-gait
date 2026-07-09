@@ -26,15 +26,15 @@
 //! See [`doc/mpc_wbc_gait_control.md`](../../../doc/mpc_wbc_gait_control.md)
 //! for the full design doc.
 
-pub mod dims;
-pub mod ho_qp;
-pub mod task;
 pub mod tasks;
 mod wbc;
 
-pub use dims::WbcDims;
-pub use ho_qp::{HoQp, WarmStart};
-pub use task::Task;
+// The HoQP core (dims / HoQp / Task / WarmStart) now lives in the
+// standalone, model-agnostic `misa-wbc` crate; this module keeps the
+// quadruped-specific task formulations (`tasks`) and the assembled
+// per-tick solve (`wbc`). Re-exported so the `tasks` builders and
+// downstream callers keep referring to `wbc::{Task, WbcDims, ...}`.
+pub use misa_wbc::{HoQp, Task, WarmStart, WbcDims};
 pub use wbc::{
     solve, solve_warm, solve_warm_with_weights, WbcInputs, WbcSolution, WbcWarmStart,
     WbcWeights,

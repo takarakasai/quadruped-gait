@@ -1838,6 +1838,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "misa-wbc"
+version = "0.1.0"
+source = "git+https://github.com/takarakasai/misa-wbc.git#3e6247c549435440d0e8650f7e8a2420867f45a9"
+dependencies = [
+ "clarabel",
+ "nalgebra",
+]
+
+[[package]]
 name = "misarta"
 version = "0.1.0"
 source = "git+https://github.com/takarakasai/misarta.git#e2983f36e10650b599f0f6d9ea30ce131e1249fb"
@@ -2455,6 +2464,7 @@ dependencies = [
  "approx",
  "clarabel",
  "log",
+ "misa-wbc",
  "misarta",
  "nalgebra",
  "serde",

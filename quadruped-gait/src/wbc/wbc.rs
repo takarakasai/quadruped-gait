@@ -13,7 +13,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use super::ho_qp::WarmStart;
+use super::WarmStart;
 use super::tasks::{
     base_accel, contact_force, floating_base_eom, friction_cone, no_contact_motion,
     swing_leg, tau_gravity, torque_limits,
