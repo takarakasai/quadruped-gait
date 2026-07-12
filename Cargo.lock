@@ -1840,7 +1840,7 @@ dependencies = [
 [[package]]
 name = "misa-wbc"
 version = "0.1.0"
-source = "git+https://github.com/takarakasai/misa-wbc.git#3e6247c549435440d0e8650f7e8a2420867f45a9"
+source = "git+https://github.com/takarakasai/misa-wbc.git#2941ae22b2c11027761cc9d854828c66bc7a8440"
 dependencies = [
  "clarabel",
  "nalgebra",

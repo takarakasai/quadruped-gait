@@ -26,6 +26,7 @@
 //! See [`doc/mpc_wbc_gait_control.md`](../../../doc/mpc_wbc_gait_control.md)
 //! for the full design doc.
 
+pub mod solver;
 pub mod tasks;
 mod wbc;
 
@@ -35,6 +36,8 @@ mod wbc;
 // per-tick solve (`wbc`). Re-exported so the `tasks` builders and
 // downstream callers keep referring to `wbc::{Task, WbcDims, ...}`.
 pub use misa_wbc::{HoQp, Task, WarmStart, WbcDims};
+pub use solver::{Formulation, HqpStrategy, QpSolver, WbcSolver};
+pub use misa_wbc::SolveConfig;
 pub use wbc::{
     solve, solve_warm, solve_warm_with_weights, WbcInputs, WbcSolution, WbcWarmStart,
     WbcWeights,
