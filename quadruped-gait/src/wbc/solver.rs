@@ -21,7 +21,7 @@ use super::wbc::{WbcInputs, WbcSolution, WbcWarmStart, WbcWeights};
 
 /// A persistent, mode-switchable WBC solver over the misa-wbc task
 /// catalogue. Construct once, call [`WbcSolver::solve`] every tick.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct WbcSolver {
     formulation: Formulation,
     cfg: SolveConfig,
