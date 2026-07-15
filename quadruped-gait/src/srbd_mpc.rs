@@ -319,6 +319,33 @@ pub struct MpcSolution {
     pub solved: bool,
 }
 
+/// The condensed QP for one [`SrbdMpc::solve`] tick, in plain dense
+/// nalgebra form — see [`SrbdMpc::build_qp`]. `min ½ Uᵀ·p·U + qᵀ·U`
+/// subject to `a_dense[0..n_eq]·U = b_vec[0..n_eq]` (swing-leg
+/// zero-force) and `a_dense[n_eq..n_eq+n_ineq]·U ≤ b_vec[n_eq..]`
+/// (friction pyramid + force bounds). `a_x`/`b_u`/`x_now` are kept
+/// only so a solution `U` can be decoded back into predicted body
+/// states (`X = a_x·x_now + b_u·U`); they play no part in the QP
+/// itself.
+#[derive(Clone, Debug)]
+pub struct SrbdQpSnapshot {
+    pub p: DMatrix<f64>,
+    pub q: DVector<f64>,
+    /// Stacked equality-then-inequality rows (see the struct doc for
+    /// the row split).
+    pub a_dense: DMatrix<f64>,
+    pub b_vec: Vec<f64>,
+    pub n_eq: usize,
+    pub n_ineq: usize,
+    /// Horizon length and per-step input dimension (12, or 24 with
+    /// `enable_foot_offset`) -- `U` has `nu * n` entries.
+    pub n: usize,
+    pub nu: usize,
+    pub a_x: DMatrix<f64>,
+    pub b_u: DMatrix<f64>,
+    pub x_now: DVector<f64>,
+}
+
 /// SRBD physics: predict the floating-base linear and angular
 /// acceleration **the MPC's GRFs would produce** at the current state.
 ///
@@ -416,13 +443,20 @@ impl SrbdMpc {
     /// step; subsequent steps are returned for diagnostic plotting
     /// but are NOT applied (Receding Horizon — only first step is
     /// committed each tick).
-    pub fn solve(
+    /// Build the condensed QP `(P, q, constraints)` for this tick
+    /// without solving it — the same data [`Self::solve`] hands to
+    /// clarabel, exposed as plain dense nalgebra matrices so any QP
+    /// backend (e.g. misa-wbc's `solve_qp`, for a cross-backend
+    /// comparison) can solve the identical problem. `solve` calls this
+    /// and does only the clarabel-specific packaging + decode from
+    /// there, so the two paths can never numerically drift apart.
+    pub fn build_qp(
         &self,
         state_now: SrbdState,
         reference: &ReferenceTrajectory,
         contact: &ContactSchedule,
         feet: &FootOffsets,
-    ) -> MpcSolution {
+    ) -> SrbdQpSnapshot {
         let n = self.cfg.horizon_steps;
         assert_eq!(reference.states.len(), n, "ref length mismatch");
         for leg in 0..4 {
@@ -562,16 +596,52 @@ impl SrbdMpc {
         //           |f_y| ≤ μ f_z
         //   swing:  f_x = f_y = f_z = 0  (equality)
         //
-        // Conventions for clarabel:
-        //   ZeroConeT(m)         : A·x − b = 0 over the first m rows
-        //   NonnegativeConeT(m)  : A·x − b ≤ 0 over the next m rows
-        //
-        // We stack equalities first, then inequalities.
-        let (a_csc, b_vec, cones) = build_constraints(&self.cfg, contact, n, nu);
+        // Stacked equalities-then-inequalities; [`Self::solve`] wraps
+        // rows `0..n_eq`/`n_eq..n_eq+n_ineq` into clarabel's
+        // ZeroConeT/NonnegativeConeT, but the split itself is backend-
+        // agnostic (`a_dense·x = b`, `a_dense·x ≤ b`).
+        let (a_dense, b_vec, n_eq, n_ineq) = build_constraints_dense(&self.cfg, contact, n, nu);
+
+        SrbdQpSnapshot {
+            p: p_dense,
+            q: q_vec,
+            a_dense,
+            b_vec,
+            n_eq,
+            n_ineq,
+            n,
+            nu,
+            a_x,
+            b_u,
+            x_now,
+        }
+    }
+
+    pub fn solve(
+        &self,
+        state_now: SrbdState,
+        reference: &ReferenceTrajectory,
+        contact: &ContactSchedule,
+        feet: &FootOffsets,
+    ) -> MpcSolution {
+        let snap = self.build_qp(state_now, reference, contact, feet);
+        let (n, nu) = (snap.n, snap.nu);
+        let nx = 13;
+        let (a_x, b_u, x_now) = (&snap.a_x, &snap.b_u, &snap.x_now);
+
+        let mut cones: Vec<clarabel::solver::SupportedConeT<f64>> = Vec::new();
+        if snap.n_eq > 0 {
+            cones.push(ZeroConeT(snap.n_eq));
+        }
+        if snap.n_ineq > 0 {
+            cones.push(NonnegativeConeT(snap.n_ineq));
+        }
+        let a_csc = dense_to_csc_full(&snap.a_dense);
+        let b_vec = snap.b_vec;
 
         // ── clarabel solve ──────────────────────────────────────────
-        let p_csc = dense_to_csc_upper(&p_dense);
-        let q_slice: Vec<f64> = q_vec.iter().copied().collect();
+        let p_csc = dense_to_csc_upper(&snap.p);
+        let q_slice: Vec<f64> = snap.q.iter().copied().collect();
         let mut settings = DefaultSettings::default();
         settings.verbose = false;
         settings.max_iter = 50;
@@ -625,7 +695,7 @@ impl SrbdMpc {
         // dynamics with the QP-optimal U: X = A_x · x_0 + B_u · U.
         // X is laid out [x_1; x_2; …; x_n] (each 13-dim).
         let u_dvec = DVector::from_vec(u_opt.clone());
-        let x_horizon = &a_x * &x_now + &b_u * &u_dvec;
+        let x_horizon = a_x * x_now + b_u * &u_dvec;
         let mut predicted_body_states = Vec::with_capacity(n);
         for k in 0..n {
             let row0 = k * nx;
@@ -852,8 +922,11 @@ fn dense_to_csc_upper(p: &DMatrix<f64>) -> CscMatrix<f64> {
     CscMatrix::new(n, n, colptr, rowval, nzval)
 }
 
-/// Build the constraint matrix A and bound vector b for the QP. The
-/// stacking order is:
+/// Build the constraint matrix in dense (equality-rows-then-
+/// inequality-rows) form. [`SrbdMpc::build_qp`] hands this straight to
+/// callers (any QP backend can consume `a_dense·x {=,≤} b_vec`
+/// directly); [`SrbdMpc::solve`] additionally wraps it into clarabel's
+/// ZeroConeT/NonnegativeConeT for its own solve. The stacking order:
 ///   1. equality rows for swing legs (f = 0)
 ///   2. inequality rows for stance legs:
 ///      - f_z ≥ 0           ⇒ -f_z ≤ 0
@@ -862,12 +935,16 @@ fn dense_to_csc_upper(p: &DMatrix<f64>) -> CscMatrix<f64> {
 ///      - −f_x − μ·f_z ≤ 0
 ///      - f_y − μ·f_z ≤ 0
 ///      - −f_y − μ·f_z ≤ 0
-fn build_constraints(
+///
+/// Returns `(a_dense, b_vec, n_eq, n_ineq)`: rows `0..n_eq` are
+/// `a_dense·x = b_vec` (swing-leg zero-force), rows `n_eq..n_eq+n_ineq`
+/// are `a_dense·x ≤ b_vec` (friction pyramid + force bounds).
+fn build_constraints_dense(
     cfg: &SrbdMpcConfig,
     contact: &ContactSchedule,
     n: usize,
     nu: usize,
-) -> (CscMatrix<f64>, Vec<f64>, Vec<clarabel::solver::SupportedConeT<f64>>) {
+) -> (DMatrix<f64>, Vec<f64>, usize, usize) {
     let total_vars = nu * n;
     let mu = cfg.friction_mu;
     let f_max = cfg.max_normal_force;
@@ -973,15 +1050,7 @@ fn build_constraints(
         }
     }
 
-    let a_csc = dense_to_csc_full(&a_dense);
-    let mut cones: Vec<clarabel::solver::SupportedConeT<f64>> = Vec::new();
-    if n_eq > 0 {
-        cones.push(ZeroConeT(n_eq));
-    }
-    if n_ineq > 0 {
-        cones.push(NonnegativeConeT(n_ineq));
-    }
-    (a_csc, b_vec, cones)
+    (a_dense, b_vec, n_eq, n_ineq)
 }
 
 /// Convert a dense matrix into clarabel's CSC format (column-major
@@ -1260,5 +1329,126 @@ mod tests {
             (total_other - weight).abs() < 0.20 * weight,
             "Σf_z (other legs) = {total_other} should still ≈ weight",
         );
+    }
+
+    /// Cross-backend performance comparison for the production trot
+    /// MPC QP: the exact same `SrbdQpSnapshot` (from `build_qp`, the
+    /// same data `solve` hands to clarabel) solved by every misa-wbc
+    /// `QpSolver` backend instead of only clarabel. This is the MPC-
+    /// scale counterpart to misa-wbc's own `formulation_bench`/
+    /// `qp_warm_bench` (per-tick WBC HoQP, n<30) -- horizon_steps=10 x
+    /// 12 GRF components gives n=120, connecting the "at what n does
+    /// IPM's iteration-count edge become a wall-clock edge" question
+    /// from misa-wbc's IPM-vs-ActiveSet scaling study
+    /// (ref/wbc_comparison.md Sec.5l, synthetic dense QPs n=5..5120)
+    /// to a *real* MPC problem instead of a random one.
+    ///
+    /// Disabled by default, same reasoning as `mpc_solve_under_25ms_at_sqp_3`:
+    /// `cargo test --release ... -- --ignored mpc_backend_bench`.
+    #[test]
+    #[ignore = "performance benchmark — run with --ignored"]
+    fn mpc_backend_bench() {
+        use misa_wbc::qp::{solve_qp, QpConfig, QpSolver};
+
+        let cfg = SrbdMpcConfig::default();
+        let n = cfg.horizon_steps;
+
+        // Representative trotting state: forward at 0.3 m/s, level,
+        // nominal stance height (matches this file's other fixtures).
+        let mut state_now = SrbdState::default();
+        state_now.position.z = 0.30;
+        state_now.linear_velocity = Vector3::new(0.3, 0.0, 0.0);
+        let reference = ReferenceTrajectory::from_constant_velocity(
+            state_now,
+            Vector3::new(0.3, 0.0, 0.0),
+            0.0,
+            &cfg,
+        );
+
+        // Diagonal-pair trot (FL+RR vs FR+RL), one full switch within
+        // the horizon -- exercises both the swing-leg equality rows
+        // and the stance-leg inequality rows in a realistic ratio,
+        // unlike the all-stance fixture the 25ms budget test above uses.
+        let half = n / 2;
+        let fl_rr_stance: Vec<bool> = (0..n).map(|k| k < half).collect();
+        let fr_rl_stance: Vec<bool> = (0..n).map(|k| k >= half).collect();
+        let contact = ContactSchedule {
+            is_stance: [
+                fl_rr_stance.clone(),
+                fr_rl_stance.clone(),
+                fr_rl_stance,
+                fl_rr_stance,
+            ],
+        };
+        let feet = FootOffsets::constant_per_leg(nominal_feet(), n);
+
+        let mpc = SrbdMpc::new(cfg);
+        let snap = mpc.build_qp(state_now, &reference, &contact, &feet);
+        eprintln!(
+            "[mpc_backend_bench] n_vars={} n_eq={} n_ineq={}",
+            snap.p.nrows(),
+            snap.n_eq,
+            snap.n_ineq
+        );
+
+        // Split the stacked dense rows for solve_qp's separate
+        // eq/ineq arguments (`A_iq x <= b_iq`, same convention as
+        // build_constraints_dense's own doc comment).
+        let a_eq = snap.a_dense.rows(0, snap.n_eq).into_owned();
+        let b_eq = DVector::from_vec(snap.b_vec[0..snap.n_eq].to_vec());
+        let a_iq = snap.a_dense.rows(snap.n_eq, snap.n_ineq).into_owned();
+        let b_iq = DVector::from_vec(snap.b_vec[snap.n_eq..].to_vec());
+
+        const N_REPEATS: usize = 200;
+        let backends = [
+            ("ActiveSet", QpSolver::ActiveSet),
+            ("Ipm", QpSolver::Ipm),
+            ("Admm", QpSolver::Admm),
+            ("Clarabel", QpSolver::Clarabel),
+        ];
+
+        let mut objectives = Vec::new();
+        eprintln!(
+            "{:10} {:>10} {:>10} {:>8} {:>12}",
+            "backend", "median_us", "p99_us", "iters", "objective"
+        );
+        for (name, backend) in backends {
+            let qp_cfg = QpConfig { solver: backend, ..QpConfig::default() };
+            // Warm up: first solve of a backend can carry setup cost
+            // (e.g. Clarabel's internal allocations).
+            let _ = solve_qp(&snap.p, &snap.q, Some(&a_eq), Some(&b_eq), Some(&a_iq), Some(&b_iq), None, &qp_cfg);
+
+            let mut samples_us = Vec::with_capacity(N_REPEATS);
+            let mut last = None;
+            for _ in 0..N_REPEATS {
+                let t0 = std::time::Instant::now();
+                let sol = solve_qp(&snap.p, &snap.q, Some(&a_eq), Some(&b_eq), Some(&a_iq), Some(&b_iq), None, &qp_cfg);
+                samples_us.push(t0.elapsed().as_micros() as u64);
+                last = Some(sol);
+            }
+            samples_us.sort();
+            let median_us = samples_us[samples_us.len() / 2];
+            let p99_us = samples_us[samples_us.len() * 99 / 100];
+            let sol = last.unwrap();
+            eprintln!(
+                "{:10} {:10} {:10} {:8} {:12.4} {:?}",
+                name, median_us, p99_us, sol.iterations, sol.objective, sol.status
+            );
+            objectives.push((name, sol.objective));
+        }
+
+        // Sanity: every backend solves the *same* strongly-convex QP,
+        // so all reported objectives should agree to solver tolerance
+        // (this is the correctness cross-check that makes the timing
+        // comparison meaningful -- a fast backend that found a
+        // different, wrong optimum wouldn't be a useful result).
+        let reference_obj = objectives[0].1;
+        for (name, obj) in &objectives[1..] {
+            assert!(
+                (obj - reference_obj).abs() < 1e-3 * reference_obj.abs().max(1.0),
+                "{name} objective {obj} disagrees with {} objective {reference_obj}",
+                objectives[0].0,
+            );
+        }
     }
 }

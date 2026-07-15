@@ -6,3 +6,11 @@
 [workspace]
 members = ["quadruped-gait", "legged-estimation", "policy-runtime"]
 resolver = "3"
+
+# TEMPORARY (dev-only, not pushed): pin misa-wbc to the local sibling
+# checkout so the srbd_mpc::tests::mpc_backend_bench comparison can
+# use Ipm/Admm/Clarabel, which postdate the git rev this workspace is
+# currently pinned to. Revert (or push misa-wbc + bump the git rev)
+# once that comparison no longer needs to track local-only commits.
+[patch."https://github.com/takarakasai/misa-wbc.git"]
+misa-wbc = { path = "../misa-wbc" }
