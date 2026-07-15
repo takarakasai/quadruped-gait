@@ -1435,6 +1435,59 @@ mod tests {
                 name, median_us, p99_us, sol.iterations, sol.objective, sol.status
             );
             objectives.push((name, sol.objective));
+
+            // Dump the last backend's (Clarabel's) predicted horizon
+            // -- every backend agrees on the objective (checked
+            // below), so any one of them is representative -- as a
+            // CSV for external rendering, when `MPC_BENCH_CSV_OUT` is
+            // set. Not part of the pass/fail check; this is purely a
+            // visualization side-channel for the write-up in
+            // ref/wbc_comparison.md (`cargo test --release ... \
+            // --ignored mpc_backend_bench` with the env var set).
+            if name == "Clarabel" {
+                if let Ok(out_path) = std::env::var("MPC_BENCH_CSV_OUT") {
+                    let out_path = std::path::PathBuf::from(out_path);
+                    let x_horizon = &snap.a_x * &snap.x_now + &snap.b_u * &sol.x;
+                    let mut csv = String::from(
+                        "step,roll,pitch,yaw,pos_x,pos_y,pos_z,\
+                         F_FL_x,F_FL_y,F_FL_z,F_FR_x,F_FR_y,F_FR_z,\
+                         F_RL_x,F_RL_y,F_RL_z,F_RR_x,F_RR_y,F_RR_z,\
+                         stance_FL,stance_FR,stance_RL,stance_RR,\
+                         r_FL_x,r_FL_y,r_FL_z,r_FR_x,r_FR_y,r_FR_z,\
+                         r_RL_x,r_RL_y,r_RL_z,r_RR_x,r_RR_y,r_RR_z\n",
+                    );
+                    for k in 0..n {
+                        let row0 = k * 13;
+                        let u0 = k * snap.nu;
+                        csv.push_str(&format!(
+                            "{k},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5}",
+                            x_horizon[row0],
+                            x_horizon[row0 + 1],
+                            x_horizon[row0 + 2],
+                            x_horizon[row0 + 3],
+                            x_horizon[row0 + 4],
+                            x_horizon[row0 + 5],
+                        ));
+                        for leg in 0..4 {
+                            let base = u0 + leg * 3;
+                            csv.push_str(&format!(
+                                ",{:.4},{:.4},{:.4}",
+                                sol.x[base], sol.x[base + 1], sol.x[base + 2]
+                            ));
+                        }
+                        for leg in 0..4 {
+                            csv.push_str(&format!(",{}", contact.is_stance[leg][k] as u8));
+                        }
+                        for leg in 0..4 {
+                            let r = feet.r[leg][k];
+                            csv.push_str(&format!(",{:.5},{:.5},{:.5}", r.x, r.y, r.z));
+                        }
+                        csv.push('\n');
+                    }
+                    std::fs::write(&out_path, csv).expect("write trot_mpc_horizon.csv");
+                    eprintln!("wrote {}", out_path.display());
+                }
+            }
         }
 
         // Sanity: every backend solves the *same* strongly-convex QP,
