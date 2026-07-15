@@ -345,6 +345,33 @@ pub struct FullCentroidalMpcConfig {
     /// Default `0.0` ⇒ disabled, preserving backward compatibility
     /// for callers that don't populate `foot_xy_target_body_offset`.
     pub q_foot_xy_world: f64,
+    /// **Task-space→joint-space `R` weight mapping for `joint_v`.**
+    ///
+    /// When `Some`, each leg's 12×12 `joint_v` cost block is replaced
+    /// with `J_nom^T · diag(r_taskspace_joint_vel) · J_nom` (`J_nom` =
+    /// that leg's [`crate::ik::foot_jacobian_body`] evaluated at a
+    /// *fixed nominal pose*) instead of the flat per-joint diagonal
+    /// `r_diag[12..24]`. This is legged_control/OCS2's own technique —
+    /// `LeggedRobotInterface::initializeInputCostWeight` in OCS2's
+    /// `ocs2_legged_robot` example does the identical
+    /// `baseToFeetJacobians^T · R_taskspace · baseToFeetJacobians`
+    /// remap at a fixed initial-state pose (confirmed against
+    /// `ref/ocs2`) — a task-space (Cartesian foot-velocity) penalty
+    /// projected into joint space, rather than an isotropic per-joint
+    /// scalar. Populated by
+    /// [`crate::full_centroidal_controller::FullCentroidalMpcGaitController::set_task_space_joint_vel_weight`],
+    /// not computed inside the MPC itself (it only depends on
+    /// kinematics + a nominal pose, both controller-side concerns —
+    /// same reasoning as the β nominal-`joint_q` path).
+    ///
+    /// `None` (default) preserves the existing flat-diagonal `r_diag`
+    /// behavior exactly.
+    pub joint_vel_nominal_jacobian: Option<[Matrix3<f64>; N_FEET]>,
+    /// Task-space (foot-velocity, m/s) diagonal weight used when
+    /// [`Self::joint_vel_nominal_jacobian`] is `Some`. Unused
+    /// otherwise. Default `[1.0, 1.0, 1.0]` matches the flat
+    /// `r_diag[12..24] = 1.0` default in overall scale.
+    pub r_taskspace_joint_vel: [f64; 3],
 }
 
 impl FullCentroidalMpcConfig {
@@ -408,6 +435,8 @@ impl FullCentroidalMpcConfig {
             friction_cone_slack_penalty: 1000.0,
             warm_start: false,
             q_foot_xy_world: 0.0,
+            joint_vel_nominal_jacobian: None,
+            r_taskspace_joint_vel: [1.0, 1.0, 1.0],
         }
     }
 }
@@ -965,8 +994,34 @@ impl FullCentroidalMpc {
         }
         let mut r_block = DMatrix::<f64>::zeros(nu * n, nu * n);
         for k in 0..n {
-            for i in 0..nu {
+            // GRF block (first 12 columns): always a flat diagonal.
+            for i in 0..12.min(nu) {
                 r_block[(k * nu + i, k * nu + i)] = self.cfg.r_diag[i];
+            }
+            // joint_v block (columns 12..24): task-space Jacobian
+            // mapping when configured (see
+            // `joint_vel_nominal_jacobian`'s doc comment), else the
+            // legacy flat per-joint diagonal.
+            if let Some(jacobians) = &self.cfg.joint_vel_nominal_jacobian {
+                let r_task = Matrix3::from_diagonal(&Vector3::new(
+                    self.cfg.r_taskspace_joint_vel[0],
+                    self.cfg.r_taskspace_joint_vel[1],
+                    self.cfg.r_taskspace_joint_vel[2],
+                ));
+                for leg in 0..N_FEET {
+                    let j = jacobians[leg];
+                    let r_leg = j.transpose() * r_task * j;
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            r_block[(k * nu + 12 + 3 * leg + a, k * nu + 12 + 3 * leg + b)] =
+                                r_leg[(a, b)];
+                        }
+                    }
+                }
+            } else {
+                for i in 12..nu {
+                    r_block[(k * nu + i, k * nu + i)] = self.cfg.r_diag[i];
+                }
             }
         }
         let x_ref = {
@@ -1675,6 +1730,8 @@ mod tests {
             friction_cone_slack_penalty: 1000.0,
             warm_start: false,
             q_foot_xy_world: 0.0,
+            joint_vel_nominal_jacobian: None,
+            r_taskspace_joint_vel: [1.0, 1.0, 1.0],
         }
     }
 

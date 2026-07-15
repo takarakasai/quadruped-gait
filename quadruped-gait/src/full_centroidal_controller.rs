@@ -47,7 +47,7 @@
 //! mode-agnostic. The native solution is available via
 //! [`Self::predicted_full_centroidal_solution`].
 
-use nalgebra::Vector3;
+use nalgebra::{Matrix3, Vector3};
 
 use crate::async_solver::AsyncJobWorker;
 use crate::body_state::BodyState;
@@ -312,6 +312,44 @@ impl FullCentroidalMpcGaitController {
     /// to have an effect.
     pub fn set_dynamic_joint_q_reference(&mut self, enable: bool) {
         self.dynamic_joint_q_reference = enable;
+    }
+
+    pub fn task_space_joint_vel_weight(&self) -> Option<[f64; 3]> {
+        self.full_centroidal_mpc.config().joint_vel_nominal_jacobian.is_some()
+            .then(|| self.full_centroidal_mpc.config().r_taskspace_joint_vel)
+    }
+    /// Replace the flat per-joint `r_diag[12..24]` joint_v cost with a
+    /// task-space (foot-velocity) weight mapped through each leg's
+    /// fixed-nominal-pose Jacobian — legged_control/OCS2's own
+    /// technique (`LeggedRobotInterface::initializeInputCostWeight` in
+    /// `ocs2_legged_robot`, confirmed against `ref/ocs2`). The nominal
+    /// pose used is each leg's `kin.nominal_foot_body` at the
+    /// controller's current `knee_forward` convention — same pose the
+    /// β nominal-`joint_q` path (`parity_use_nominal_q_ref`) already
+    /// uses, computed once here rather than cached, since this is only
+    /// called on config changes, not per tick.
+    ///
+    /// Pass `None` to revert to the flat diagonal (default).
+    pub fn set_task_space_joint_vel_weight(&mut self, r_taskspace: Option<[f64; 3]>) {
+        let mut mpc_cfg = self.full_centroidal_mpc.config().clone();
+        match r_taskspace {
+            Some(r) => {
+                let mut jacobians = [Matrix3::zeros(); N_FEET];
+                for slot in 0..N_FEET {
+                    let kin = self.kin.leg(LegId::ALL[slot]);
+                    let knee_fwd = self.knee_forward[slot];
+                    let sol = solve_leg_ik(kin, kin.nominal_foot_body, knee_fwd);
+                    let (h, th, c) = sol.angles();
+                    jacobians[slot] = foot_jacobian_body(kin, h, th, c);
+                }
+                mpc_cfg.joint_vel_nominal_jacobian = Some(jacobians);
+                mpc_cfg.r_taskspace_joint_vel = r;
+            }
+            None => {
+                mpc_cfg.joint_vel_nominal_jacobian = None;
+            }
+        }
+        self.full_centroidal_mpc.set_config(mpc_cfg);
     }
 
     pub fn goal_pose_world(&self) -> Option<GoalPoseWorld> {

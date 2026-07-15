@@ -491,6 +491,22 @@ impl AnyGaitController {
         }
     }
 
+    /// Toggle the FullCentroidal controller's task-space→joint-space
+    /// `R` weight mapping for the `joint_v` cost (see
+    /// [`crate::full_centroidal_controller::FullCentroidalMpcGaitController::set_task_space_joint_vel_weight`]).
+    /// No-op for other modes.
+    pub fn set_task_space_joint_vel_weight(&mut self, r_taskspace: Option<[f64; 3]>) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_task_space_joint_vel_weight(r_taskspace);
+        }
+    }
+    pub fn task_space_joint_vel_weight(&self) -> Option<[f64; 3]> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => c.task_space_joint_vel_weight(),
+            _ => None,
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).
