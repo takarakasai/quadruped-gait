@@ -167,6 +167,25 @@ pub struct FullCentroidalMpcGaitController {
     /// `None` the flag silently falls back to the cap-pt path.
     use_mpc_predicted_footstep: bool,
 
+    /// When `true`, the joint_q tracking reference fed to the MPC at
+    /// each horizon step `k` is no longer a flat hold — it's sampled
+    /// from the same open-loop swing/stance foot curve `tick()` already
+    /// uses (`Footstep::stance_at` / `swing_position`, IK-inverted via
+    /// `solve_leg_ik`) at that step's *projected* phase, for every leg,
+    /// stance or swing. This is the D3.3.5a simplification's reversal:
+    /// instead of the MPC's joint-space cost being indifferent to what
+    /// the swing leg is actually planned to do over the horizon, it now
+    /// tracks the real planned arc — closer to legged_control's
+    /// whole-body joint reference, without touching the MPC's own cost
+    /// weights or dynamics.
+    ///
+    /// Requires `legged_control_parity` for the projected per-step
+    /// phase (`legacy` mode's crude "duty>0.5 ⇒ all stance" proxy
+    /// doesn't carry per-leg sub-fraction info past step 0, so this
+    /// flag is a no-op without parity). Takes priority over
+    /// `parity_use_nominal_q_ref` when both are set. Default `false`.
+    dynamic_joint_q_reference: bool,
+
     /// Background worker that runs the full-centroidal SQP off the
     /// caller's thread. This is the heaviest MPC (≈0.4 s/solve), so
     /// solving it inline on the GUI's update loop froze the window —
@@ -233,6 +252,7 @@ impl FullCentroidalMpcGaitController {
             parity_use_nominal_q_ref: false,
             goal_pose: None,
             use_mpc_predicted_footstep: false,
+            dynamic_joint_q_reference: false,
             mpc_worker: AsyncJobWorker::new(),
             async_mpc: false,
         }
@@ -282,6 +302,16 @@ impl FullCentroidalMpcGaitController {
     /// See struct docs for the rationale.
     pub fn set_parity_use_nominal_q_ref(&mut self, enable: bool) {
         self.parity_use_nominal_q_ref = enable;
+    }
+
+    pub fn dynamic_joint_q_reference(&self) -> bool {
+        self.dynamic_joint_q_reference
+    }
+    /// Toggle the per-horizon-step dynamic joint_q reference. See the
+    /// struct field's doc comment — requires `legged_control_parity`
+    /// to have an effect.
+    pub fn set_dynamic_joint_q_reference(&mut self, enable: bool) {
+        self.dynamic_joint_q_reference = enable;
     }
 
     pub fn goal_pose_world(&self) -> Option<GoalPoseWorld> {
@@ -700,6 +730,12 @@ impl FullCentroidalMpcGaitController {
         // leg is in stance (swing entries are unused).
         let mut stance_sub_fractions: [Vec<f64>; N_FEET] =
             [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        // Per-(leg, step) phase sub-fraction regardless of stance/swing
+        // (unlike `stance_sub_fractions`, which zeroes swing entries) —
+        // feeds `dynamic_joint_q_reference`'s per-step swing/stance foot
+        // sampling below.
+        let mut phase_sub_fractions: [Vec<f64>; N_FEET] =
+            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let cycle_phase_now = self.phase_gen.cycle_phase();
         let cycle_period = self.cfg.cycle_period_s.max(1e-6);
         let duty = self.cfg.duty_factor.clamp(1e-6, 1.0 - 1e-6);
@@ -760,6 +796,7 @@ impl FullCentroidalMpcGaitController {
                 // reference loop below can apply the transition ramp.
                 // Swing entries get 0.0 (unused).
                 stance_sub_fractions[leg].push(if in_stance { sub_frac } else { 0.0 });
+                phase_sub_fractions[leg].push(sub_frac);
                 // C1-2: per-(leg, k) f_z upper bound. When the
                 // constraint-side ramp is enabled (and we're on the
                 // parity path with a non-zero transition_fraction),
@@ -870,6 +907,40 @@ impl FullCentroidalMpcGaitController {
                 None
             };
 
+        // γ: when `dynamic_joint_q_reference` is on (and parity, since
+        // that's what makes `phase_sub_fractions`/`contact.is_stance`
+        // meaningful per-leg past step 0), sample each leg's open-loop
+        // foot curve — the same `Footstep::stance_at` / `swing_position`
+        // + `solve_leg_ik` pattern `tick()` uses for the *current* tick
+        // — at every horizon step's *projected* phase instead. This is
+        // the D3.3.5a reversal: the joint_q reference becomes a real
+        // per-step trajectory instead of a flat hold, so the MPC's
+        // (already-generic, already-existing) per-node joint_q cost
+        // actually has something meaningful to track for the swing leg.
+        //
+        // The `Footstep` itself (Raibert + cap-pt touchdown) is computed
+        // once per leg, open-loop, exactly like the A1 block above —
+        // not from the MPC's own in-flight solve, so there's no
+        // intra-solve circularity.
+        let dynamic_footsteps: Option<[Footstep; N_FEET]> =
+            if self.dynamic_joint_q_reference && self.legged_control_parity && !holding {
+                let v_obs_body_now = world_to_body_horizontal(
+                    self.v_observed_world,
+                    self.body_state.world_yaw,
+                );
+                let v_cmd_now = Vector3::new(self.cmd.vx, self.cmd.vy, 0.0);
+                let v_err_body_now = v_obs_body_now - v_cmd_now;
+                let mut steps =
+                    [Footstep { lift_off: Vector3::zeros(), touch_down: Vector3::zeros() }; N_FEET];
+                for slot in 0..N_FEET {
+                    let kin = self.kin.leg(LegId::ALL[slot]);
+                    steps[slot] = self.compute_mpc_footstep(kin, &v_err_body_now);
+                }
+                Some(steps)
+            } else {
+                None
+            };
+
         // Per-step reference state + input. Body pose integrates the cmd
         // velocity; joint_q held (or set to nominal pose when β is on);
         // gravity distributed across stance legs for the GRF reference
@@ -883,7 +954,27 @@ impl FullCentroidalMpcGaitController {
             sk.angular_velocity_world = Vector3::new(0.0, 0.0, self.cmd.wz);
             sk.base_pos_world = s_now.base_pos_world + v_world_cmd * t;
             sk.base_euler_zyx.z = s_now.base_euler_zyx.z + self.cmd.wz * t;
-            if let Some(q_nom) = nominal_joint_q {
+            if let Some(footsteps) = &dynamic_footsteps {
+                // γ: per-(leg, k) dynamic joint_q — takes priority over
+                // the β nominal-pose override (both are opt-in and
+                // mutually exclusive in practice; γ is the more complete
+                // behaviour when both happen to be enabled).
+                for slot in 0..N_FEET {
+                    let kin = self.kin.leg(LegId::ALL[slot]);
+                    let sub_frac = phase_sub_fractions[slot][k];
+                    let target = if contact.is_stance[slot][k] {
+                        footsteps[slot].stance_at(sub_frac)
+                    } else {
+                        swing_position(footsteps[slot].lift_off, footsteps[slot].touch_down, swing_h, sub_frac)
+                    };
+                    let knee_fwd = self.knee_forward[slot];
+                    let sol = solve_leg_ik(kin, target, knee_fwd);
+                    let (h, th, c) = sol.angles();
+                    sk.joint_q[3 * slot] = h;
+                    sk.joint_q[3 * slot + 1] = th;
+                    sk.joint_q[3 * slot + 2] = c;
+                }
+            } else if let Some(q_nom) = nominal_joint_q {
                 sk.joint_q = q_nom;
             }
             ref_states.push(sk);

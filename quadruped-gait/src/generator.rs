@@ -475,6 +475,22 @@ impl AnyGaitController {
         }
     }
 
+    /// Toggle the FullCentroidal controller's per-horizon-step dynamic
+    /// joint_q reference (see
+    /// [`crate::full_centroidal_controller::FullCentroidalMpcGaitController::set_dynamic_joint_q_reference`]).
+    /// No-op for other modes.
+    pub fn set_dynamic_joint_q_reference(&mut self, enable: bool) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_dynamic_joint_q_reference(enable);
+        }
+    }
+    pub fn dynamic_joint_q_reference(&self) -> Option<bool> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.dynamic_joint_q_reference()),
+            _ => None,
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).
