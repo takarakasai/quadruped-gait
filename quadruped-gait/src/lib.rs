@@ -90,7 +90,10 @@ mod swing_traj;
 
 // ── Curated re-exports ──
 
-pub use autodetect::{auto_detect_kinematics_config, auto_detect_leg_kinematics, joint_signs};
+pub use autodetect::{
+    auto_detect_kinematics_config, auto_detect_leg_kinematics, auto_detect_true_centroidal_coupling,
+    joint_signs,
+};
 pub use config::{
     GaitConfig, GaitType, KinematicsConfig, KneePattern, LegId, LegKinematics,
     VelocityCmd, DEFAULT_FOOT_LINKS,
@@ -114,5 +117,5 @@ pub use phase::ContactDrivenPhase;
 // internal.
 pub use centroidal_mpc::{predicted_base_accel_world_centroidal, CentroidalMpcConfig};
 pub use full_centroidal_controller::GoalPoseWorld;
-pub use full_centroidal_mpc::FullCentroidalMpcConfig;
+pub use full_centroidal_mpc::{FullCentroidalMpcConfig, TrueCentroidalCouplingData};
 pub use srbd_mpc::{predicted_base_accel_world, MpcSolution, SrbdMpcConfig, SrbdState};

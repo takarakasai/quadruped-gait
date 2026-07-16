@@ -352,6 +352,19 @@ impl FullCentroidalMpcGaitController {
         self.full_centroidal_mpc.set_config(mpc_cfg);
     }
 
+    pub fn true_centroidal_coupling(&self) -> bool {
+        self.full_centroidal_mpc.config().enable_true_centroidal_coupling
+    }
+    /// Toggle the true-centroidal-coupling bias term (see
+    /// [`FullCentroidalMpcConfig`]'s doc comment) — a no-op if the
+    /// config's `true_centroidal_coupling_data` wasn't populated (no
+    /// `misarta` model was available at auto-detect time).
+    pub fn set_true_centroidal_coupling(&mut self, enable: bool) {
+        let mut mpc_cfg = self.full_centroidal_mpc.config().clone();
+        mpc_cfg.enable_true_centroidal_coupling = enable;
+        self.full_centroidal_mpc.set_config(mpc_cfg);
+    }
+
     pub fn goal_pose_world(&self) -> Option<GoalPoseWorld> {
         self.goal_pose
     }

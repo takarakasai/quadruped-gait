@@ -507,6 +507,22 @@ impl AnyGaitController {
         }
     }
 
+    /// Toggle the FullCentroidal controller's true-centroidal-coupling
+    /// bias term (see
+    /// [`crate::full_centroidal_mpc::FullCentroidalMpcConfig`]'s doc
+    /// comment). No-op for other modes.
+    pub fn set_true_centroidal_coupling(&mut self, enable: bool) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_true_centroidal_coupling(enable);
+        }
+    }
+    pub fn true_centroidal_coupling(&self) -> Option<bool> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.true_centroidal_coupling()),
+            _ => None,
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).

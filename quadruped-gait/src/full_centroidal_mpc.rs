@@ -46,6 +46,7 @@ use nalgebra::{DMatrix, DVector, Matrix3, Rotation3, Vector3};
 
 use crate::config::{KinematicsConfig, LegId};
 use crate::ik::{foot_jacobian_body, forward_leg_kinematics};
+use misarta::model::Model as MisartaModel;
 
 /// Number of leg joints handled by the full-centroidal state. Three per
 /// leg × four legs = 12 (Hip-Thigh-Calf RPP morphology, the only one
@@ -210,6 +211,39 @@ impl FullCentroidalInput {
 ///    update with joint motion within the horizon.
 /// 2. (D3.3.3) The **linearization** of those moments — `∂r_i/∂q` flows
 ///    through `ik::foot_jacobian_body`.
+///
+/// **True centroidal coupling** (desk-research gap ①, `ref/ocs2`
+/// verified): OCS2's `centroidalModelType=FullCentroidalDynamics`
+/// couples joint velocity into the base's motion via the centroidal
+/// momentum matrix `A(q)` — `v_base = Ab(q)⁻¹·(h − A_joints(q)·q̇_j)`.
+/// Rather than switching our own state from angular *velocity* (ω) to
+/// normalized angular *momentum* (a change that would ripple through
+/// every consumer of `angular_velocity_world` across this file and
+/// `full_centroidal_controller.rs`), this is added as an **additive
+/// bias term** to the existing `v̇_com`/`α` equations, derived from the
+/// same physics:
+///
+/// ```text
+/// ḣ = Σ wrench  (unchanged Newton-Euler, our existing v̇_com/α term)
+/// h = Ab·v_base + A_joints(q)·q̇_j     (Ab constant ⇒ Ȧb = 0)
+/// ⇒ v̇_base = Ab⁻¹·Σwrench − Ab⁻¹·(Ȧ_joints·q̇_j + A_joints·q̈_j)
+///                            \_________________________________/
+///                                    the new correction term
+/// ```
+///
+/// `Ab⁻¹` is exactly `(1/mass_kg, i_world_inv)` — already computed by
+/// the existing dynamics, no new inversion needed. `A_joints`/
+/// `Ȧ_joints` come from [`misarta::centroidal::compute_centroidal_momentum_matrix`]
+/// / `..._time_derivative`, evaluated at the reference trajectory (so
+/// this is a per-linearization-point bias, consistent with how the
+/// rest of this SQP's affine structure already works — no new
+/// decision variable). `q̈_j` is approximated by finite-differencing
+/// the reference `joint_v` trajectory across horizon steps (see
+/// [`FullCentroidalMpc::solve_one_iter`]).
+///
+/// `None` (default, populated only when [`TrueCentroidalCouplingData`]
+/// is available) or `enable_true_centroidal_coupling = false` (default)
+/// both preserve today's dynamics exactly.
 #[derive(Clone, Debug)]
 pub struct FullCentroidalMpcConfig {
     /// Total robot mass (kg).
@@ -372,6 +406,37 @@ pub struct FullCentroidalMpcConfig {
     /// otherwise. Default `[1.0, 1.0, 1.0]` matches the flat
     /// `r_diag[12..24] = 1.0` default in overall scale.
     pub r_taskspace_joint_vel: [f64; 3],
+    /// Precomputed data for the true-centroidal-coupling bias term (see
+    /// the struct-level doc comment). Populated by auto-detection
+    /// whenever a `misarta` model is available; `None` otherwise
+    /// (headless callers with no URDF, unit tests). Independent of
+    /// [`Self::enable_true_centroidal_coupling`] so the data can be
+    /// prepared once and the correction toggled on/off cheaply.
+    pub true_centroidal_coupling_data: Option<TrueCentroidalCouplingData>,
+    /// Gate for actually applying the bias term. `false` (default)
+    /// preserves today's dynamics exactly even when
+    /// `true_centroidal_coupling_data` is `Some`.
+    pub enable_true_centroidal_coupling: bool,
+}
+
+/// Data needed to evaluate the true-centroidal-coupling bias term (see
+/// [`FullCentroidalMpcConfig`]'s doc comment): a `misarta` model of the
+/// robot's actual kinematic/inertial tree (fixed-base — the floating
+/// base is handled entirely by this crate's own SRBD-style state, not
+/// by `misarta`), plus, for each leg, which columns of that model's
+/// `nv`-wide velocity vector correspond to its `[hip, thigh, calf]`
+/// joints (needed to scatter our canonical `joint_q`/`joint_v` layout
+/// into `misarta`'s vector convention before calling
+/// [`misarta::centroidal::compute_centroidal_momentum_matrix`], and to
+/// gather the resulting columns back out per leg).
+#[derive(Clone, Debug)]
+pub struct TrueCentroidalCouplingData {
+    pub misarta_model: MisartaModel<f64>,
+    /// `leg_joint_v_idx[leg][0..3]` = that leg's `[hip, thigh, calf]`
+    /// joints' index into `misarta_model`'s `nv`-wide velocity (and,
+    /// since all our leg joints are single-DOF revolute, equivalently
+    /// `nq`-wide configuration) vector.
+    pub leg_joint_v_idx: [[usize; 3]; N_FEET],
 }
 
 impl FullCentroidalMpcConfig {
@@ -437,6 +502,8 @@ impl FullCentroidalMpcConfig {
             q_foot_xy_world: 0.0,
             joint_vel_nominal_jacobian: None,
             r_taskspace_joint_vel: [1.0, 1.0, 1.0],
+            true_centroidal_coupling_data: None,
+            enable_true_centroidal_coupling: false,
         }
     }
 }
@@ -554,6 +621,7 @@ pub fn continuous_dynamics_full(
     cfg: &FullCentroidalMpcConfig,
     stance: &[bool; N_FEET],
     psi_ref: f64,
+    joint_accel_ref: &[f64; N_LEG_JOINTS],
 ) -> (DMatrix<f64>, DMatrix<f64>) {
     let nx = N_STATE_AUG;
     let nu = N_INPUT;
@@ -573,7 +641,13 @@ pub fn continuous_dynamics_full(
     let foot_ref_world = compute_foot_positions_world(state_ref, cfg);
 
     // ── 1. v̇_com row: gravity (via aug state) + (1/m)·F per stance leg
-    a[(2, 24)] = 1.0;
+    //
+    // The augmented state's last slot is a constant `1.0` (see
+    // `state_to_vec_aug`) — a generic bias carrier, not gravity-specific
+    // — so any row can inject an arbitrary per-linearization-point
+    // constant via `A[row, 24] = <value>`. Gravity uses it here; the
+    // true-centroidal-coupling bias term (below) reuses the same slot.
+    a[(2, 24)] = -9.81;
     for leg in 0..N_FEET {
         if !stance[leg] {
             continue;
@@ -680,6 +754,54 @@ pub fn continuous_dynamics_full(
     }
 
     // ── 6. augmented gravity row: ġ = 0 (left zero by initialiser) ───
+
+    // ── 7. True centroidal coupling bias (desk-research gap ①) ───────
+    // v̇_base_correction = -Ab⁻¹·(Ȧ_joints·q̇_ref + A_joints·q̈_ref), a
+    // per-linearization-point constant injected via the augmented
+    // bias column — see `FullCentroidalMpcConfig`'s and
+    // `state_to_vec_aug`'s doc comments. `Ab⁻¹` is exactly
+    // `(1/mass_kg, i_world_inv)`, already computed above for the
+    // dynamics' own v̇_com/α terms.
+    if cfg.enable_true_centroidal_coupling {
+        if let Some(data) = &cfg.true_centroidal_coupling_data {
+            let model = &data.misarta_model;
+            let mut q_vec = vec![0.0_f64; model.nq];
+            let mut v_vec = vec![0.0_f64; model.nv];
+            let mut a_vec = vec![0.0_f64; model.nv];
+            for leg in 0..N_FEET {
+                let [qh, qt, qc] = state_ref.leg_joint_q(leg);
+                let idx = data.leg_joint_v_idx[leg];
+                q_vec[idx[0]] = qh;
+                q_vec[idx[1]] = qt;
+                q_vec[idx[2]] = qc;
+                for j in 0..3 {
+                    v_vec[idx[j]] = input_ref.joint_v[3 * leg + j];
+                    a_vec[idx[j]] = joint_accel_ref[3 * leg + j];
+                }
+            }
+            let a_joints_body =
+                misarta::centroidal::compute_centroidal_momentum_matrix(model, &q_vec);
+            let adot_joints_body =
+                misarta::centroidal::compute_centroidal_momentum_matrix_time_derivative(
+                    model, &q_vec, &v_vec,
+                );
+            let qddot_vec = DVector::from_vec(a_vec);
+            let qdot_vec = DVector::from_vec(v_vec);
+            // 6-vector [angular(3); linear(3)], body frame (misarta's
+            // "universe" = trunk body frame, base fixed at identity).
+            let bias_h = &a_joints_body * &qddot_vec + &adot_joints_body * &qdot_vec;
+            let bias_ang_body = Vector3::new(bias_h[0], bias_h[1], bias_h[2]);
+            let bias_lin_body = Vector3::new(bias_h[3], bias_h[4], bias_h[5]);
+            let bias_ang_world = r_z * bias_ang_body;
+            let bias_lin_world = r_z * bias_lin_body;
+            let correction_ang = -i_world_inv * bias_ang_world;
+            let correction_lin = -bias_lin_world / m;
+            for i in 0..3 {
+                a[(i, 24)] += correction_lin[i];
+                a[(3 + i, 24)] += correction_ang[i];
+            }
+        }
+    }
 
     (a, b)
 }
@@ -940,6 +1062,33 @@ impl FullCentroidalMpc {
         let n_slacks = n_friction_slack_vars(&self.cfg, contact, n);
         let total_vars = nu * n + n_slacks;
 
+        // True-centroidal-coupling (desk-research gap ①) needs a joint
+        // acceleration reference `q̈_j`, which isn't otherwise tracked
+        // (our QP's input is joint_v, not joint_v's own derivative).
+        // Approximate it by finite-differencing the reference joint_v
+        // trajectory across horizon steps — forward difference except
+        // at the last step, where there's no k+1 to difference against
+        // (backward difference there instead; zero if n == 1). This is
+        // a per-linearization-point constant like the rest of this
+        // SQP's affine structure, not a new decision variable.
+        let joint_accel_ref: Vec<[f64; N_LEG_JOINTS]> = (0..n)
+            .map(|k| {
+                let mut accel = [0.0_f64; N_LEG_JOINTS];
+                if n < 2 {
+                    return accel;
+                }
+                let (v_next, v_prev, dt) = if k + 1 < n {
+                    (&ref_traj.inputs[k + 1].joint_v, &ref_traj.inputs[k].joint_v, self.cfg.dt_per_step)
+                } else {
+                    (&ref_traj.inputs[k].joint_v, &ref_traj.inputs[k - 1].joint_v, self.cfg.dt_per_step)
+                };
+                for i in 0..N_LEG_JOINTS {
+                    accel[i] = (v_next[i] - v_prev[i]) / dt.max(1e-9);
+                }
+                accel
+            })
+            .collect();
+
         // ── Build per-step continuous-time A_c, B_c, then discretise ──
         let mut a_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
         let mut b_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
@@ -957,6 +1106,7 @@ impl FullCentroidalMpc {
                 &self.cfg,
                 &stance,
                 psi_ref,
+                &joint_accel_ref[k],
             );
             // Forward Euler: x_{k+1} = (I + dt·A) x_k + dt·B u_k.
             let mut a_d = DMatrix::<f64>::identity(nx, nx);
@@ -1142,15 +1292,18 @@ impl FullCentroidalMpc {
     }
 }
 
-/// Pack `FullCentroidalState` into the 25-dim augmented vector with
-/// `g_aug = -9.81` in the last slot.
+/// Pack `FullCentroidalState` into the 25-dim augmented vector with a
+/// constant `1.0` in the last slot — a generic bias carrier (any row of
+/// `A` can inject an arbitrary per-linearization-point constant via
+/// `A[row, N_STATE] = <value>`), used for gravity (`A[2, 24] = -9.81`)
+/// and the true-centroidal-coupling bias term.
 fn state_to_vec_aug(s: &FullCentroidalState) -> DVector<f64> {
     let mut v = DVector::<f64>::zeros(N_STATE_AUG);
     let body = s.to_vec();
     for i in 0..N_STATE {
         v[i] = body[i];
     }
-    v[N_STATE] = -9.81;
+    v[N_STATE] = 1.0;
     v
 }
 
@@ -1732,7 +1885,156 @@ mod tests {
             q_foot_xy_world: 0.0,
             joint_vel_nominal_jacobian: None,
             r_taskspace_joint_vel: [1.0, 1.0, 1.0],
+            true_centroidal_coupling_data: None,
+            enable_true_centroidal_coupling: false,
         }
+    }
+
+    /// A synthetic 12-joint `misarta` model matching `test_kinematics()`'s
+    /// joint names (`{FL,FR,RL,RR}_{hip,thigh,calf}`) — four independent
+    /// 3-joint (Roll-Pitch-Pitch) serial chains off the universe, each
+    /// with a small placeholder link mass/inertia. Geometry doesn't need
+    /// to exactly match `test_kinematics()` (the coupling term only
+    /// needs *a* physically valid tree to exercise CRBA on); only the
+    /// joint names need to line up for `auto_detect_true_centroidal_coupling`
+    /// to resolve them.
+    fn test_misarta_model() -> misarta::model::Model<f64> {
+        use misarta::model::{LinkInertia, ModelBuilder};
+        let inertia = |com_x: f64| LinkInertia {
+            mass: 0.2,
+            center_of_mass: Vector3::new(com_x, 0.0, 0.0),
+            rotational_inertia: Matrix3::identity() * 1e-3,
+        };
+        let placement = |x: f64, y: f64, z: f64| {
+            misarta::se3::from_rotation_and_translation(
+                &nalgebra::Rotation3::identity(),
+                &Vector3::new(x, y, z),
+            )
+        };
+        let mut builder = ModelBuilder::new();
+        // Joints are 1-based (index 0 = universe); each leg's hip
+        // branches directly off the universe, so with legs added in
+        // order leg `li`'s [hip, thigh, calf] land at
+        // [1+3li, 2+3li, 3+3li] — computed arithmetically since
+        // `ModelBuilder` doesn't expose a running joint-count accessor.
+        for (li, (leg, x, y)) in [
+            (LegId::FL, 0.25, 0.20),
+            (LegId::FR, 0.25, -0.20),
+            (LegId::RL, -0.25, 0.20),
+            (LegId::RR, -0.25, -0.20),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let label = leg.label();
+            let hip_idx = 1 + 3 * li;
+            builder = builder.add_joint(
+                format!("{label}_hip"),
+                0,
+                misarta::joint::revolute_x(),
+                placement(x, y, 0.0),
+                inertia(0.0),
+            );
+            builder = builder.add_joint(
+                format!("{label}_thigh"),
+                hip_idx,
+                misarta::joint::revolute_y(),
+                placement(0.0, 0.0, 0.0),
+                inertia(0.15),
+            );
+            builder = builder.add_joint(
+                format!("{label}_calf"),
+                hip_idx + 1,
+                misarta::joint::revolute_y(),
+                placement(0.0, 0.0, -0.3),
+                inertia(0.15),
+            );
+        }
+        builder.build()
+    }
+
+    /// `test_config()` + real `TrueCentroidalCouplingData` from
+    /// `test_misarta_model()`, coupling toggle left to the caller.
+    fn test_config_with_coupling(enable: bool) -> FullCentroidalMpcConfig {
+        let mut cfg = test_config();
+        let model = test_misarta_model();
+        let data = crate::autodetect::auto_detect_true_centroidal_coupling(&model, &cfg.kinematics)
+            .expect("test model's joint names match test_kinematics()");
+        cfg.true_centroidal_coupling_data = Some(data);
+        cfg.enable_true_centroidal_coupling = enable;
+        cfg
+    }
+
+    #[test]
+    fn true_centroidal_coupling_zero_motion_leaves_aug_column_at_gravity_only() {
+        // Enabled, real misarta data, but zero joint_v / zero joint_accel
+        // -- the bias term must vanish exactly (Ȧ·0 + A·0 = 0), leaving
+        // the augmented column exactly as it is with coupling disabled.
+        let cfg = test_config_with_coupling(true);
+        let state = FullCentroidalState::default();
+        let input = FullCentroidalInput::default();
+        let (a, _b) =
+            continuous_dynamics_full(&state, &input, &cfg, &[true; N_FEET], 0.0, &[0.0; N_LEG_JOINTS]);
+        for i in 0..N_STATE_AUG {
+            let expected = if i == 2 { -9.81 } else { 0.0 };
+            assert!(
+                (a[(i, 24)] - expected).abs() < 1e-9,
+                "A[{i}, 24] = {}, expected {expected} at zero motion",
+                a[(i, 24)]
+            );
+        }
+    }
+
+    #[test]
+    fn true_centroidal_coupling_disabled_flag_ignores_nonzero_motion() {
+        // Data present, flag OFF, nonzero joint_v/accel: must match the
+        // flag-off-and-no-data baseline exactly (the flag, not merely
+        // data presence, gates the effect).
+        let cfg_off = test_config_with_coupling(false);
+        let cfg_baseline = test_config();
+        let state = FullCentroidalState { joint_q: [0.1; N_LEG_JOINTS], ..Default::default() };
+        let input = FullCentroidalInput { joint_v: [0.5; N_LEG_JOINTS], ..Default::default() };
+        let accel = [0.3; N_LEG_JOINTS];
+        let (a_off, _) =
+            continuous_dynamics_full(&state, &input, &cfg_off, &[true; N_FEET], 0.0, &accel);
+        let (a_base, _) =
+            continuous_dynamics_full(&state, &input, &cfg_baseline, &[true; N_FEET], 0.0, &accel);
+        for i in 0..N_STATE_AUG {
+            assert!(
+                (a_off[(i, 24)] - a_base[(i, 24)]).abs() < 1e-12,
+                "row {i}: disabled-flag output {} != baseline {}",
+                a_off[(i, 24)],
+                a_base[(i, 24)]
+            );
+        }
+    }
+
+    #[test]
+    fn true_centroidal_coupling_enabled_changes_bias_with_motion() {
+        // Same nonzero joint_v/accel as above, but flag ON: at least one
+        // of the angular (rows 3..6) or linear (rows 0..3, excluding the
+        // gravity row 2 which the term additively perturbs too) column-24
+        // entries must move away from the gravity-only baseline, and
+        // every entry must stay finite (no NaN/inf from a degenerate
+        // Ab⁻¹ or an indexing bug).
+        let cfg_on = test_config_with_coupling(true);
+        let cfg_baseline = test_config();
+        let state = FullCentroidalState { joint_q: [0.1; N_LEG_JOINTS], ..Default::default() };
+        let input = FullCentroidalInput { joint_v: [0.5; N_LEG_JOINTS], ..Default::default() };
+        let accel = [0.3; N_LEG_JOINTS];
+        let (a_on, _) =
+            continuous_dynamics_full(&state, &input, &cfg_on, &[true; N_FEET], 0.0, &accel);
+        let (a_base, _) =
+            continuous_dynamics_full(&state, &input, &cfg_baseline, &[true; N_FEET], 0.0, &accel);
+        let mut any_diff = false;
+        for i in 0..6 {
+            let v = a_on[(i, 24)];
+            assert!(v.is_finite(), "A[{i}, 24] is not finite: {v}");
+            if (v - a_base[(i, 24)]).abs() > 1e-9 {
+                any_diff = true;
+            }
+        }
+        assert!(any_diff, "true_centroidal_coupling had no effect on any of rows 0..6 of column 24");
     }
 
     #[test]
@@ -2077,7 +2379,7 @@ mod tests {
         let stance = [true; N_FEET];
         let psi_ref = state.base_euler_zyx.z;
 
-        let (a_mat, _b_mat) = continuous_dynamics_full(&state, &input, &cfg, &stance, psi_ref);
+        let (a_mat, _b_mat) = continuous_dynamics_full(&state, &input, &cfg, &stance, psi_ref, &[0.0; N_LEG_JOINTS]);
         let eps = 1e-6;
         let tol = 1e-3; // FD has ~1e-6 noise, plus we drop ω×Iω
 
@@ -2106,7 +2408,7 @@ mod tests {
         let stance = [true; N_FEET];
         let psi_ref = state.base_euler_zyx.z;
 
-        let (_a_mat, b_mat) = continuous_dynamics_full(&state, &input, &cfg, &stance, psi_ref);
+        let (_a_mat, b_mat) = continuous_dynamics_full(&state, &input, &cfg, &stance, psi_ref, &[0.0; N_LEG_JOINTS]);
         let eps = 1e-6;
         let tol = 1e-3;
 
@@ -2135,7 +2437,7 @@ mod tests {
         let state = ref_state_for_lin_test();
         let input = ref_input_for_lin_test();
         let stance = [true, false, true, false]; // FR, RR are swinging
-        let (_a, b) = continuous_dynamics_full(&state, &input, &cfg, &stance, 0.0);
+        let (_a, b) = continuous_dynamics_full(&state, &input, &cfg, &stance, 0.0, &[0.0; N_LEG_JOINTS]);
 
         for swing_leg in [1usize, 3] {
             for j in 0..3 {
@@ -2754,14 +3056,17 @@ mod tests {
 
     #[test]
     fn linearization_aug_gravity_column_is_unit_z_on_v_com() {
-        // The augmented gravity state [24] only feeds into v_com_z dot
-        // via A[2, 24] = 1. Every other entry in column 24 must be 0.
+        // The augmented state's last slot is a constant 1.0 (see
+        // `state_to_vec_aug`), so gravity feeds into v_com_z dot via
+        // A[2, 24] = -9.81. Every other entry in column 24 must be 0
+        // (true-centroidal-coupling is disabled in `test_config`, so
+        // no other row should inject a bias here).
         let cfg = test_config();
         let state = ref_state_for_lin_test();
         let input = ref_input_for_lin_test();
-        let (a, _b) = continuous_dynamics_full(&state, &input, &cfg, &[true; N_FEET], 0.0);
+        let (a, _b) = continuous_dynamics_full(&state, &input, &cfg, &[true; N_FEET], 0.0, &[0.0; N_LEG_JOINTS]);
         for i in 0..N_STATE_AUG {
-            let expected = if i == 2 { 1.0 } else { 0.0 };
+            let expected = if i == 2 { -9.81 } else { 0.0 };
             assert_eq!(a[(i, 24)], expected, "A[{i}, 24] != {expected}");
         }
     }

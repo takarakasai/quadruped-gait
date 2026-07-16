@@ -211,3 +211,40 @@ pub fn joint_signs(model: &Model<f64>, kin: &KinematicsConfig) -> Result<[[f64; 
     }
     Ok(signs)
 }
+
+/// Auto-detect the data [`crate::full_centroidal_mpc::TrueCentroidalCouplingData`]
+/// needs: for each leg, which index of `model`'s `nv`-wide (equivalently
+/// `nq`-wide, since our leg joints are all single-DOF revolute) velocity
+/// vector its `[hip, thigh, calf]` joints occupy.
+///
+/// `model` is the robot's actual (fixed-base) kinematic/inertial tree —
+/// the same one [`auto_detect_kinematics_config`] already reads joint
+/// names from, so any joint name mismatch surfaces the same way.
+pub fn auto_detect_true_centroidal_coupling(
+    model: &Model<f64>,
+    kin: &KinematicsConfig,
+) -> Result<crate::full_centroidal_mpc::TrueCentroidalCouplingData, String> {
+    use std::collections::HashMap;
+    let name_to_joint: HashMap<&str, usize> = model
+        .joints
+        .iter()
+        .enumerate()
+        .map(|(i, j)| (j.name.as_str(), i))
+        .collect();
+
+    let legs = [&kin.fl, &kin.fr, &kin.rl, &kin.rr];
+    let mut leg_joint_v_idx = [[0usize; 3]; 4];
+    for (slot, lk) in legs.iter().enumerate() {
+        let names = [&lk.hip_joint, &lk.thigh_joint, &lk.calf_joint];
+        for (k, nm) in names.iter().enumerate() {
+            let idx = *name_to_joint
+                .get(nm.as_str())
+                .ok_or_else(|| format!("joint {nm:?} (from kinematics) not in model"))?;
+            leg_joint_v_idx[slot][k] = model.v_idx[idx];
+        }
+    }
+    Ok(crate::full_centroidal_mpc::TrueCentroidalCouplingData {
+        misarta_model: model.clone(),
+        leg_joint_v_idx,
+    })
+}
