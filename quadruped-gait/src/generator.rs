@@ -523,6 +523,22 @@ impl AnyGaitController {
         }
     }
 
+    /// Toggle the FullCentroidal controller's closed-form Bound trim
+    /// reference (see
+    /// [`crate::full_centroidal_controller::FullCentroidalMpcGaitController::set_bound_trim_reference`]'s
+    /// doc comment). No-op for other modes.
+    pub fn set_bound_trim_reference(&mut self, enable: bool) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_trim_reference(enable);
+        }
+    }
+    pub fn bound_trim_reference(&self) -> Option<bool> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.bound_trim_reference()),
+            _ => None,
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).

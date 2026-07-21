@@ -51,7 +51,8 @@ use nalgebra::{Matrix3, Vector3};
 
 use crate::async_solver::AsyncJobWorker;
 use crate::body_state::BodyState;
-use crate::config::{GaitConfig, KinematicsConfig, LegId, LegKinematics, VelocityCmd};
+use crate::bound_reference::BoundTrimConfig;
+use crate::config::{GaitConfig, GaitType, KinematicsConfig, LegId, LegKinematics, VelocityCmd};
 use crate::controller::{ControllerOutput, LegOutput};
 use crate::footstep::Footstep;
 use crate::full_centroidal_mpc::{
@@ -186,6 +187,20 @@ pub struct FullCentroidalMpcGaitController {
     /// `parity_use_nominal_q_ref` when both are set. Default `false`.
     dynamic_joint_q_reference: bool,
 
+    /// When `true` (and `self.cfg.gait_type == GaitType::Bound`), the
+    /// per-horizon-step reference built by
+    /// [`Self::build_full_centroidal_inputs`] is augmented with the
+    /// closed-form Bound "trim" pitch / fore-aft-GRF profile
+    /// ([`crate::BoundTrimConfig`]) instead of the flat zero-pitch,
+    /// zero-`F_x` hold every gait has used until now (`grfs[leg].x`
+    /// was never set anywhere in this function before this flag was
+    /// added — see `articara/ref/wbc_comparison.md` Sec.5bb/5bc for
+    /// the derivation and the first-principles feasibility check that
+    /// motivated it). A no-op for every other gait, and a no-op for
+    /// Bound too while the velocity command is zero (holding). Default
+    /// `false`.
+    enable_bound_trim_reference: bool,
+
     /// Background worker that runs the full-centroidal SQP off the
     /// caller's thread. This is the heaviest MPC (≈0.4 s/solve), so
     /// solving it inline on the GUI's update loop froze the window —
@@ -253,6 +268,7 @@ impl FullCentroidalMpcGaitController {
             goal_pose: None,
             use_mpc_predicted_footstep: false,
             dynamic_joint_q_reference: false,
+            enable_bound_trim_reference: false,
             mpc_worker: AsyncJobWorker::new(),
             async_mpc: false,
         }
@@ -363,6 +379,16 @@ impl FullCentroidalMpcGaitController {
         let mut mpc_cfg = self.full_centroidal_mpc.config().clone();
         mpc_cfg.enable_true_centroidal_coupling = enable;
         self.full_centroidal_mpc.set_config(mpc_cfg);
+    }
+
+    pub fn bound_trim_reference(&self) -> bool {
+        self.enable_bound_trim_reference
+    }
+    /// Toggle the closed-form Bound trim reference (see
+    /// [`Self::enable_bound_trim_reference`]'s doc comment). A no-op
+    /// unless `self.cfg.gait_type == GaitType::Bound`.
+    pub fn set_bound_trim_reference(&mut self, enable: bool) {
+        self.enable_bound_trim_reference = enable;
     }
 
     pub fn goal_pose_world(&self) -> Option<GoalPoseWorld> {
@@ -992,6 +1018,40 @@ impl FullCentroidalMpcGaitController {
                 None
             };
 
+        // Bound trim reference (Sec.5bb/5bc): a closed-form periodic
+        // pitch/fore-aft-GRF profile for Bound's front-pair/rear-pair
+        // stance, replacing the flat zero-pitch/zero-Fx hold every
+        // gait (including Bound, until now) has used. `None` for
+        // every other gait, and for Bound while holding (cmd==0) --
+        // an oscillating reference makes no sense standing still.
+        let fl_slot = crate::controller::slot_of(LegId::FL);
+        let bound_trim: Option<BoundTrimConfig> = if self.enable_bound_trim_reference
+            && self.cfg.gait_type == GaitType::Bound
+            && !holding
+        {
+            let fl_kin = self.kin.leg(LegId::FL);
+            let rl_kin = self.kin.leg(LegId::RL);
+            let r_x_front = fl_kin.nominal_foot_body.x;
+            let r_x_rear = -rl_kin.nominal_foot_body.x;
+            let h0 = -fl_kin.nominal_foot_body.z;
+            Some(BoundTrimConfig {
+                mass_kg: cfg.mass_kg,
+                inertia_yy: cfg.centroidal_inertia_body[(1, 1)],
+                r_x: 0.5 * (r_x_front + r_x_rear),
+                h0,
+                cycle_period_s: self.cfg.cycle_period_s,
+                duty_factor: self.cfg.duty_factor,
+                friction_mu: cfg.friction_mu,
+                // Sec.5bc: MuJoCo phase-check found this module's
+                // internal front-stance-positive convention runs
+                // antiphase to Go2's real `euler_angles()` pitch sign
+                // -- empirically corrected here, not guessed.
+                sign: -1.0,
+            })
+        } else {
+            None
+        };
+
         // Per-step reference state + input. Body pose integrates the cmd
         // velocity; joint_q held (or set to nominal pose when β is on);
         // gravity distributed across stance legs for the GRF reference
@@ -1005,6 +1065,21 @@ impl FullCentroidalMpcGaitController {
             sk.angular_velocity_world = Vector3::new(0.0, 0.0, self.cmd.wz);
             sk.base_pos_world = s_now.base_pos_world + v_world_cmd * t;
             sk.base_euler_zyx.z = s_now.base_euler_zyx.z + self.cmd.wz * t;
+            // Reconstruct this step's global cycle phase from FL's own
+            // projected phase (FL's `phase_offsets()` entry is 0.0 for
+            // Bound, so its own `pos` *is* the global cycle phase --
+            // no separate phase math needed, stays consistent with
+            // whatever `contact`/`phase_sub_fractions` already decided
+            // for this step).
+            let trim_sample = bound_trim.map(|trim| {
+                let fl_stance = contact.is_stance[fl_slot][k];
+                let fl_sub = phase_sub_fractions[fl_slot][k];
+                let cycle_phase_k = if fl_stance { fl_sub * duty } else { duty + fl_sub * (1.0 - duty) };
+                trim.sample(cycle_phase_k)
+            });
+            if let Some(sample) = trim_sample {
+                sk.base_euler_zyx.y = sample.pitch;
+            }
             if let Some(footsteps) = &dynamic_footsteps {
                 // γ: per-(leg, k) dynamic joint_q — takes priority over
                 // the β nominal-pose override (both are opt-in and
@@ -1061,6 +1136,24 @@ impl FullCentroidalMpcGaitController {
             for leg in 0..N_FEET {
                 if contact.is_stance[leg][k] {
                     grfs[leg].z = leg_weights[leg] * f_per_unit;
+                }
+            }
+            // Bound trim: fore-aft GRF (Sec.5bb/5bc). Reuses the same
+            // `leg_weights`/`total_weight` transition ramp already
+            // applied to `grfs[leg].z` above, so the added `F_x` term
+            // ramps in/out at pair-switch instants exactly like the
+            // gravity split does, rather than stepping. `grfs[leg].x`
+            // was never set anywhere before this (always the
+            // `Vector3::zeros()` default) -- the MPC has never had any
+            // fore-aft GRF signal to chase, for any gait.
+            if let Some(sample) = trim_sample {
+                if total_weight > 1e-9 {
+                    let f_x_total = sample.f_x_per_leg * 2.0;
+                    for leg in 0..N_FEET {
+                        if contact.is_stance[leg][k] {
+                            grfs[leg].x = leg_weights[leg] * f_x_total / total_weight;
+                        }
+                    }
                 }
             }
             ref_inputs.push(FullCentroidalInput {
