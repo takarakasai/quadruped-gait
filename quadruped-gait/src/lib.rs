@@ -111,7 +111,7 @@ pub use generator::{AnyGaitController, GaitGenerator, GaitMode};
 pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolution};
 pub use mpc_controller::capture_point_step;
 pub use mpc_reference::JointReference;
-pub use phase::ContactDrivenPhase;
+pub use phase::{ContactDrivenPhase, PhaseErrorTracker};
 // MPC tuning configs + the solution / prediction types the GUI reads
 // back for overlays. The solvers themselves (SrbdMpc / CentroidalMpc /
 // FullCentroidalMpc) and their input / reference / schedule types are

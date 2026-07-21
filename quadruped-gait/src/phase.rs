@@ -260,6 +260,148 @@ impl ContactDrivenPhase {
     }
 }
 
+/// Estimates a signed phase-timing error (seconds) per leg, from the
+/// same measured GRF [`ContactDrivenPhase::apply_correction`] already
+/// uses -- but symmetric and quantitative where that function is
+/// direction-limited and boolean-only.
+///
+/// `apply_correction` only ever detects the real gait running FASTER
+/// than the nominal clock (early touchdown, early liftoff-from-
+/// stance) -- there's no detection of the opposite (the real gait
+/// running SLOWER: a touchdown that hasn't happened yet even though
+/// the nominal schedule already switched to stance, or a foot that
+/// stays loaded past the nominal stance-to-swing switch). This
+/// tracker adds that missing direction, at the cost of a small amount
+/// of cross-tick state (`apply_correction` is stateless) -- per leg,
+/// whether the nominal stance/swing window flipped since last tick,
+/// and whether a "too slow" event is pending resolution once flipped
+/// (its magnitude isn't known at the transition instant -- only once
+/// the foot finally does what the nominal schedule already expected).
+///
+/// Motivation: `articara/ref/wbc_comparison.md` Sec.5bk found the
+/// (boolean, one-directional) `apply_correction` mismatch rate
+/// correlates strongly with Bound's sparse cmd_vx instability points
+/// (Sec.5bi) -- the natural next step is a slow feedback loop that
+/// nudges `cycle_period_s` toward whatever period the real contact
+/// timing implies, which needs a signed, quantitative error signal
+/// symmetric in both directions. See Sec.5bl for the calibration.
+#[derive(Clone, Debug)]
+pub struct PhaseErrorTracker {
+    prev_nominal_stance: [bool; 4],
+    /// Set at a stance→swing transition if the foot was still loaded
+    /// at that instant (stance overran into nominal swing); cleared
+    /// once the foot finally unloads and the (positive, lengthen)
+    /// error fires.
+    stance_overrun_pending: [bool; 4],
+    /// Set at a swing→stance transition if the foot was NOT yet
+    /// loaded at that instant (touchdown hasn't happened yet even
+    /// though nominal already switched to stance); cleared once the
+    /// foot finally loads and the (positive, lengthen) error fires.
+    late_touchdown_pending: [bool; 4],
+    /// Whether the "too fast" event (early touchdown / early liftoff)
+    /// has already fired for the current window -- keeps those two
+    /// cases edge-triggered (fire once, at first detection) to match
+    /// the "too slow" cases' one-shot nature, instead of re-firing
+    /// (with a shrinking magnitude) every tick the condition holds.
+    fast_event_fired: [bool; 4],
+}
+
+impl Default for PhaseErrorTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PhaseErrorTracker {
+    pub fn new() -> Self {
+        Self {
+            prev_nominal_stance: [true; 4],
+            stance_overrun_pending: [false; 4],
+            late_touchdown_pending: [false; 4],
+            fast_event_fired: [false; 4],
+        }
+    }
+
+    /// Call once per tick, in lockstep with the same `nominal` phases
+    /// and `contact_force_z` (world-z GRF, N) [`ContactDrivenPhase::
+    /// apply_correction`] would receive. Returns, per leg, `Some(err)`
+    /// on the tick a mismatch event is first detected (`None`
+    /// otherwise) -- `err` is a signed seconds estimate: negative
+    /// means the real gait ran that much FASTER than `cycle_period_s`
+    /// assumes over the current sub-phase (shorten the period),
+    /// positive means SLOWER (lengthen it).
+    ///
+    /// Four mutually-exclusive events, one per combination of (which
+    /// sub-phase nominal is in) x (which direction the mismatch runs):
+    /// early touchdown / early liftoff (both "too fast", already
+    /// covered non-quantitatively by [`ContactDrivenPhase::
+    /// apply_correction`]), late touchdown / stance-overrun-into-swing
+    /// (both "too slow", new). The two "too slow" cases are detected
+    /// as *pending* at the transition instant (since at that instant
+    /// we don't yet know how much longer reality will take) and
+    /// resolved -- with the actual seconds error -- once the foot
+    /// finally does what the nominal schedule already expected.
+    pub fn observe(
+        &mut self,
+        nominal: &[PhaseState; 4],
+        contact_force_z: [f64; 4],
+        early_contact_threshold_n: f64,
+        late_liftoff_threshold_n: f64,
+        cycle_period_s: f64,
+        duty_factor: f64,
+    ) -> [Option<f64>; 4] {
+        let mut out = [None; 4];
+        for slot in 0..4 {
+            let ps = nominal[slot];
+            let f = contact_force_z[slot];
+            let loaded = f > early_contact_threshold_n;
+            let unloaded = f < late_liftoff_threshold_n;
+
+            if ps.is_stance != self.prev_nominal_stance[slot] {
+                if ps.is_stance {
+                    // swing -> stance: if not loaded THIS tick, touchdown
+                    // is running late relative to the clock.
+                    self.late_touchdown_pending[slot] = !loaded;
+                } else {
+                    // stance -> swing: if still loaded THIS tick, stance
+                    // ran over into what the clock already calls swing.
+                    self.stance_overrun_pending[slot] = loaded;
+                }
+                self.fast_event_fired[slot] = false;
+            }
+
+            if self.late_touchdown_pending[slot] {
+                if loaded {
+                    out[slot] = Some(ps.sub_fraction * duty_factor * cycle_period_s);
+                    self.late_touchdown_pending[slot] = false;
+                }
+            } else if self.stance_overrun_pending[slot] {
+                if unloaded {
+                    out[slot] = Some(ps.sub_fraction * (1.0 - duty_factor) * cycle_period_s);
+                    self.stance_overrun_pending[slot] = false;
+                }
+            } else if ps.is_stance {
+                if unloaded && ps.sub_fraction > 0.05 && !self.fast_event_fired[slot] {
+                    // Early liftoff (was on-time or late at touchdown,
+                    // per the branches above, and is now unloading
+                    // before the nominal stance window ends).
+                    out[slot] = Some(-(1.0 - ps.sub_fraction) * duty_factor * cycle_period_s);
+                    self.fast_event_fired[slot] = true;
+                }
+            } else if loaded && !self.fast_event_fired[slot] {
+                // Early touchdown (was on-time at the swing handoff,
+                // per the branches above, and is now loaded before the
+                // nominal swing window ends).
+                out[slot] = Some(-(1.0 - ps.sub_fraction) * (1.0 - duty_factor) * cycle_period_s);
+                self.fast_event_fired[slot] = true;
+            }
+
+            self.prev_nominal_stance[slot] = ps.is_stance;
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +549,104 @@ mod tests {
         // duty 0.5 this is the boundary. Floating-point may put it just
         // below or above so we accept either side.
         assert!((fl.cycle_position - 0.5).abs() < 1e-9);
+    }
+
+    // --- PhaseErrorTracker (Sec.5bl, local doc) --------------------------
+
+    const T_ERR: f64 = 0.30;
+    const DUTY_ERR: f64 = 0.5;
+    const EARLY_N: f64 = 5.0;
+    const LATE_N: f64 = 1.0;
+
+    fn err_ps(is_stance: bool, sub_fraction: f64) -> PhaseState {
+        PhaseState { leg: LegId::FL, cycle_position: 0.0, is_stance, sub_fraction }
+    }
+
+    fn observe1(
+        tracker: &mut PhaseErrorTracker,
+        is_stance: bool,
+        sub_fraction: f64,
+        force_n: f64,
+    ) -> Option<f64> {
+        let nominal = [err_ps(is_stance, sub_fraction); 4];
+        let force = [force_n; 4];
+        tracker.observe(&nominal, force, EARLY_N, LATE_N, T_ERR, DUTY_ERR)[0]
+    }
+
+    /// Force always agrees with the nominal schedule (loaded in
+    /// stance, unloaded in swing) -- no event should ever fire.
+    #[test]
+    fn phase_error_tracker_silent_when_consistent() {
+        let mut tracker = PhaseErrorTracker::new();
+        for i in 0..=10 {
+            let sub = i as f64 / 10.0;
+            assert!(observe1(&mut tracker, true, sub, 50.0).is_none(), "stance sub={sub}");
+        }
+        for i in 0..=10 {
+            let sub = i as f64 / 10.0;
+            assert!(observe1(&mut tracker, false, sub, 0.0).is_none(), "swing sub={sub}");
+        }
+    }
+
+    /// Foot touches down (loaded) partway through nominal swing --
+    /// "too fast", negative error, magnitude from the remaining
+    /// nominal swing time.
+    #[test]
+    fn phase_error_tracker_early_touchdown() {
+        let mut tracker = PhaseErrorTracker::new();
+        // Prime: consistent stance, then a clean (unloaded) swing entry.
+        assert!(observe1(&mut tracker, true, 0.99, 50.0).is_none());
+        assert!(observe1(&mut tracker, false, 0.0, 0.0).is_none());
+        assert!(observe1(&mut tracker, false, 0.3, 0.0).is_none());
+        // Touches down early, at swing sub_fraction 0.8 (should run to 1.0).
+        let err = observe1(&mut tracker, false, 0.8, 50.0).expect("expected early-touchdown event");
+        let expected = -(1.0 - 0.8) * (1.0 - DUTY_ERR) * T_ERR;
+        assert!((err - expected).abs() < 1e-9, "err={err} expected={expected}");
+        // Must not re-fire on a later tick in the same window.
+        assert!(observe1(&mut tracker, false, 0.9, 50.0).is_none());
+    }
+
+    /// Foot unloads (lifts off) partway through nominal stance, having
+    /// been loaded earlier in that same window -- "too fast", negative
+    /// error.
+    #[test]
+    fn phase_error_tracker_early_liftoff() {
+        let mut tracker = PhaseErrorTracker::new();
+        assert!(observe1(&mut tracker, true, 0.0, 50.0).is_none());
+        assert!(observe1(&mut tracker, true, 0.3, 50.0).is_none());
+        let err = observe1(&mut tracker, true, 0.8, 0.0).expect("expected early-liftoff event");
+        let expected = -(1.0 - 0.8) * DUTY_ERR * T_ERR;
+        assert!((err - expected).abs() < 1e-9, "err={err} expected={expected}");
+    }
+
+    /// Swing→stance transition happens, but the foot hasn't touched
+    /// down yet -- "too slow", positive error, resolved once it
+    /// finally loads.
+    #[test]
+    fn phase_error_tracker_late_touchdown() {
+        let mut tracker = PhaseErrorTracker::new();
+        assert!(observe1(&mut tracker, false, 0.9, 0.0).is_none());
+        // Transition tick: nominal says stance, still unloaded -> pending.
+        assert!(observe1(&mut tracker, true, 0.0, 0.0).is_none());
+        assert!(observe1(&mut tracker, true, 0.2, 0.0).is_none());
+        // Finally loads at stance sub_fraction 0.4.
+        let err = observe1(&mut tracker, true, 0.4, 50.0).expect("expected late-touchdown event");
+        let expected = 0.4 * DUTY_ERR * T_ERR;
+        assert!((err - expected).abs() < 1e-9, "err={err} expected={expected}");
+    }
+
+    /// Stance→swing transition happens, but the foot is still loaded
+    /// -- "too slow", positive error, resolved once it finally unloads.
+    #[test]
+    fn phase_error_tracker_stance_overrun() {
+        let mut tracker = PhaseErrorTracker::new();
+        assert!(observe1(&mut tracker, true, 0.9, 50.0).is_none());
+        // Transition tick: nominal says swing, still loaded -> pending.
+        assert!(observe1(&mut tracker, false, 0.0, 50.0).is_none());
+        assert!(observe1(&mut tracker, false, 0.2, 50.0).is_none());
+        // Finally unloads at swing sub_fraction 0.5.
+        let err = observe1(&mut tracker, false, 0.5, 0.0).expect("expected stance-overrun event");
+        let expected = 0.5 * (1.0 - DUTY_ERR) * T_ERR;
+        assert!((err - expected).abs() < 1e-9, "err={err} expected={expected}");
     }
 }

@@ -201,6 +201,27 @@ pub struct FullCentroidalMpcGaitController {
     /// `false`.
     enable_bound_trim_reference: bool,
 
+    /// Fraction (`[0,1]`) of the friction-clipped trim force actually
+    /// commanded when [`Self::enable_bound_trim_reference`] is on
+    /// (`BoundTrimConfig::thrust_scale`). `1.0` (default) reproduces
+    /// the original behaviour -- and at Go2's real numbers, already
+    /// saturates the hard friction cone by itself, leaving zero
+    /// headroom for this same MPC's own velocity-tracking `F_x` (see
+    /// `articara/ref/wbc_comparison.md` Sec.5bf). Values `<1.0`
+    /// deliberately under-cancel pitch torque to free real friction
+    /// budget for velocity tracking, at the cost of a larger
+    /// `theta_peak`.
+    bound_trim_thrust_scale: f64,
+
+    /// If `Some(fraction)`, `BoundTrimConfig::velocity_ripple_fraction`
+    /// -- sizes the trim's `F_x` from a target velocity ripple
+    /// (fraction of `self.cmd.vx`) instead of from
+    /// `bound_trim_thrust_scale`, the MIT-Cheetah-style "impulse
+    /// scaling" alternative (`articara/ref/wbc_comparison.md` Sec.5bj).
+    /// `None` (default) preserves the `bound_trim_thrust_scale`-based
+    /// behaviour exactly.
+    bound_trim_velocity_ripple_fraction: Option<f64>,
+
     /// Background worker that runs the full-centroidal SQP off the
     /// caller's thread. This is the heaviest MPC (≈0.4 s/solve), so
     /// solving it inline on the GUI's update loop froze the window —
@@ -269,6 +290,8 @@ impl FullCentroidalMpcGaitController {
             use_mpc_predicted_footstep: false,
             dynamic_joint_q_reference: false,
             enable_bound_trim_reference: false,
+            bound_trim_thrust_scale: 1.0,
+            bound_trim_velocity_ripple_fraction: None,
             mpc_worker: AsyncJobWorker::new(),
             async_mpc: false,
         }
@@ -391,6 +414,28 @@ impl FullCentroidalMpcGaitController {
         self.enable_bound_trim_reference = enable;
     }
 
+    pub fn bound_trim_thrust_scale(&self) -> f64 {
+        self.bound_trim_thrust_scale
+    }
+    /// Set the partial-trim fraction (see
+    /// [`Self::bound_trim_thrust_scale`]'s doc comment). Clamped to
+    /// `[0,1]`; a no-op unless [`Self::set_bound_trim_reference`] is
+    /// also enabled.
+    pub fn set_bound_trim_thrust_scale(&mut self, thrust_scale: f64) {
+        self.bound_trim_thrust_scale = thrust_scale.clamp(0.0, 1.0);
+    }
+
+    pub fn bound_trim_velocity_ripple_fraction(&self) -> Option<f64> {
+        self.bound_trim_velocity_ripple_fraction
+    }
+    /// Set the "impulse scaling" velocity-ripple fraction (see
+    /// [`Self::bound_trim_velocity_ripple_fraction`]'s doc comment).
+    /// `Some(fraction)` takes priority over `bound_trim_thrust_scale`;
+    /// `None` reverts to the `thrust_scale`-based path.
+    pub fn set_bound_trim_velocity_ripple_fraction(&mut self, fraction: Option<f64>) {
+        self.bound_trim_velocity_ripple_fraction = fraction;
+    }
+
     pub fn goal_pose_world(&self) -> Option<GoalPoseWorld> {
         self.goal_pose
     }
@@ -490,6 +535,23 @@ impl FullCentroidalMpcGaitController {
     pub fn config(&self) -> &GaitConfig {
         &self.cfg
     }
+
+    /// Update `cycle_period_s` in place, WITHOUT resetting the phase
+    /// clock (`self.phase_gen`'s `cycle_phase`/`holding` state) the
+    /// way [`Self::set_config`] does (it rebuilds `phase_gen` from
+    /// scratch via `PhaseGenerator::new`, snapping `cycle_phase` back
+    /// to 0 -- fine for a one-off gait-family switch, but it would
+    /// glitch the gait if called every cycle to nudge the period).
+    /// [`crate::phase::PhaseGenerator::set_config`] itself already has
+    /// the right (phase-preserving) semantics; this just routes to it
+    /// without going through the whole-`GaitConfig` replacement path.
+    /// For the adaptive-period ("impulse scaling" / PLL) investigation
+    /// -- see `articara/ref/wbc_comparison.md` Sec.5bl.
+    pub fn set_cycle_period_s(&mut self, period_s: f64) {
+        self.cfg.cycle_period_s = period_s.max(0.05);
+        self.phase_gen.set_config(self.cfg.clone());
+    }
+
     /// Apply a new gait config. The MPC's per-tick flags that mirror
     /// fields on `GaitConfig` (currently A3 friction-cone-soft +
     /// slack penalty) are pushed into the live MPC config here so a
@@ -1047,6 +1109,9 @@ impl FullCentroidalMpcGaitController {
                 // antiphase to Go2's real `euler_angles()` pitch sign
                 // -- empirically corrected here, not guessed.
                 sign: -1.0,
+                thrust_scale: self.bound_trim_thrust_scale,
+                cmd_vx_mps: self.cmd.vx,
+                velocity_ripple_fraction: self.bound_trim_velocity_ripple_fraction,
             })
         } else {
             None

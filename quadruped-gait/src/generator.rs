@@ -539,6 +539,47 @@ impl AnyGaitController {
         }
     }
 
+    /// Set the Bound trim reference's partial-thrust fraction (see
+    /// [`crate::full_centroidal_controller::FullCentroidalMpcGaitController::set_bound_trim_thrust_scale`]'s
+    /// doc comment). No-op for other modes.
+    pub fn set_bound_trim_thrust_scale(&mut self, thrust_scale: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_trim_thrust_scale(thrust_scale);
+        }
+    }
+    pub fn bound_trim_thrust_scale(&self) -> Option<f64> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => Some(c.bound_trim_thrust_scale()),
+            _ => None,
+        }
+    }
+
+    /// Set the Bound trim reference's "impulse scaling" velocity-
+    /// ripple fraction (see
+    /// [`crate::full_centroidal_controller::FullCentroidalMpcGaitController::set_bound_trim_velocity_ripple_fraction`]'s
+    /// doc comment). No-op for other modes.
+    pub fn set_bound_trim_velocity_ripple_fraction(&mut self, fraction: Option<f64>) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_trim_velocity_ripple_fraction(fraction);
+        }
+    }
+    pub fn bound_trim_velocity_ripple_fraction(&self) -> Option<f64> {
+        match self {
+            AnyGaitController::FullCentroidal(c) => c.bound_trim_velocity_ripple_fraction(),
+            _ => None,
+        }
+    }
+
+    /// Update `cycle_period_s` in place without resetting the phase
+    /// clock (see [`crate::full_centroidal_controller::
+    /// FullCentroidalMpcGaitController::set_cycle_period_s`]'s doc
+    /// comment). No-op for other modes.
+    pub fn set_cycle_period_s(&mut self, period_s: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_cycle_period_s(period_s);
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).
