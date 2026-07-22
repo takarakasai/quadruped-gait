@@ -267,6 +267,24 @@ impl AnyGaitController {
         }
     }
 
+    /// Open-loop world-frame yaw (`BodyState::world_yaw`, integrated
+    /// from `cmd.wz`) -- `0.0` when holding straight (`wz=0`), and the
+    /// natural target for an explicit yaw-holding feedback term
+    /// (`WbcPipeline::yaw_ref`, Sec.5bp) since it already tracks an
+    /// actual turn command instead of always pinning to a fixed
+    /// heading. `LinearCrawl` doesn't track a `BodyState` at all, so
+    /// returns `0.0` (matches its lack of world-frame odometry
+    /// elsewhere in this enum).
+    pub fn world_yaw(&self) -> f64 {
+        match self {
+            AnyGaitController::Champ(c) => c.body_state().world_yaw,
+            AnyGaitController::Mpc(c) => c.body_state().world_yaw,
+            AnyGaitController::CentroidalSrbd(c) => c.body_state().world_yaw,
+            AnyGaitController::FullCentroidal(c) => c.body_state().world_yaw,
+            AnyGaitController::LinearCrawl(_) => 0.0,
+        }
+    }
+
     /// Native centroidal MPC solution, only available in
     /// [`GaitMode::CentroidalSrbd`]. Hosts that want the centroidal-
     /// aware WBC integration read this directly; everyone else can
