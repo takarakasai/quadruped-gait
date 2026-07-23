@@ -112,25 +112,36 @@ pub struct BoundTrimSample {
     /// pair force / 2).
     pub f_x_per_leg: f64,
     /// Vertical GRF for ONE foot of the currently-stance pair (total
-    /// pair force / 2, `= m·g/2` always -- see [`Self::f_z_total`]).
+    /// pair force / 2, `= m·g/2` at `duty_factor=0.5`; `0.0` during a
+    /// flight-phase sample when `duty_factor<0.5` -- see
+    /// [`Self::f_z_total`]).
     pub f_z_per_leg: f64,
 }
 
 impl BoundTrimConfig {
-    /// Total vertical GRF (both stance feet). Constant `= m·g`
-    /// throughout the cycle -- height closure (`ż` periodic under a
-    /// constant `F_z`) forces this; Bound at `duty_factor=0.5` has no
-    /// aerial phase, so no vertical bounce is kinematically possible
-    /// or required.
+    /// Total vertical GRF during stance (both stance feet). `= m·g`
+    /// at `duty_factor=0.5` (Bound's original, no-aerial-phase case,
+    /// where `ż` closes periodically under a constant `F_z` with no
+    /// bounce needed or possible). Generalizes to `duty_factor<0.5`
+    /// (a genuine aerial phase between pairs, see module docs): flight
+    /// is ballistic (`F_z=0`), so the parabola closes in exactly
+    /// `T_flight` seconds only if liftoff/landing vertical speed is
+    /// `+-g·T_flight/2`; stance must then supply the vertical impulse
+    /// `m·g·T_flight` that reverses that speed, over duration `T_st`
+    /// -- averaging (piecewise-constant, matching this model's
+    /// existing philosophy for `F_x`) gives `F_z = m·g/(2·duty_
+    /// factor)`, which is exactly `m·g` at `duty_factor=0.5`.
     pub fn f_z_total(&self) -> f64 {
-        self.mass_kg * GRAVITY_MPS2
+        self.mass_kg * GRAVITY_MPS2 / (2.0 * self.duty_factor)
     }
 
     /// The fore-aft force (both stance feet) that exactly zeroes net
-    /// pitch torque: `F_x* = -r_x·m·g/h0`, from `τ = -h0·F_x -
-    /// r_x·F_z = 0` at `F_z = m·g`.
+    /// pitch torque: `F_x* = -r_x·F_z/h0`, from `τ = -h0·F_x -
+    /// r_x·F_z = 0`. Uses [`Self::f_z_total`] (not a hardcoded `m·g`)
+    /// so the `duty_factor<0.5` dependence propagates here too --
+    /// equal to `-r_x·m·g/h0` at `duty_factor=0.5`.
     pub fn f_x_trim(&self) -> f64 {
-        -self.r_x * self.mass_kg * GRAVITY_MPS2 / self.h0
+        -self.r_x * self.f_z_total() / self.h0
     }
 
     /// Friction coefficient required to realize the *exact* trim
@@ -172,52 +183,113 @@ impl BoundTrimConfig {
         self.cycle_period_s * self.duty_factor
     }
 
+    /// Aerial (flight) duration within a half-cycle -- `0.0` at
+    /// `duty_factor=0.5` (Bound's original, no-aerial-phase case);
+    /// positive whenever `duty_factor<0.5` opens a genuine moment
+    /// with all 4 legs in swing (see module docs).
+    fn t_flight(&self) -> f64 {
+        (0.5 - self.duty_factor).max(0.0) * self.cycle_period_s
+    }
+
     /// Angular acceleration during front-pair stance for a given
     /// (front-phase-convention) fore-aft force `f_x`: `α_p = (-h0·f_x
-    /// - r_x·F_z) / I_yy`.
+    /// - r_x·F_z) / I_yy`. Only applies during stance -- flight is
+    /// force-free (`θ̈=0`), handled separately in [`Self::sample`].
     fn alpha_p(&self, f_x: f64) -> f64 {
         (-self.h0 * f_x - self.r_x * self.f_z_total()) / self.inertia_yy
     }
 
-    /// Peak pitch magnitude (rad) reached at mid-stance, for a given
-    /// front-phase fore-aft force `f_x`: `|α_p|·T_st²/8`.
+    /// Pitch and pitch-rate at front-pair touchdown (`s=0`), from the
+    /// closed-form periodicity closure across stance+flight: the
+    /// front-stance trajectory, propagated through the following
+    /// flight segment, must land on `(-θ(0), -θ̇(0))` at the half-cycle
+    /// mark `s=T/2` for the mirror ansatz to close (see module docs).
+    /// `θ̇(0) = -α_p·T_st/2` and `θ(0) = -α_p·T_st·T_flight/4` --
+    /// `T_flight=0` (`duty_factor=0.5`) gives `θ(0)=0` exactly,
+    /// matching the original derivation's boundary condition.
+    fn theta_boundary(&self, f_x: f64) -> (f64, f64) {
+        let t_st = self.t_st();
+        let t_flight = self.t_flight();
+        let a = self.alpha_p(f_x);
+        let theta_dot_0 = -a * t_st / 2.0;
+        let theta_0 = -a * t_st * t_flight / 4.0;
+        (theta_0, theta_dot_0)
+    }
+
+    /// Peak pitch magnitude (rad) reached over the half-cycle, for a
+    /// given front-phase fore-aft force `f_x`. Candidates: `s=0`
+    /// (`|θ(0)|`, generally nonzero once a flight phase is present),
+    /// the interior stance extremum (where `θ̇=0`, if it falls within
+    /// `[0,T_st]`), and `s=T_st` (liftoff -- flight is linear in `s`,
+    /// so its own extrema are its endpoints, already covered by
+    /// `s=T_st` and the `s=T/2` closure value `-θ(0)`). At
+    /// `duty_factor=0.5` this reduces to the original single-parabola
+    /// peak (`θ(0)=0`, extremum at `s=T_st/2`).
     pub fn theta_peak(&self, f_x: f64) -> f64 {
-        (self.alpha_p(f_x).abs() * self.t_st() * self.t_st()) / 8.0
+        let t_st = self.t_st();
+        let a = self.alpha_p(f_x);
+        let (theta_0, theta_dot_0) = self.theta_boundary(f_x);
+        let theta_at = |s: f64| theta_0 + theta_dot_0 * s + 0.5 * a * s * s;
+        let mut peak = theta_0.abs().max(theta_at(t_st).abs());
+        if a != 0.0 {
+            let s_star = -theta_dot_0 / a;
+            if s_star > 0.0 && s_star < t_st {
+                peak = peak.max(theta_at(s_star).abs());
+            }
+        }
+        peak
     }
 
     /// Sample the trim reference at a global gait-cycle phase
     /// `cycle_phase ∈ [0, 1)` (matching `PhaseGenerator::cycle_phase()`
     /// / `GaitType::Bound`'s own front=`[0,0.5)`/rear=`[0.5,1.0)`
-    /// convention). Uses the closed-form solution to the half-cycle
-    /// boundary-value problem: `θ_A(s) = (α_p/2)·s·(s−T_st)` for front
-    /// stance (`θ_A(0)=0`, peak magnitude at `s=T_st/2`), and rear
-    /// stance is the front solution's exact negation at the same
-    /// local stance time (`θ_B(s) = -θ_A(s)`, `F_x^B = -F_x^A`) --
+    /// convention). Each half-cycle is now `[0,T_st)` stance followed
+    /// by `[T_st,T/2)` flight (T_flight=0 at `duty_factor=0.5`,
+    /// reducing exactly to the original single-segment closed form):
+    /// stance follows the quadratic from [`Self::theta_boundary`]'s
+    /// initial conditions, flight continues at the constant angular
+    /// velocity reached at liftoff (force-free) with `f_x_per_leg=
+    /// f_z_per_leg=0`. Rear stance is the front solution's exact
+    /// negation at the same local half-cycle time (`θ_B(s)=-θ_A(s)`,
+    /// `F_x^B=-F_x^A`; `F_z` does not flip sign, it's the same
+    /// stance/flight schedule shape for both pairs, just shifted) --
     /// the mirror-symmetry ansatz that closes the periodicity
-    /// condition (see module docs / Sec.5bb).
+    /// condition (see module docs / Sec.5bb/5bq).
     pub fn sample(&self, cycle_phase: f64) -> BoundTrimSample {
         let cycle_phase = cycle_phase.rem_euclid(1.0);
-        let front_stance = cycle_phase < 0.5;
-        let local_frac = if front_stance { cycle_phase } else { cycle_phase - 0.5 }; // in [0, 0.5)
-        let s = local_frac * 2.0 * self.t_st(); // map [0,0.5) -> [0, T_st)
+        let front_half = cycle_phase < 0.5;
+        let local_frac = if front_half { cycle_phase } else { cycle_phase - 0.5 }; // in [0, 0.5)
+        let s = local_frac * self.cycle_period_s; // local half-cycle time, in [0, T/2)
 
         let f_x_a = self.f_x_used();
         let alpha_p = self.alpha_p(f_x_a);
         let t_st = self.t_st();
-        let theta_a = (alpha_p / 2.0) * s * (s - t_st);
-        let theta_dot_a = alpha_p * (s - t_st / 2.0);
+        let (theta_0, theta_dot_0) = self.theta_boundary(f_x_a);
 
-        let (pitch, pitch_rate, f_x_pair) = if front_stance {
-            (theta_a, theta_dot_a, f_x_a)
+        let (theta_a, theta_dot_a, f_x_pair_a, f_z_pair_a) = if s < t_st {
+            // Stance: quadratic from the touchdown boundary condition.
+            let theta = theta_0 + theta_dot_0 * s + 0.5 * alpha_p * s * s;
+            let theta_dot = theta_dot_0 + alpha_p * s;
+            (theta, theta_dot, f_x_a, self.f_z_total())
         } else {
-            (-theta_a, -theta_dot_a, -f_x_a)
+            // Flight: force-free, constant angular velocity from liftoff.
+            let theta_dot_lo = theta_dot_0 + alpha_p * t_st;
+            let theta_lo = theta_0 + theta_dot_0 * t_st + 0.5 * alpha_p * t_st * t_st;
+            let u = s - t_st;
+            (theta_lo + theta_dot_lo * u, theta_dot_lo, 0.0, 0.0)
+        };
+
+        let (pitch, pitch_rate, f_x_pair, f_z_pair) = if front_half {
+            (theta_a, theta_dot_a, f_x_pair_a, f_z_pair_a)
+        } else {
+            (-theta_a, -theta_dot_a, -f_x_pair_a, f_z_pair_a)
         };
 
         BoundTrimSample {
             pitch: self.sign * pitch,
             pitch_rate: self.sign * pitch_rate,
             f_x_per_leg: self.sign * f_x_pair / 2.0,
-            f_z_per_leg: self.f_z_total() / 2.0,
+            f_z_per_leg: f_z_pair / 2.0,
         }
     }
 }
@@ -449,5 +521,137 @@ mod tests {
             "ripple-fraction F_x_used={:.2} should be within 2N of thrust_scale=0.4's {:.2}",
             cfg.f_x_used(), thrust_scale_path
         );
+    }
+
+    /// `f_z_total()` at `duty_factor<0.5` matches the flight-phase
+    /// closed form (`m·g/(2·duty)`), cross-checked against
+    /// `simulate_point_mass_bound_flight_phase.py`'s printed table
+    /// (Phase 0, local doc Sec.5bq).
+    #[test]
+    fn f_z_total_grows_as_duty_factor_shrinks_below_half() {
+        let mut cfg = go2_cfg(0.7);
+        cfg.cycle_period_s = 0.18;
+        for (duty, expected_fz) in [
+            (0.50, 153.09),
+            (0.45, 170.11),
+            (0.40, 191.37),
+            (0.35, 218.71),
+            (0.30, 255.16),
+            (0.25, 306.19),
+        ] {
+            cfg.duty_factor = duty;
+            assert!(
+                (cfg.f_z_total() - expected_fz).abs() < 0.1,
+                "duty={duty}: f_z_total={:.2} expected {expected_fz:.2}",
+                cfg.f_z_total()
+            );
+        }
+    }
+
+    /// `theta_boundary`'s closed-form `(θ(0), θ̇(0))` matches the
+    /// Python reference at each swept `duty_factor`, including the
+    /// `duty=0.5` case reproducing `θ(0)=0` exactly (no flight, no
+    /// change from the original single-parabola derivation).
+    #[test]
+    fn theta_boundary_matches_flight_phase_closed_form() {
+        let mut cfg = go2_cfg(0.7);
+        cfg.cycle_period_s = 0.18;
+        for (duty, expected_th0, expected_thd0) in [
+            (0.50, 0.0, 0.40170),
+            (0.45, 0.00181, 0.40170),
+            (0.40, 0.00362, 0.40170),
+            (0.35, 0.00542, 0.40170),
+            (0.30, 0.00723, 0.40170),
+            (0.25, 0.00904, 0.40170),
+        ] {
+            cfg.duty_factor = duty;
+            let f_x = cfg.f_x_clipped();
+            let (th0, thd0) = cfg.theta_boundary(f_x);
+            assert!(
+                (th0 - expected_th0).abs() < 0.001,
+                "duty={duty}: th0={th0:.5} expected {expected_th0:.5}"
+            );
+            assert!(
+                (thd0 - expected_thd0).abs() < 0.001,
+                "duty={duty}: thd0={thd0:.5} expected {expected_thd0:.5}"
+            );
+        }
+    }
+
+    /// `theta_peak` (the 3-candidate generalization) matches the
+    /// Python reference across the same duty sweep.
+    #[test]
+    fn theta_peak_matches_flight_phase_closed_form() {
+        let mut cfg = go2_cfg(0.7);
+        cfg.cycle_period_s = 0.18;
+        for (duty, expected_peak) in [
+            (0.50, 0.00904),
+            (0.45, 0.00994),
+            (0.40, 0.01085),
+            (0.35, 0.01175),
+            (0.30, 0.01265),
+            (0.25, 0.01356),
+        ] {
+            cfg.duty_factor = duty;
+            let f_x = cfg.f_x_clipped();
+            let peak = cfg.theta_peak(f_x);
+            assert!(
+                (peak - expected_peak).abs() < 0.001,
+                "duty={duty}: theta_peak={peak:.5} expected {expected_peak:.5}"
+            );
+        }
+    }
+
+    /// During the flight segment of a `duty_factor<0.5` half-cycle,
+    /// `sample()` must report zero force on both axes -- no feet on
+    /// the ground to push against.
+    #[test]
+    fn flight_phase_sample_has_zero_force() {
+        let mut cfg = go2_cfg(0.7);
+        cfg.cycle_period_s = 0.18;
+        cfg.duty_factor = 0.4; // T_st=0.072, T_flight=0.018, half-cycle=0.09
+        // Front-pair flight: local time s in (T_st, T/2) -> cycle_phase in (0.4, 0.5).
+        let sample = cfg.sample(0.45);
+        assert_eq!(sample.f_x_per_leg, 0.0);
+        assert_eq!(sample.f_z_per_leg, 0.0);
+        // Rear-pair flight: cycle_phase in (0.9, 1.0).
+        let sample = cfg.sample(0.95);
+        assert_eq!(sample.f_x_per_leg, 0.0);
+        assert_eq!(sample.f_z_per_leg, 0.0);
+    }
+
+    /// At `duty_factor=0.5` (no flight phase, `T_flight=0`), `sample`'s
+    /// generalized stance/flight branch must reproduce the original
+    /// single-parabola trajectory exactly at several phases -- this is
+    /// the key regression check that the `s` mapping fix (`local_frac
+    /// * cycle_period_s` instead of the old `local_frac * 2 * t_st()`,
+    /// which only coincided with the correct formula at duty=0.5)
+    /// didn't change duty=0.5 behaviour.
+    #[test]
+    fn duty_one_half_sample_matches_original_single_parabola() {
+        let cfg = go2_cfg(0.7);
+        let f_x = cfg.f_x_clipped();
+        let alpha_p = -(cfg.h0 * f_x + cfg.r_x * cfg.f_z_total()) / cfg.inertia_yy;
+        let t_st = cfg.cycle_period_s * 0.5;
+        for cycle_phase in [0.0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9] {
+            let local_frac = if cycle_phase < 0.5 { cycle_phase } else { cycle_phase - 0.5 };
+            let s = local_frac * 2.0 * t_st; // old formula, exact at duty=0.5
+            let expected_theta = (alpha_p / 2.0) * s * (s - t_st);
+            let expected_theta_dot = alpha_p * (s - t_st / 2.0);
+            let sample = cfg.sample(cycle_phase);
+            let (theta, theta_dot) = if cycle_phase < 0.5 {
+                (sample.pitch / cfg.sign, sample.pitch_rate / cfg.sign)
+            } else {
+                (-sample.pitch / cfg.sign, -sample.pitch_rate / cfg.sign)
+            };
+            assert!(
+                (theta - expected_theta).abs() < 1e-9,
+                "cycle_phase={cycle_phase}: theta={theta:.6} expected {expected_theta:.6}"
+            );
+            assert!(
+                (theta_dot - expected_theta_dot).abs() < 1e-9,
+                "cycle_phase={cycle_phase}: theta_dot={theta_dot:.6} expected {expected_theta_dot:.6}"
+            );
+        }
     }
 }
