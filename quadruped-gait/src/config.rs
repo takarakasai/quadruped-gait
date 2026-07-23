@@ -316,6 +316,20 @@ pub struct GaitConfig {
     /// bounce is zero and `f_z==m·g`, so this is a no-op. Default
     /// `false` preserves the exact prior (gravity-z, flat-v_z) reference.
     pub bound_trim_vertical_reference: bool,
+    /// **Forward fore-aft GRF thrust bias** (N, total across stance
+    /// feet), added to the MPC's GRF reference on stance legs (Sec.5d7,
+    /// articara ref/wbc_comparison.md). The MIT-faithful trimless Bound
+    /// caps at ~1.3 m/s because, without the closed-form trim's
+    /// structured F_x, the MPC's velocity-tracking alone can't supply
+    /// enough forward force at high command (Sec.5d6 a). This adds a
+    /// simple constant forward thrust feedforward (distributed by the
+    /// same stance transition ramp as gravity) to raise the ceiling --
+    /// a minimal hybrid between the pure-MIT line and the full trim.
+    /// Unlike the trim's ALTERNATING (front/rear) pitch-cancelling F_x,
+    /// this is a net forward push, so it also injects a pitch moment
+    /// the (low-weight) attitude cost must absorb. `0.0` (default) is a
+    /// no-op. Applied in world-x (≈ body-forward for straight running).
+    pub bound_fx_thrust_bias: f64,
     /// **LinearCrawl-only**: fraction of each per-leg sub-cycle
     /// (`T/4`) held in 4-support before that leg lifts. Range `(0, 1)`;
     /// `0.5` is the default. Only [`crate::linear_crawl::LinearCrawlController`]
@@ -400,6 +414,7 @@ impl GaitConfig {
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
+            bound_fx_thrust_bias: 0.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -430,6 +445,7 @@ impl GaitConfig {
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
+            bound_fx_thrust_bias: 0.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -459,6 +475,7 @@ impl GaitConfig {
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
+            bound_fx_thrust_bias: 0.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -487,6 +504,7 @@ impl GaitConfig {
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
+            bound_fx_thrust_bias: 0.0,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -541,6 +559,7 @@ impl GaitConfig {
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
+            bound_fx_thrust_bias: 0.0,
             four_support_fraction: 0.85,
             lateral_sway_m: 0.0,
             smooth_swing: false,

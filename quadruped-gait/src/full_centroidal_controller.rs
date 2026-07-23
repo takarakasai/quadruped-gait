@@ -1343,6 +1343,19 @@ impl FullCentroidalMpcGaitController {
                     }
                 }
             }
+            // Sec.5d7 forward thrust bias: add a constant net forward
+            // GRF (world-x ≈ body-forward for straight running) on
+            // stance feet, distributed by the same transition-ramp
+            // weights. Raises the trimless MIT line's speed ceiling by
+            // supplying the forward force the velocity-tracking cost
+            // can't at high command. `0.0` (default) is a no-op.
+            if self.cfg.bound_fx_thrust_bias != 0.0 && total_weight > 1e-9 {
+                for leg in 0..N_FEET {
+                    if contact.is_stance[leg][k] {
+                        grfs[leg].x += leg_weights[leg] * self.cfg.bound_fx_thrust_bias / total_weight;
+                    }
+                }
+            }
             ref_inputs.push(FullCentroidalInput {
                 grfs_world: grfs,
                 joint_v: [0.0; N_LEG_JOINTS],
