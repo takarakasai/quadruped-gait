@@ -658,6 +658,14 @@ impl AnyGaitController {
         }
     }
 
+    /// Set the P3-a prescribed `(front, rear)` footholds from the trajopt
+    /// orbit. No-op for other modes.
+    pub fn set_bound_prescribed_footholds(&mut self, footholds: Option<(f64, f64)>) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_prescribed_footholds(footholds);
+        }
+    }
+
     /// Feed the observed base roll/pitch (rad) to the Poincaré/deadbeat
     /// pitch foot-placement. No-op for other modes.
     pub fn set_body_attitude_observed(&mut self, roll: f64, pitch: f64) {

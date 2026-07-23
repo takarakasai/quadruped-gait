@@ -83,6 +83,13 @@ pub struct BoundOrbit {
     /// Front / rear foot fore-aft positions (world, at the cycle start).
     pub xf: f64,
     pub xr: f64,
+    /// **P3-a**: front / rear pair fore-aft foothold RELATIVE TO THE CoM at
+    /// that pair's touchdown (front at phase 0, rear at phase 0.5). These
+    /// are the placements that make the orbit forward-moving AND
+    /// pitch-balanced -- the controller can follow them directly instead of
+    /// the Raibert+deadbeat footstep (which fought forward vs stabilize).
+    pub front_foothold: f64,
+    pub rear_foothold: f64,
     /// Max |periodicity + forward| residual of the returned solution.
     pub periodicity_residual: f64,
     /// Worst friction margin (mu - |fx|/fz) over stance; >= 0 is feasible.
@@ -362,6 +369,11 @@ fn build_orbit(model: &Model, x: &[f64]) -> BoundOrbit {
     let nsub = 12; // 48 rows over the cycle, matching the P0 CSV export
     let traj = model.integrate(x, nsub);
     let n = traj.len();
+    // P3-a footholds: each pair's foot fore-aft relative to the CoM at its
+    // touchdown. front touches down at index 0 (phase 0); rear at index
+    // 2*nsub (phase 0.5, start of the rear-stance segment).
+    let front_foothold = x[P_XF] - traj[0][0];
+    let rear_foothold = x[P_XR] - traj[(2 * nsub).min(n - 1)][0];
     let mut samples = Vec::with_capacity(n - 1);
     let mut table = Vec::with_capacity(n - 1);
     for (k, s) in traj.iter().take(n - 1).enumerate() {
@@ -400,6 +412,8 @@ fn build_orbit(model: &Model, x: &[f64]) -> BoundOrbit {
         samples,
         xf: x[P_XF],
         xr: x[P_XR],
+        front_foothold,
+        rear_foothold,
         periodicity_residual: per,
         friction_margin: fric,
         table,
@@ -421,9 +435,10 @@ mod tests {
         let pk = orbit.samples.iter().map(|s| s.pitch.abs()).fold(0.0_f64, f64::max);
         eprintln!(
             "[P1 Rust orbit] periodicity={:.2e} vx_avg={:.3} z_range={:.3} peak_pitch={:.3} \
-             friction_margin={:.3} xf={:.3} xr={:.3} rows={}",
+             friction_margin={:.3} xf={:.3} xr={:.3} front_foothold={:.3} rear_foothold={:.3} rows={}",
             orbit.periodicity_residual, vx_dbg, zmax_dbg - zmin_dbg, pk,
-            orbit.friction_margin, orbit.xf, orbit.xr, orbit.table.len(),
+            orbit.friction_margin, orbit.xf, orbit.xr,
+            orbit.front_foothold, orbit.rear_foothold, orbit.table.len(),
         );
         // periodicity closed and forward speed achieved
         assert!(
