@@ -119,6 +119,56 @@ pub struct FullCentroidalMpcGaitController {
     v_fore_aft_filtered: f64,
     v_observed_world: Vector3<f64>,
     omega_observed_world: Vector3<f64>,
+    /// Observed base attitude (world-frame roll/pitch), fed by
+    /// [`Self::set_body_attitude_observed`]. Only consumed by the
+    /// Poincaré/deadbeat pitch foot-placement (Sec.5f6); defaults to
+    /// zero so callers that never set it keep the prior behaviour.
+    roll_observed: f64,
+    pitch_observed: f64,
+    /// **Poincaré/deadbeat pitch foot-placement** (Sec.5f6). For an
+    /// energetic Bound with real air time, the tumble is a slow pitch
+    /// divergence: each cycle imparts a small net pitch impulse the
+    /// stance can't cancel, so pitch angular momentum grows until the
+    /// body somersaults (Sec.5f3-5f5: rate-deadbeat state weights only
+    /// delay it 4x). The touchdown fore-aft position of the front/rear
+    /// pair sets the pitch moment during the next stance (upward GRF at
+    /// fore-aft offset x → pitch moment ∝ -x), so shifting the foothold
+    /// by the pitch error is a Poincaré-section deadbeat that nulls the
+    /// accumulated momentum rather than merely damping it:
+    ///   `x_foot += k_ang·pitch + k_rate·pitch_rate`.
+    /// Applied uniformly to both pairs (same body pitch state); the sign
+    /// is carried in the gains and swept empirically (Sec.5f's pitch sign
+    /// convention is antiphase to `euler_angles()`, see the trim path).
+    /// `(0.0, 0.0)` (default) leaves the foothold untouched.
+    bound_pitch_placement_gain: f64,
+    bound_pitch_rate_placement_gain: f64,
+    /// Sec.5f8 DC-blocker time constant (s) for the pitch foot-placement.
+    /// The orbit-relative deadbeat still leaves a persistent forward
+    /// foothold bias (the trim closed-form nominal ≠ the real orbit's
+    /// pitch_rate at the sampled phase), which drags the body backward.
+    /// A slow EMA of the applied shift estimates that DC bias; subtracting
+    /// it leaves only the AC (deviation-stabilizing) part, so steady-state
+    /// placement is drift-neutral while transient corrections survive.
+    /// `0.0` (default) disables it -- the raw Sec.5f6/5f8 shift.
+    bound_pitch_placement_dc_tau: f64,
+    /// Sec.5f9 (P2) tabulated forward-Bound reference orbit: rows of
+    /// `[phase, z, pitch, vx, vz, w]` over one cycle (phase in [0,1)),
+    /// produced offline by the trajopt existence solver
+    /// (`ref/scripts/bound_trajopt_p0_shooting.py`). When set, the MPC
+    /// reference loop injects the phase-interpolated (z, pitch, vx, vz, w)
+    /// instead of the flat / closed-form-trim reference -- giving the MPC
+    /// a CONSISTENT feasible forward orbit to track (the missing piece
+    /// §5f7/5f8 identified: forward velocity + trim pitch + flat height
+    /// were mutually infeasible, so vx collapsed to ~0). Rows must be
+    /// sorted by ascending phase. `None` keeps the existing reference.
+    bound_tabulated_reference: Option<Vec<[f64; 6]>>,
+    /// Running EMA of the applied pitch shift (the DC estimate) and the
+    /// once-per-tick DC-blocked value the footstep planner consumes. The
+    /// shift is leg-independent (global pitch state), so it is computed
+    /// once per `tick` (where `&mut self` allows the EMA update) and read
+    /// by every leg's `compute_mpc_footstep`.
+    pitch_placement_shift_dc: f64,
+    pitch_placement_shift: f64,
 
     full_centroidal_mpc: FullCentroidalMpc,
     last_solution: Option<FullCentroidalMpcSolution>,
@@ -302,6 +352,14 @@ impl FullCentroidalMpcGaitController {
             k_capture_pulse: 0.0,
             v_capture_deadband: 0.0,
             bound_fore_aft_placement_gain: 0.0,
+            roll_observed: 0.0,
+            pitch_observed: 0.0,
+            bound_pitch_placement_gain: 0.0,
+            bound_pitch_rate_placement_gain: 0.0,
+            bound_pitch_placement_dc_tau: 0.0,
+            pitch_placement_shift_dc: 0.0,
+            pitch_placement_shift: 0.0,
+            bound_tabulated_reference: None,
             v_fore_aft_filtered: 0.0,
             v_observed_world: Vector3::zeros(),
             omega_observed_world: Vector3::zeros(),
@@ -666,6 +724,63 @@ impl FullCentroidalMpcGaitController {
         self.bound_fore_aft_placement_gain = k.max(0.0);
     }
 
+    /// Set the Poincaré/deadbeat pitch foot-placement gains
+    /// `(k_angle, k_rate)` (see the field's doc comment). Unlike the
+    /// speed-regulator gain these are NOT clamped to ≥ 0 -- the pitch
+    /// sign convention is antiphase to `euler_angles()`, so the
+    /// stabilizing sign is found empirically. `(0.0, 0.0)` (default)
+    /// leaves the foothold untouched.
+    pub fn set_bound_pitch_placement_gain(&mut self, k_angle: f64, k_rate: f64) {
+        self.bound_pitch_placement_gain = k_angle;
+        self.bound_pitch_rate_placement_gain = k_rate;
+    }
+
+    /// Set the Sec.5f8 DC-blocker time constant (s) for the pitch
+    /// foot-placement (see the field's doc). `0.0` disables it. Clamped
+    /// to ≥ 0.
+    pub fn set_bound_pitch_placement_dc_tau(&mut self, tau: f64) {
+        self.bound_pitch_placement_dc_tau = tau.max(0.0);
+    }
+
+    /// Set the Sec.5f9 (P2) tabulated forward-Bound reference orbit
+    /// (`[phase, z, pitch, vx, vz, w]` rows, ascending phase). Empty or
+    /// `None` clears it.
+    pub fn set_bound_tabulated_reference(&mut self, table: Option<Vec<[f64; 6]>>) {
+        self.bound_tabulated_reference = table.filter(|t| t.len() >= 2);
+    }
+
+    /// Phase-interpolate the tabulated reference at `phase` in [0,1),
+    /// returning `(z, pitch, vx, vz, w)`. Linear between the two nearest
+    /// rows, wrapping across the period boundary.
+    fn sample_tabulated_reference(&self, phase: f64) -> Option<(f64, f64, f64, f64, f64)> {
+        let t = self.bound_tabulated_reference.as_ref()?;
+        let ph = phase.rem_euclid(1.0);
+        // find the first row with phase > ph; interpolate with predecessor
+        let n = t.len();
+        let mut hi = n;
+        for (i, row) in t.iter().enumerate() {
+            if row[0] > ph {
+                hi = i;
+                break;
+            }
+        }
+        let (lo_i, hi_i, span_lo, span_hi) = if hi == 0 {
+            // before the first row: wrap with the last row (phase-1)
+            (n - 1, 0, t[n - 1][0] - 1.0, t[0][0])
+        } else if hi == n {
+            // after the last row: wrap to the first (phase+1)
+            (n - 1, 0, t[n - 1][0], t[0][0] + 1.0)
+        } else {
+            (hi - 1, hi, t[hi - 1][0], t[hi][0])
+        };
+        let denom = (span_hi - span_lo).max(1e-9);
+        let frac = ((ph - span_lo) / denom).clamp(0.0, 1.0);
+        let a = &t[lo_i];
+        let b = &t[hi_i];
+        let lerp = |j: usize| a[j] + frac * (b[j] - a[j]);
+        Some((lerp(1), lerp(2), lerp(3), lerp(4), lerp(5)))
+    }
+
     /// Read the nonlinear pulse branch parameters `(k_pulse, v_db)`.
     /// `k_pulse = 0` means the pulse branch is inactive — the
     /// controller uses pure linear capture-point.
@@ -699,6 +814,15 @@ impl FullCentroidalMpcGaitController {
     ) {
         self.body_state.world_yaw = world_yaw;
         self.body_state.world_position = world_position;
+    }
+
+    /// Feed the observed base roll/pitch (world-frame ZYX Euler, rad),
+    /// consumed only by the Poincaré/deadbeat pitch foot-placement
+    /// (Sec.5f6). Optional -- callers that never set it keep the prior
+    /// zero-attitude behaviour, so this is non-breaking.
+    pub fn set_body_attitude_observed(&mut self, roll: f64, pitch: f64) {
+        self.roll_observed = roll;
+        self.pitch_observed = pitch;
     }
 
     pub fn reset(&mut self) {
@@ -744,6 +868,48 @@ impl FullCentroidalMpcGaitController {
             let alpha = (dt / (tau + dt)).clamp(0.0, 1.0);
             self.v_fore_aft_filtered += alpha * (v_obs_body.x - self.v_fore_aft_filtered);
         }
+
+        // Sec.5f8 pitch foot-placement shift, computed ONCE per tick (the
+        // shift is leg-independent: it depends only on the global base
+        // pitch state). Orbit-relative deviation (subtract the trim
+        // nominal at the current phase) plus an optional DC-blocker that
+        // removes the residual persistent forward bias (which otherwise
+        // drags the body backward, Sec.5f7). Every leg's footstep reads
+        // the resulting `self.pitch_placement_shift`.
+        if self.bound_pitch_placement_gain != 0.0 || self.bound_pitch_rate_placement_gain != 0.0 {
+            // Nominal for the orbit-relative deadbeat. The closed-form trim
+            // orbit is used when active; otherwise absolute (0,0). NOTE
+            // (Sec.5f9/P2): subtracting the *tabulated* SRBD orbit's
+            // pitch_rate was tried and made it WORSE (tumble at ~5s) --
+            // the planar SRBD nominal ≠ the real 3D Go2 pitch_rate, so the
+            // "deviation" is polluted by model mismatch and the deadbeat
+            // loses its stabilizing action. Instead the deadbeat keeps its
+            // full (absolute/trim) stabilizing action and the DC-blocker
+            // (model-free) removes the backward-drag DC, while the
+            // tabulated reference supplies the forward drive.
+            let cur_phase = self.phase_gen.cycle_phase();
+            let (nom_pitch, nom_pitch_rate) = if let Some(trim) = self.bound_trim_config() {
+                let s = trim.sample(cur_phase);
+                (s.pitch, s.pitch_rate)
+            } else {
+                (0.0, 0.0)
+            };
+            let pitch_err = self.pitch_observed - nom_pitch;
+            let pitch_rate_err = self.omega_observed_world.y - nom_pitch_rate;
+            let raw = self.bound_pitch_placement_gain * pitch_err
+                + self.bound_pitch_rate_placement_gain * pitch_rate_err;
+            if self.bound_pitch_placement_dc_tau > 0.0 {
+                let alpha = (dt / (self.bound_pitch_placement_dc_tau + dt)).clamp(0.0, 1.0);
+                self.pitch_placement_shift_dc += alpha * (raw - self.pitch_placement_shift_dc);
+                self.pitch_placement_shift = raw - self.pitch_placement_shift_dc;
+            } else {
+                self.pitch_placement_shift = raw;
+            }
+        } else {
+            self.pitch_placement_shift = 0.0;
+            self.pitch_placement_shift_dc = 0.0;
+        }
+
         let v_cmd = Vector3::new(self.cmd.vx, self.cmd.vy, 0.0);
         let v_err_body = v_obs_body - v_cmd;
 
@@ -1176,35 +1342,10 @@ impl FullCentroidalMpcGaitController {
         // every other gait, and for Bound while holding (cmd==0) --
         // an oscillating reference makes no sense standing still.
         let fl_slot = crate::controller::slot_of(LegId::FL);
-        let bound_trim: Option<BoundTrimConfig> = if self.enable_bound_trim_reference
-            && self.cfg.gait_type == GaitType::Bound
-            && !holding
-        {
-            let fl_kin = self.kin.leg(LegId::FL);
-            let rl_kin = self.kin.leg(LegId::RL);
-            let r_x_front = fl_kin.nominal_foot_body.x;
-            let r_x_rear = -rl_kin.nominal_foot_body.x;
-            let h0 = -fl_kin.nominal_foot_body.z;
-            Some(BoundTrimConfig {
-                mass_kg: cfg.mass_kg,
-                inertia_yy: cfg.centroidal_inertia_body[(1, 1)],
-                r_x: 0.5 * (r_x_front + r_x_rear),
-                h0,
-                cycle_period_s: self.cfg.cycle_period_s,
-                duty_factor: self.cfg.duty_factor,
-                friction_mu: cfg.friction_mu,
-                // Sec.5bc: MuJoCo phase-check found this module's
-                // internal front-stance-positive convention runs
-                // antiphase to Go2's real `euler_angles()` pitch sign
-                // -- empirically corrected here, not guessed.
-                sign: -1.0,
-                thrust_scale: self.bound_trim_thrust_scale,
-                cmd_vx_mps: self.cmd.vx,
-                velocity_ripple_fraction: self.bound_trim_velocity_ripple_fraction,
-            })
-        } else {
-            None
-        };
+        // Sec.5bb/5bc closed-form pitch/Fx orbit; `None` for other gaits
+        // and while holding. Built via the shared helper so the Sec.5f8
+        // orbit-relative foot-placement samples the identical nominal.
+        let bound_trim: Option<BoundTrimConfig> = self.bound_trim_config();
 
         // Per-step reference state + input. Body pose integrates the cmd
         // velocity; joint_q held (or set to nominal pose when β is on);
@@ -1225,13 +1366,27 @@ impl FullCentroidalMpcGaitController {
             // no separate phase math needed, stays consistent with
             // whatever `contact`/`phase_sub_fractions` already decided
             // for this step).
-            let trim_sample = bound_trim.map(|trim| {
-                let fl_stance = contact.is_stance[fl_slot][k];
-                let fl_sub = phase_sub_fractions[fl_slot][k];
-                let cycle_phase_k = if fl_stance { fl_sub * duty } else { duty + fl_sub * (1.0 - duty) };
-                trim.sample(cycle_phase_k)
-            });
-            if let Some(sample) = trim_sample {
+            let fl_stance = contact.is_stance[fl_slot][k];
+            let fl_sub = phase_sub_fractions[fl_slot][k];
+            let cycle_phase_k = if fl_stance { fl_sub * duty } else { duty + fl_sub * (1.0 - duty) };
+            let trim_sample = bound_trim.map(|trim| trim.sample(cycle_phase_k));
+            // Sec.5f9 (P2): a tabulated feasible forward-Bound orbit takes
+            // priority over the closed-form trim. It injects the FULL
+            // consistent reference (height z, pitch, forward vx, vertical
+            // vz, pitch-rate w) at this step's phase -- the missing piece
+            // §5f7/5f8 found: forward-vx + trim-pitch + flat-height were
+            // mutually infeasible, so the MPC gave vx≈0. A consistent
+            // orbit gives it a trackable forward target. Straight bound
+            // (yaw≈0) => world x = forward. (GRF reference below still uses
+            // the trim's f_x when a trim is set; the table has no forces,
+            // so the MPC optimizes GRF around the gravity split otherwise.)
+            if let Some((z, pitch, vx, vz, w)) = self.sample_tabulated_reference(cycle_phase_k) {
+                sk.base_euler_zyx.y = pitch;
+                sk.v_com_world.x = vx;
+                sk.v_com_world.z = vz;
+                sk.base_pos_world.z = z;
+                sk.angular_velocity_world.y = w;
+            } else if let Some(sample) = bound_trim.map(|trim| trim.sample(cycle_phase_k)) {
                 sk.base_euler_zyx.y = sample.pitch;
                 // Sec.5d4: feed the ballistic vertical-bounce velocity
                 // into the reference (opt-in). NOTE: verified against
@@ -1465,6 +1620,38 @@ impl FullCentroidalMpcGaitController {
         world_to_body_horizontal(residual_world, self.body_state.world_yaw)
     }
 
+    /// Build the closed-form Bound trim reference for the current config,
+    /// or `None` for other gaits / while holding (Sec.5bb/5bc). Shared by
+    /// the per-step MPC reference loop and the Sec.5f8 orbit-relative
+    /// pitch foot-placement, so both sample the SAME nominal orbit.
+    fn bound_trim_config(&self) -> Option<BoundTrimConfig> {
+        if !(self.enable_bound_trim_reference
+            && self.cfg.gait_type == GaitType::Bound
+            && !self.cmd.is_zero())
+        {
+            return None;
+        }
+        let cfg = self.full_centroidal_mpc.config();
+        let fl_kin = self.kin.leg(LegId::FL);
+        let rl_kin = self.kin.leg(LegId::RL);
+        let r_x_front = fl_kin.nominal_foot_body.x;
+        let r_x_rear = -rl_kin.nominal_foot_body.x;
+        let h0 = -fl_kin.nominal_foot_body.z;
+        Some(BoundTrimConfig {
+            mass_kg: cfg.mass_kg,
+            inertia_yy: cfg.centroidal_inertia_body[(1, 1)],
+            r_x: 0.5 * (r_x_front + r_x_rear),
+            h0,
+            cycle_period_s: self.cfg.cycle_period_s,
+            duty_factor: self.cfg.duty_factor,
+            friction_mu: cfg.friction_mu,
+            sign: -1.0,
+            thrust_scale: self.bound_trim_thrust_scale,
+            cmd_vx_mps: self.cmd.vx,
+            velocity_ripple_fraction: self.bound_trim_velocity_ripple_fraction,
+        })
+    }
+
     fn compute_mpc_footstep(
         &self,
         kin: &LegKinematics,
@@ -1539,6 +1726,7 @@ impl FullCentroidalMpcGaitController {
             half.x = v_filt * (0.5 * stance_duration)
                 + self.bound_fore_aft_placement_gain * (v_filt - self.cmd.vx);
         }
+
         let raw_half = half + closed_loop;
         let mut combined = raw_half;
         let min_x = MIN_HALF_FRACTION * half.x;
@@ -1559,9 +1747,37 @@ impl FullCentroidalMpcGaitController {
         if mag > max_half && mag > 0.0 {
             half *= max_half / mag;
         }
+
+        // Poincaré/deadbeat pitch foot-placement (Sec.5f6/5f7). Shift the
+        // TOUCH_DOWN fore-aft by the pitch error so the upcoming stance's
+        // GRF moment nulls the accumulated pitch momentum. Applied to
+        // touch_down ONLY (not the symmetric `half`) so it does NOT bias
+        // the step CENTER: Sec.5f7 found that folding it into `half`
+        // shifted lift_off backward too, biasing net fore-aft travel into
+        // a persistent backward drift the speed regulator couldn't
+        // reverse. Leaving lift_off at the speed-neutral point and moving
+        // only the landing target decouples attitude control from the
+        // fore-aft drive. Independent of `feedback_enabled` (attitude must
+        // be stabilized even at zero velocity command); clamped to the
+        // same max-step envelope.
+        let mut touch_down = kin.nominal_foot_body + half;
+        // Sec.5f6/5f8 Poincaré/deadbeat pitch foot-placement. The shift
+        // (orbit-relative deviation, optionally DC-blocked) is computed
+        // once per tick in `tick()` -- it is leg-independent -- and only
+        // applied to TOUCH_DOWN here (not the symmetric `half`, Sec.5f7)
+        // so it does not bias the step center. Clamped to the same
+        // max-step envelope.
+        if self.pitch_placement_shift != 0.0 {
+            touch_down.x += self.pitch_placement_shift;
+            let td_rel = touch_down - kin.nominal_foot_body;
+            let td_mag = td_rel.norm();
+            if td_mag > max_half && td_mag > 0.0 {
+                touch_down = kin.nominal_foot_body + td_rel * (max_half / td_mag);
+            }
+        }
         Footstep {
             lift_off: kin.nominal_foot_body - half,
-            touch_down: kin.nominal_foot_body + half,
+            touch_down,
         }
     }
 }

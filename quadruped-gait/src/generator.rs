@@ -615,6 +615,40 @@ impl AnyGaitController {
         }
     }
 
+    /// Set the Poincaré/deadbeat pitch foot-placement gains
+    /// `(k_angle, k_rate)` (see [`crate::full_centroidal_controller::
+    /// FullCentroidalMpcGaitController::set_bound_pitch_placement_gain`]).
+    /// No-op for other modes.
+    pub fn set_bound_pitch_placement_gain(&mut self, k_angle: f64, k_rate: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_pitch_placement_gain(k_angle, k_rate);
+        }
+    }
+
+    /// Set the Sec.5f8 pitch foot-placement DC-blocker time constant (s).
+    /// No-op for other modes.
+    pub fn set_bound_pitch_placement_dc_tau(&mut self, tau: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_pitch_placement_dc_tau(tau);
+        }
+    }
+
+    /// Set the Sec.5f9 (P2) tabulated forward-Bound reference orbit
+    /// (`[phase, z, pitch, vx, vz, w]` rows). No-op for other modes.
+    pub fn set_bound_tabulated_reference(&mut self, table: Option<Vec<[f64; 6]>>) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_tabulated_reference(table);
+        }
+    }
+
+    /// Feed the observed base roll/pitch (rad) to the Poincaré/deadbeat
+    /// pitch foot-placement. No-op for other modes.
+    pub fn set_body_attitude_observed(&mut self, roll: f64, pitch: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_body_attitude_observed(roll, pitch);
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).
