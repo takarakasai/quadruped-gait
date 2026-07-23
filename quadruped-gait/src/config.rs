@@ -272,6 +272,50 @@ pub struct GaitConfig {
     /// so 1 N² ≡ 0.001; 0.01² · 500 = 0.05 ≫ 0.001) without
     /// drowning out the body-tracking terms.
     pub q_foot_xy_world: f64,
+    /// Use the **body-frame (base-relative)** foot-XY cost variant when
+    /// [`Self::mpc_optimized_footstep`] is on (forwarded to
+    /// [`crate::full_centroidal_mpc::FullCentroidalMpcConfig::
+    /// foot_xy_cost_body_frame`]). The world-frame default lets the MPC
+    /// shift the base (via horizontal GRF) to keep a foot's absolute
+    /// ground spot fixed under disturbance -- good for Trot, but that
+    /// GRF adjustment torques pitch and destabilizes the flight-phase
+    /// Bound (whose F_x is pinned at the pitch-cancelling trim). The
+    /// body-frame variant places the foot by swing-leg motion alone,
+    /// decoupled from the GRF/pitch solution. Default `false`
+    /// (world-frame) for backward compatibility. See articara
+    /// ref/wbc_comparison.md Sec.5d1/5d2.
+    pub foot_xy_cost_body_frame: bool,
+    /// **Bound-family symmetric foothold** (Sec.5d3, articara
+    /// ref/wbc_comparison.md). When `true` AND
+    /// [`Self::mpc_optimized_footstep`] is on, the MPC-predicted
+    /// per-leg swing footholds (used by `use_mpc_predicted_footstep`)
+    /// are symmetrized across each left/right pair — front (FL,FR) and
+    /// rear (RL,RR) — before use: `x` and `z` averaged, `y` mirrored
+    /// (`y_L = −y_R`). The flight-phase Bound faceplanted (Sec.5d2)
+    /// because the MPC's independent per-leg foot-XY optimization
+    /// produced ASYMMETRIC left/right footholds, and during the aerial
+    /// phase (no stance feet to correct it) asymmetric planting rolls
+    /// the body over. Enforcing pair symmetry removes the roll degree
+    /// of freedom the open-loop trim never excited. Default `false`.
+    /// Only meaningful for gaits whose L/R pairs swing in phase (Bound;
+    /// also Pace) — a no-op otherwise.
+    pub bound_symmetric_foothold: bool,
+    /// **Feasible vertical-bounce reference for the Bound trim**
+    /// (Sec.5d4, articara ref/wbc_comparison.md). When `true` (and the
+    /// Bound trim reference is active), the FullCentroidal MPC's
+    /// vertical reference is made physically consistent with the
+    /// `duty_factor<0.5` flight phase: the stance vertical-GRF reference
+    /// uses the trim's `f_z = m·g/(2·duty)` (the surplus over gravity is
+    /// the bounce impulse) instead of pure gravity support, and the
+    /// reference CoM vertical velocity follows the ballistic bounce
+    /// (`BoundTrimSample::com_z_velocity`) instead of a flat `v_z=0`.
+    /// Without this, the reference commands "hold constant height with
+    /// gravity-only force" while 30%+ airborne — infeasible, and the
+    /// flat reference fights the bounce (MIT-style controllers track a
+    /// feasible bouncing CoM reference). At `duty_factor>=0.5` the
+    /// bounce is zero and `f_z==m·g`, so this is a no-op. Default
+    /// `false` preserves the exact prior (gravity-z, flat-v_z) reference.
+    pub bound_trim_vertical_reference: bool,
     /// **LinearCrawl-only**: fraction of each per-leg sub-cycle
     /// (`T/4`) held in 4-support before that leg lifts. Range `(0, 1)`;
     /// `0.5` is the default. Only [`crate::linear_crawl::LinearCrawlController`]
@@ -353,6 +397,9 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            foot_xy_cost_body_frame: false,
+            bound_symmetric_foothold: false,
+            bound_trim_vertical_reference: false,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -380,6 +427,9 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            foot_xy_cost_body_frame: false,
+            bound_symmetric_foothold: false,
+            bound_trim_vertical_reference: false,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -406,6 +456,9 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            foot_xy_cost_body_frame: false,
+            bound_symmetric_foothold: false,
+            bound_trim_vertical_reference: false,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -431,6 +484,9 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            foot_xy_cost_body_frame: false,
+            bound_symmetric_foothold: false,
+            bound_trim_vertical_reference: false,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -482,6 +538,9 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            foot_xy_cost_body_frame: false,
+            bound_symmetric_foothold: false,
+            bound_trim_vertical_reference: false,
             four_support_fraction: 0.85,
             lateral_sway_m: 0.0,
             smooth_swing: false,

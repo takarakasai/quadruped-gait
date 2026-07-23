@@ -614,6 +614,7 @@ impl FullCentroidalMpcGaitController {
         } else {
             0.0
         };
+        mpc_cfg.foot_xy_cost_body_frame = self.cfg.foot_xy_cost_body_frame;
         self.full_centroidal_mpc.set_config(mpc_cfg);
         // When warm-start is freshly turned off, drop any stale cache
         // so a later re-enable doesn't replay an old trajectory the
@@ -748,6 +749,48 @@ impl FullCentroidalMpcGaitController {
 
         let phases = self.phase_gen.legs();
         let swing_duration = self.cfg.cycle_period_s * (1.0 - self.cfg.duty_factor);
+
+        // Pre-pass (Sec.5d3): latch each leg's MPC-predicted foothold at
+        // its stance→swing transition, THEN — if bound_symmetric_foothold
+        // is on — symmetrize each L/R pair before the main loop consumes
+        // the latches. Done as a separate pass (not inline in the main
+        // loop) because symmetrizing a pair needs both legs' freshly-
+        // latched values at once, and a pair's two legs are visited in
+        // separate loop iterations. Sec.5d2: the MPC's independent per-
+        // leg foot-XY optimization produced asymmetric footholds that
+        // rolled the body over during the aerial phase.
+        if self.cfg.mpc_optimized_footstep {
+            for ps in phases.iter() {
+                let slot = crate::controller::slot_of(ps.leg);
+                if !ps.is_stance {
+                    if self.prev_leg_is_stance[slot] {
+                        self.swing_locked_touch_down_body[slot] =
+                            self.mpc_predicted_swing_target_body(ps.leg, 0.0, swing_duration);
+                    }
+                } else {
+                    self.swing_locked_touch_down_body[slot] = None;
+                }
+            }
+            if self.cfg.bound_symmetric_foothold {
+                // Pairs: front (FL=0, FR=1), rear (RL=2, RR=3). Symmetrize
+                // about the sagittal plane: x,z averaged; y mirrored
+                // (y_L = +a, y_R = −a with a = (y_L − y_R)/2).
+                for &(l, r) in &[(0usize, 1usize), (2usize, 3usize)] {
+                    if let (Some(mut tl), Some(mut tr)) =
+                        (self.swing_locked_touch_down_body[l], self.swing_locked_touch_down_body[r])
+                    {
+                        let x = 0.5 * (tl.x + tr.x);
+                        let z = 0.5 * (tl.z + tr.z);
+                        let a = 0.5 * (tl.y - tr.y);
+                        tl.x = x; tl.z = z; tl.y = a;
+                        tr.x = x; tr.z = z; tr.y = -a;
+                        self.swing_locked_touch_down_body[l] = Some(tl);
+                        self.swing_locked_touch_down_body[r] = Some(tr);
+                    }
+                }
+            }
+        }
+
         let mut legs: [Option<LegOutput>; 4] = [None, None, None, None];
         for ps in phases.iter() {
             let kin_leg = self.kin.leg(ps.leg);
@@ -766,25 +809,13 @@ impl FullCentroidalMpcGaitController {
             // (which uses cmd-extrap, separate axis) keeps the body
             // honest during stance.
             let slot = crate::controller::slot_of(ps.leg);
+            // The latch (+ optional pair symmetrization) is done in the
+            // pre-pass above; here we just consume the locked value for
+            // swing legs.
             if self.cfg.mpc_optimized_footstep && !ps.is_stance {
-                if self.prev_leg_is_stance[slot] {
-                    // Transition stance → swing: latch a fresh
-                    // prediction. sub_fraction ≈ 0 at this instant,
-                    // so the helper picks `k_td ≈ swing_duration /
-                    // dt_per_step` — the touchdown step in the
-                    // current MPC plan.
-                    self.swing_locked_touch_down_body[slot] = self
-                        .mpc_predicted_swing_target_body(
-                            ps.leg, 0.0, swing_duration,
-                        );
-                }
                 if let Some(td_body) = self.swing_locked_touch_down_body[slot] {
                     footstep.touch_down = td_body;
                 }
-            } else if ps.is_stance {
-                // Clear the lock once the leg is back on the ground —
-                // the next swing entry will capture a fresh value.
-                self.swing_locked_touch_down_body[slot] = None;
             }
             self.prev_leg_is_stance[slot] = ps.is_stance;
             let target = if ps.is_stance {
@@ -1202,6 +1233,15 @@ impl FullCentroidalMpcGaitController {
             });
             if let Some(sample) = trim_sample {
                 sk.base_euler_zyx.y = sample.pitch;
+                // Sec.5d4: feed the ballistic vertical-bounce velocity
+                // into the reference (opt-in). NOTE: verified against
+                // MIT Cheetah 3 / Mini Cheetah, this is AWAY from their
+                // design -- they command z-velocity=0 and let the bounce
+                // emerge. Kept flag-gated (default off) so the on/off
+                // A/B is measurable; off = MIT-aligned flat reference.
+                if self.cfg.bound_trim_vertical_reference {
+                    sk.v_com_world.z = sample.com_z_velocity;
+                }
             }
             if let Some(footsteps) = &dynamic_footsteps {
                 // γ: per-(leg, k) dynamic joint_q — takes priority over
@@ -1272,9 +1312,33 @@ impl FullCentroidalMpcGaitController {
             if let Some(sample) = trim_sample {
                 if total_weight > 1e-9 {
                     let f_x_total = sample.f_x_per_leg * 2.0;
+                    // Vertical GRF reference from the trim's own F_z
+                    // (Sec.5d4): for duty<0.5 the trim's `f_z_total =
+                    // m·g/(2·duty)` exceeds pure gravity support (m·g),
+                    // and that surplus is exactly the impulse the stance
+                    // must supply to reverse the flight-phase fall and
+                    // bounce the CoM back up. The gravity-only z set
+                    // above (`m·g` split) leaves the reference physically
+                    // infeasible through the aerial phase (commands "hold
+                    // flat height" with only gravity force while 30%
+                    // airborne). At duty=0.5, `f_z_total == m·g`, so this
+                    // is byte-identical to the gravity split -- the
+                    // stock no-flight Bound is unchanged. `f_z_per_leg`
+                    // is already computed and, until now, only used for
+                    // the WBC's per-foot z; feeding it to the MPC's own
+                    // reference is the missing half.
+                    let f_z_total = sample.f_z_per_leg * 2.0;
                     for leg in 0..N_FEET {
                         if contact.is_stance[leg][k] {
                             grfs[leg].x = leg_weights[leg] * f_x_total / total_weight;
+                            // Vertical GRF surplus for the bounce (opt-in,
+                            // Sec.5d4). Off (default) keeps the pure
+                            // gravity-split z set above -- which, per the
+                            // MIT verification, is the aligned choice
+                            // (they don't command a bounce force either).
+                            if self.cfg.bound_trim_vertical_reference {
+                                grfs[leg].z = leg_weights[leg] * f_z_total / total_weight;
+                            }
                         }
                     }
                 }

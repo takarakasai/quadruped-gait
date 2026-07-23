@@ -379,6 +379,23 @@ pub struct FullCentroidalMpcConfig {
     /// Default `0.0` ⇒ disabled, preserving backward compatibility
     /// for callers that don't populate `foot_xy_target_body_offset`.
     pub q_foot_xy_world: f64,
+    /// **Body-frame (base-relative) foot-XY cost variant** (Sec.5d1/5d2,
+    /// articara ref/wbc_comparison.md). When `true`, the foot-XY soft
+    /// cost drops the `base_pos` term from the linearised foot position
+    /// (`foot_xy = base_pos_xy + R·FK_xy(q)` → `R·FK_xy(q)` only) and
+    /// from its target (`base_pos_ref + R·offset` → `R·offset`), so the
+    /// residual becomes the purely body-relative placement error
+    /// `R·(FK(q) − offset)`. That depends only on `joint_v` and is
+    /// KINEMATICALLY DECOUPLED from the GRF: the MPC then repositions
+    /// the foot by moving the swing leg alone, never adjusting
+    /// horizontal GRF to shift the base (which would create `r×F` pitch
+    /// moments). The world-frame default keeps a foot's absolute ground
+    /// spot fixed under disturbance (Trot's use case) but that base-
+    /// repositioning couples destructively into the pitch-critical GRF
+    /// solution of the flight-phase Bound (its F_x is pinned at the
+    /// pitch-cancelling trim) -- see Sec.5c8-5d0. `false` (default)
+    /// preserves the exact prior world-frame behaviour.
+    pub foot_xy_cost_body_frame: bool,
     /// **Task-space→joint-space `R` weight mapping for `joint_v`.**
     ///
     /// When `Some`, each leg's 12×12 `joint_v` cost block is replaced
@@ -500,6 +517,7 @@ impl FullCentroidalMpcConfig {
             friction_cone_slack_penalty: 1000.0,
             warm_start: false,
             q_foot_xy_world: 0.0,
+            foot_xy_cost_body_frame: false,
             joint_vel_nominal_jacobian: None,
             r_taskspace_joint_vel: [1.0, 1.0, 1.0],
             true_centroidal_coupling_data: None,
@@ -1385,10 +1403,22 @@ fn add_foot_xy_soft_cost(
             // around, so iter 0 uses the caller's reference (open-loop
             // cmd extrapolation) and iter ≥1 uses the previous iter's
             // predicted base (closed-loop self-consistent foothold).
-            let target_world_x = ref_traj.states[k].base_pos_world.x
-                + c * target_body_offset[0] - s * target_body_offset[1];
-            let target_world_y = ref_traj.states[k].base_pos_world.y
-                + s * target_body_offset[0] + c * target_body_offset[1];
+            // Body-frame variant (Sec.5d1): drop base_pos from BOTH the
+            // predicted foot expression (the `e_xy[6+ax]=1` selector
+            // below) and the target here, so the residual is the purely
+            // base-relative placement error `R·(FK(q) − offset)` --
+            // depends on joint_v only, decoupled from the GRF-driven
+            // base_pos and thus from pitch. World-frame (default) keeps
+            // the base_pos terms for absolute-ground-spot rejection.
+            let base_ref = if cfg.foot_xy_cost_body_frame {
+                Vector3::zeros()
+            } else {
+                ref_traj.states[k].base_pos_world
+            };
+            let target_world_x =
+                base_ref.x + c * target_body_offset[0] - s * target_body_offset[1];
+            let target_world_y =
+                base_ref.y + s * target_body_offset[0] + c * target_body_offset[1];
             let target_xy = [target_world_x, target_world_y];
 
             for ax in 0..2 {
@@ -1397,7 +1427,13 @@ fn add_foot_xy_soft_cost(
                 //  e_xy[6 + ax]            = 1                  (base_pos[ax] direct)
                 //  e_xy[12 + 3·leg + j]    = (R_z J_body)[ax,j] (joint contribution)
                 let mut e_xy = [0.0_f64; N_STATE_AUG];
-                e_xy[6 + ax] = 1.0;
+                // Body-frame variant (Sec.5d1) omits the base_pos term
+                // so the cost can't drive horizontal GRF to shift the
+                // base (which would torque pitch); world-frame default
+                // keeps it (base_pos[ax] direct).
+                if !cfg.foot_xy_cost_body_frame {
+                    e_xy[6 + ax] = 1.0;
+                }
                 for j in 0..3 {
                     e_xy[12 + 3 * leg + j] = r_z_j[(ax, j)];
                 }
@@ -1883,6 +1919,7 @@ mod tests {
             friction_cone_slack_penalty: 1000.0,
             warm_start: false,
             q_foot_xy_world: 0.0,
+            foot_xy_cost_body_frame: false,
             joint_vel_nominal_jacobian: None,
             r_taskspace_joint_vel: [1.0, 1.0, 1.0],
             true_centroidal_coupling_data: None,

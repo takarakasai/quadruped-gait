@@ -116,6 +116,17 @@ pub struct BoundTrimSample {
     /// flight-phase sample when `duty_factor<0.5` -- see
     /// [`Self::f_z_total`]).
     pub f_z_per_leg: f64,
+    /// Reference **vertical CoM velocity** (m/s, world +z = up) of the
+    /// ballistic bounce this trim implies (Sec.5d4, local doc). Zero at
+    /// `duty_factor=0.5` (no flight, no bounce); for `duty<0.5` it is
+    /// the closed-form bounce velocity: during stance the CoM
+    /// accelerates upward at `a = g·T_flight/T_st` from the touchdown
+    /// speed `−g·T_flight/2` to the liftoff speed `+g·T_flight/2`;
+    /// during flight it decelerates ballistically at `−g`. Feeding this
+    /// (with the `f_z` surplus) into the MPC's vertical reference makes
+    /// the reference physically FEASIBLE through the aerial phase --
+    /// the flat `v_z=0` reference otherwise fights the bounce force.
+    pub com_z_velocity: f64,
 }
 
 impl BoundTrimConfig {
@@ -285,11 +296,32 @@ impl BoundTrimConfig {
             (-theta_a, -theta_dot_a, -f_x_pair_a, f_z_pair_a)
         };
 
+        // Ballistic vertical bounce velocity (Sec.5d4). Same shape in
+        // both half-cycles (period T/2), so it's a function of the
+        // local half-cycle time `s` only -- no front/rear sign flip
+        // (up is up). Zero when `t_flight == 0` (duty_factor>=0.5).
+        let t_flight = self.t_flight();
+        let com_z_velocity = if t_flight > 0.0 && t_st > 0.0 {
+            let v_liftoff = 0.5 * GRAVITY_MPS2 * t_flight; // = g·T_flight/2
+            if s < t_st {
+                // Stance: from touchdown (−v_liftoff) accelerating up at
+                // a = g·T_flight/T_st to liftoff (+v_liftoff).
+                let a_stance = GRAVITY_MPS2 * t_flight / t_st;
+                -v_liftoff + a_stance * s
+            } else {
+                // Flight: ballistic decel at −g from +v_liftoff.
+                v_liftoff - GRAVITY_MPS2 * (s - t_st)
+            }
+        } else {
+            0.0
+        };
+
         BoundTrimSample {
             pitch: self.sign * pitch,
             pitch_rate: self.sign * pitch_rate,
             f_x_per_leg: self.sign * f_x_pair / 2.0,
             f_z_per_leg: f_z_pair / 2.0,
+            com_z_velocity,
         }
     }
 }
