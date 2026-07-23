@@ -946,23 +946,24 @@ impl FullCentroidalMpcGaitController {
         // drags the body backward, Sec.5f7). Every leg's footstep reads
         // the resulting `self.pitch_placement_shift`.
         if self.bound_pitch_placement_gain != 0.0 || self.bound_pitch_rate_placement_gain != 0.0 {
-            // Nominal for the orbit-relative deadbeat. The closed-form trim
-            // orbit is used when active; otherwise absolute (0,0). NOTE
-            // (Sec.5f9/P2): subtracting the *tabulated* SRBD orbit's
-            // pitch_rate was tried and made it WORSE (tumble at ~5s) --
-            // the planar SRBD nominal ≠ the real 3D Go2 pitch_rate, so the
-            // "deviation" is polluted by model mismatch and the deadbeat
-            // loses its stabilizing action. Instead the deadbeat keeps its
-            // full (absolute/trim) stabilizing action and the DC-blocker
-            // (model-free) removes the backward-drag DC, while the
-            // tabulated reference supplies the forward drive.
+            // Nominal for the orbit-relative deadbeat (P3-b landing reflex).
+            // Prefer the tabulated orbit being tracked (its pitch / pitch_rate
+            // at the current phase) -- this is a DEVIATION-from-orbit reflex,
+            // the right form for stabilizing a genuinely PITCHING bound
+            // (feet-forward orbit). Sec.5f8 found this failed on the FLAT
+            // orbit (nominal ~0, model mismatch dominated), but a pitching
+            // orbit has a real nominal to track. Falls back to the closed-form
+            // trim, then absolute (0,0).
             let cur_phase = self.phase_gen.cycle_phase();
-            let (nom_pitch, nom_pitch_rate) = if let Some(trim) = self.bound_trim_config() {
-                let s = trim.sample(cur_phase);
-                (s.pitch, s.pitch_rate)
-            } else {
-                (0.0, 0.0)
-            };
+            let (nom_pitch, nom_pitch_rate) =
+                if let Some((_z, pitch, _vx, _vz, w)) = self.sample_tabulated_reference(cur_phase) {
+                    (pitch, w)
+                } else if let Some(trim) = self.bound_trim_config() {
+                    let s = trim.sample(cur_phase);
+                    (s.pitch, s.pitch_rate)
+                } else {
+                    (0.0, 0.0)
+                };
             let pitch_err = self.pitch_observed - nom_pitch;
             let pitch_rate_err = self.omega_observed_world.y - nom_pitch_rate;
             let raw = self.bound_pitch_placement_gain * pitch_err
