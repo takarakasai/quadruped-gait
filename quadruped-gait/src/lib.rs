@@ -72,6 +72,7 @@ pub mod wbc;
 mod async_solver;
 mod autodetect;
 mod body_state;
+mod bound_periodic_orbit;
 mod bound_reference;
 mod centroidal_controller;
 mod centroidal_mpc;
@@ -116,6 +117,7 @@ pub use phase::{ContactDrivenPhase, PhaseErrorTracker};
 // back for overlays. The solvers themselves (SrbdMpc / CentroidalMpc /
 // FullCentroidalMpc) and their input / reference / schedule types are
 // internal.
+pub use bound_periodic_orbit::{solve as solve_bound_orbit, BoundOrbit, OrbitSample, PeriodicBoundParams};
 pub use bound_reference::{BoundTrimConfig, BoundTrimSample};
 pub use centroidal_mpc::{predicted_base_accel_world_centroidal, CentroidalMpcConfig};
 pub use full_centroidal_controller::GoalPoseWorld;
