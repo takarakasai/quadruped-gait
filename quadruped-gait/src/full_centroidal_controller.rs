@@ -92,6 +92,31 @@ pub struct FullCentroidalMpcGaitController {
     /// a foothold shift while real pushes (> 0.05 m/s = ~ 4 N impulse)
     /// still get the steeper response.
     v_capture_deadband: f64,
+    /// Bound-specific fore-aft (body-x) foot-placement feedback gain
+    /// (seconds), applied ON TOP of the cmd-based Raibert `half` and
+    /// INDEPENDENT of [`Self::k_capture`]. Adds `k · v_err_body.x` to
+    /// the fore-aft half-step — the classic Raibert running/bounding
+    /// speed regulator (`x_foot = v̄·T_st/2 + k·(v−v_des)`), where
+    /// during the flight phase the landing spot is the only authority
+    /// over fore-aft speed. Deliberately x-ONLY: re-enabling the
+    /// generic (x+y) `k_capture` for Bound reacted to lateral velocity
+    /// NOISE and induced a roll instability (`articara/ref/
+    /// wbc_comparison.md` Sec.5bt), whereas the fore-aft error is the
+    /// real speed-tracking signal Bound needs to close. `0.0` (default)
+    /// preserves prior behaviour exactly. See Sec.5c6/5c7 (local doc).
+    bound_fore_aft_placement_gain: f64,
+    /// Low-pass (EMA) estimate of the measured body-frame fore-aft
+    /// velocity, used as the Raibert **neutral-point** speed when
+    /// [`Self::bound_fore_aft_placement_gain`] is active (Sec.5c7,
+    /// local doc). The neutral foothold `ẋ·T_st/2` must be sized by the
+    /// speed the robot is ACTUALLY going, not the (possibly
+    /// unreachable) commanded speed -- otherwise, when the command
+    /// exceeds what the gait can hold, the cmd-based neutral over-places
+    /// the foot and the feedback biases chronically (Sec.5c6's negative
+    /// result). Filtered (not raw `v_obs`) to reject per-tick observer
+    /// noise. Updated every [`Self::tick`]; never read when the gain
+    /// is 0, so it costs nothing on the default path.
+    v_fore_aft_filtered: f64,
     v_observed_world: Vector3<f64>,
     omega_observed_world: Vector3<f64>,
 
@@ -276,6 +301,8 @@ impl FullCentroidalMpcGaitController {
             k_capture: DEFAULT_CAPTURE_POINT_GAIN_S,
             k_capture_pulse: 0.0,
             v_capture_deadband: 0.0,
+            bound_fore_aft_placement_gain: 0.0,
+            v_fore_aft_filtered: 0.0,
             v_observed_world: Vector3::zeros(),
             omega_observed_world: Vector3::zeros(),
             full_centroidal_mpc: FullCentroidalMpc::new(mpc_cfg),
@@ -552,6 +579,17 @@ impl FullCentroidalMpcGaitController {
         self.phase_gen.set_config(self.cfg.clone());
     }
 
+    /// Update `max_step_length_m` in place. Read live from `self.cfg`
+    /// by the footstep planner each tick (not part of `phase_gen`'s own
+    /// state), so unlike [`Self::set_cycle_period_s`] this needs no
+    /// `phase_gen` round-trip -- a plain field write is enough. For a
+    /// smooth startup transient (stride growing in step with a
+    /// `cmd_vx` ramp instead of snapping to its full value at t=0),
+    /// see `articara/ref/wbc_comparison.md` Sec.5c0.
+    pub fn set_max_step_length_m(&mut self, m: f64) {
+        self.cfg.max_step_length_m = m.max(0.0);
+    }
+
     /// Apply a new gait config. The MPC's per-tick flags that mirror
     /// fields on `GaitConfig` (currently A3 friction-cone-soft +
     /// slack penalty) are pushed into the live MPC config here so a
@@ -615,6 +653,16 @@ impl FullCentroidalMpcGaitController {
     }
     pub fn set_capture_point_gain(&mut self, k: f64) {
         self.k_capture = k.max(0.0);
+    }
+
+    pub fn bound_fore_aft_placement_gain(&self) -> f64 {
+        self.bound_fore_aft_placement_gain
+    }
+    /// Set the Bound-specific fore-aft foot-placement feedback gain
+    /// (see the field's doc comment). Clamped to ≥ 0. `0.0` disables it
+    /// (default), leaving the cmd-based Raibert `half` untouched.
+    pub fn set_bound_fore_aft_placement_gain(&mut self, k: f64) {
+        self.bound_fore_aft_placement_gain = k.max(0.0);
     }
 
     /// Read the nonlinear pulse branch parameters `(k_pulse, v_db)`.
@@ -685,6 +733,16 @@ impl FullCentroidalMpcGaitController {
             self.v_observed_world,
             self.body_state.world_yaw,
         );
+        // EMA of measured fore-aft velocity for the Raibert neutral
+        // point (Sec.5c7). tau ≈ 0.15 s (~one cycle period) smooths
+        // per-tick observer noise while tracking speed changes over a
+        // stride. Only consumed when the bound foot-placement gain is
+        // on, but updated unconditionally so it's warm the moment it is.
+        {
+            let tau = 0.15;
+            let alpha = (dt / (tau + dt)).clamp(0.0, 1.0);
+            self.v_fore_aft_filtered += alpha * (v_obs_body.x - self.v_fore_aft_filtered);
+        }
         let v_cmd = Vector3::new(self.cmd.vx, self.cmd.vy, 0.0);
         let v_err_body = v_obs_body - v_cmd;
 
@@ -1385,6 +1443,25 @@ impl FullCentroidalMpcGaitController {
             feedback + horizon_bias
         };
 
+        // Bound-specific fore-aft (x-only) Raibert speed regulator.
+        // (Sec.5c7) The full Raibert running form is
+        //   x_foot = ẋ·T_st/2 + k·(ẋ − ẋ_des),
+        // where the NEUTRAL term `ẋ·T_st/2` uses the MEASURED speed ẋ
+        // (filtered) -- placing the foot at the no-net-accel point for
+        // the speed the robot is actually going, which is stable
+        // regardless of whether the command is reachable. Sec.5c6's
+        // first attempt kept the cmd-based neutral (`half.x` from
+        // `v_hip`) and only added `k·v_err`; when the command exceeded
+        // the achievable speed the neutral was chronically over-placed
+        // and the feedback destabilized. Here we OVERRIDE the fore-aft
+        // neutral with the filtered measured speed and add the
+        // command-tracking feedback on top. x-ONLY (Sec.5bt: the
+        // generic x+y `k_capture` rolled the body on lateral noise).
+        if feedback_enabled && self.bound_fore_aft_placement_gain != 0.0 {
+            let v_filt = self.v_fore_aft_filtered;
+            half.x = v_filt * (0.5 * stance_duration)
+                + self.bound_fore_aft_placement_gain * (v_filt - self.cmd.vx);
+        }
         let raw_half = half + closed_loop;
         let mut combined = raw_half;
         let min_x = MIN_HALF_FRACTION * half.x;

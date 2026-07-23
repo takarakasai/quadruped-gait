@@ -598,6 +598,23 @@ impl AnyGaitController {
         }
     }
 
+    /// Update `max_step_length_m` in place. No-op for other modes.
+    pub fn set_max_step_length_m(&mut self, m: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_max_step_length_m(m);
+        }
+    }
+
+    /// Set the Bound-specific fore-aft foot-placement feedback gain
+    /// (see [`crate::full_centroidal_controller::
+    /// FullCentroidalMpcGaitController::set_bound_fore_aft_placement_gain`]).
+    /// No-op for other modes.
+    pub fn set_bound_fore_aft_placement_gain(&mut self, k: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_bound_fore_aft_placement_gain(k);
+        }
+    }
+
     /// Read back the active SRBD MPC config. Returns `None` for CHAMP
     /// or `CentroidalSrbd` (use [`Self::centroidal_mpc_config`] for
     /// the centroidal variant).
