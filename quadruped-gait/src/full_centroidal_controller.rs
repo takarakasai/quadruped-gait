@@ -162,6 +162,14 @@ pub struct FullCentroidalMpcGaitController {
     /// were mutually infeasible, so vx collapsed to ~0). Rows must be
     /// sorted by ascending phase. `None` keeps the existing reference.
     bound_tabulated_reference: Option<Vec<[f64; 6]>>,
+    /// **P3-a**: prescribed `(front, rear)` fore-aft foothold (body frame,
+    /// ≈ CoM-relative) from the trajopt orbit. When set, the footstep
+    /// planner places each pair's touch_down at the orbit's own foothold
+    /// instead of the Raibert+deadbeat result -- the orbit's placement is
+    /// forward-moving AND pitch-balanced by construction, so it is meant to
+    /// break the §5f10 stabilize-vs-forward dilemma (Raibert+absolute
+    /// deadbeat fought the two). `None` keeps the normal footstep.
+    bound_prescribed_footholds: Option<(f64, f64)>,
     /// Running EMA of the applied pitch shift (the DC estimate) and the
     /// once-per-tick DC-blocked value the footstep planner consumes. The
     /// shift is leg-independent (global pitch state), so it is computed
@@ -360,6 +368,7 @@ impl FullCentroidalMpcGaitController {
             pitch_placement_shift_dc: 0.0,
             pitch_placement_shift: 0.0,
             bound_tabulated_reference: None,
+            bound_prescribed_footholds: None,
             v_fore_aft_filtered: 0.0,
             v_observed_world: Vector3::zeros(),
             omega_observed_world: Vector3::zeros(),
@@ -773,6 +782,12 @@ impl FullCentroidalMpcGaitController {
     /// `None` clears it.
     pub fn set_bound_tabulated_reference(&mut self, table: Option<Vec<[f64; 6]>>) {
         self.bound_tabulated_reference = table.filter(|t| t.len() >= 2);
+    }
+
+    /// Set the P3-a prescribed `(front, rear)` fore-aft footholds from the
+    /// trajopt orbit (see the field's doc). `None` clears it.
+    pub fn set_bound_prescribed_footholds(&mut self, footholds: Option<(f64, f64)>) {
+        self.bound_prescribed_footholds = footholds;
     }
 
     /// Phase-interpolate the tabulated reference at `phase` in [0,1),
@@ -1868,6 +1883,24 @@ impl FullCentroidalMpcGaitController {
         // max-step envelope.
         if self.pitch_placement_shift != 0.0 {
             touch_down.x += self.pitch_placement_shift;
+            let td_rel = touch_down - kin.nominal_foot_body;
+            let td_mag = td_rel.norm();
+            if td_mag > max_half && td_mag > 0.0 {
+                touch_down = kin.nominal_foot_body + td_rel * (max_half / td_mag);
+            }
+        }
+        // P3-a/b: use the trajopt orbit's own foothold for this pair as the
+        // fore-aft NEUTRAL (front hips have nominal_foot_body.x>0), PLUS the
+        // deadbeat correction on top (P3-b closed loop). The orbit foothold
+        // is forward-moving + pitch-balanced by construction (the neutral);
+        // pure open-loop following collapses immediately (P3-a: no feedback
+        // for an unstable gait), so the deadbeat `pitch_placement_shift`
+        // provides the landing-reflex correction around that neutral. The
+        // orbit foothold is CoM-relative; touch_down is body-frame ≈
+        // CoM-relative, so it maps directly. Clamped to the step envelope.
+        if let Some((front, rear)) = self.bound_prescribed_footholds {
+            let neutral = if kin.nominal_foot_body.x > 0.0 { front } else { rear };
+            touch_down.x = neutral + self.pitch_placement_shift;
             let td_rel = touch_down - kin.nominal_foot_body;
             let td_mag = td_rel.norm();
             if td_mag > max_half && td_mag > 0.0 {
