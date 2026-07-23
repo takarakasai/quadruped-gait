@@ -40,8 +40,29 @@ pub struct PeriodicBoundParams {
     /// Forward speed to design the orbit for (m/s).
     pub vx_target: f64,
     pub friction_mu: f64,
-    /// Foot reachability box: |x_foot - x_com| <= reach during stance.
+    /// Foot reachability box: |x_foot - x_hip| <= reach during stance, where
+    /// the hip is the fore-aft hip position `x_com + hip_x_{front,rear}`.
+    /// Sec.5f13: this is HIP-centered (was CoM-centered), matching the
+    /// controller's clamp (|touch_down - nominal_foot_body| <= max_half), so
+    /// the solved orbit is executable without a per-stride clamp distortion,
+    /// AND -- since a hip-reachable foot can't sit at the flat-pitch value --
+    /// it forces the pitch to oscillate, dissolving the front-foot-behind-hip
+    /// artifact. Set to the controller's `max_half` (0.11).
     pub reach: f64,
+    /// Fore-aft hip offsets from the CoM/base origin (front > 0, rear < 0).
+    /// The reachability box and the Raibert-neutral foothold regularizer are
+    /// referenced to these, not to the CoM.
+    pub hip_x_front: f64,
+    pub hip_x_rear: f64,
+    /// Weight of the Raibert-neutral foothold regularizer (Sec.5f13): how
+    /// hard to pull each foot toward `v*T_st/2` ahead of its hip. Higher =
+    /// feet more forward/propulsive/under-hip, but MORE tangential force =>
+    /// LESS friction margin. `0.0` leaves feet where the pitch/periodicity
+    /// dynamics put them (near the CoM, friction-comfortable but tucked).
+    pub raibert_weight: f64,
+    /// Weight of the soft pitch-magnitude regularizer (Sec.5f13). Lower
+    /// allows more pitch oscillation (a real bound wants ~0.1-0.2 rad).
+    pub pitch_reg_weight: f64,
     /// Pitch bound (rad): an energetic Bound, not a somersault.
     pub pitch_max: f64,
 }
@@ -59,6 +80,17 @@ impl PeriodicBoundParams {
             vx_target,
             friction_mu: 0.7,
             reach: 0.16,
+            // Real Go2 fore-aft hip offsets (FK from go2.xml): front
+            // +0.19216, rear -0.19464 (2.5 mm fore-aft asymmetry). Used by
+            // the opt-in Raibert-neutral foothold regularizer.
+            hip_x_front: 0.19216,
+            hip_x_rear: -0.19464,
+            // Defaults reproduce the proven-stable Sec.5f12 orbit (front foot
+            // tucked ~0.08 m behind the hip, friction-comfortable, stable 25s
+            // at 0.65 m/s). raibert_weight > 0 trades the tuck for forward
+            // feet at a stability/speed cost (Sec.5f13 frontier).
+            raibert_weight: 0.0,
+            pitch_reg_weight: 0.4,
             pitch_max: 0.6,
         }
     }
@@ -238,6 +270,13 @@ impl Model {
                     Stance::Front => {
                         r.push(w_feas * relu(-ffz) / mg);
                         r.push(3.0 * w_feas * relu(ffx.abs() - self.p.friction_mu * ffz) / mg);
+                        // CoM-centered reachability. Sec.5f13 tried HIP-centered
+                        // (matching the controller clamp) but it forces the
+                        // feet forward, which needs more friction/pitch than
+                        // this WBC can stabilize at speed -- the tucked,
+                        // friction-comfortable orbit is what stays upright. The
+                        // Raibert regularizer below (opt-in) is the tunable way
+                        // to trade the tuck for forward feet.
                         r.push(w_feas * relu((xf - xc).abs() - self.p.reach));
                     }
                     Stance::Rear => {
@@ -249,14 +288,27 @@ impl Model {
                 }
                 r.push(w_feas * relu(th.abs() - self.p.pitch_max));
                 r.push(w_feas * relu(0.12 - z));
-                // Soft pitch-magnitude regularizer (not just the hard bound):
-                // pulls the solve toward the low-pitch orbit rather than a
-                // feasible-but-large-pitch local minimum (P0's trf found the
-                // former; bare LM otherwise binds pitch_max).
-                r.push(0.4 * th);
+                // Soft pitch-magnitude regularizer -- keeps bare LM off the
+                // pitch_max bound, but weak (Sec.5f13: 0.4 over-flattened pitch
+                // to 0.022 rad, forcing footholds to become pitch-torque
+                // nullers = the front-foot-behind-hip artifact; a real bound
+                // pitches ~0.1-0.2 rad, so allow it).
+                r.push(self.p.pitch_reg_weight * th);
                 zsum += z;
             }
         }
+        // Sec.5f13 Raibert-neutral foothold regularizer: bias each pair's
+        // touchdown foot to sit ~v*T_st/2 AHEAD of its own hip (the
+        // velocity-neutral running placement), so feet land slightly ahead
+        // of and sweep back through the hip -- the propulsive, stable posture
+        // -- instead of the front foot tucking behind the hip. Front touches
+        // down at phase 0 (x_com=0); rear at phase 0.5 (x_com = traj mid).
+        let t_st = self.p.duty_factor * self.p.cycle_period_s;
+        let raibert = self.p.vx_target * t_st / 2.0;
+        let xc_rear_td = traj[(2 * per_phase).min(n - 1)][0];
+        let w_rb = self.p.raibert_weight;
+        r.push(w_rb * ((xf - self.p.hip_x_front) - raibert));
+        r.push(w_rb * ((xr - xc_rear_td - self.p.hip_x_rear) - raibert));
         // light regularizers: symmetric pitch, small tangential, CoM ~ h0
         let zavg = zsum / (4 * per_phase) as f64;
         r.push(0.2 * x[P_TH0]);
