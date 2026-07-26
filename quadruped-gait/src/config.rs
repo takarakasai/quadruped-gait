@@ -465,6 +465,21 @@ pub struct GaitConfig {
     /// [`crate::linear_crawl::LinearCrawlConfig::max_swing_foot_speed_mps`].
     #[cfg_attr(feature = "serde", serde(default = "default_max_swing_foot_speed"))]
     pub max_swing_foot_speed_mps: f64,
+
+    /// **FullCentroidal-only.** Swing-leg retraction: the world-frame
+    /// vertical foot velocity (m/s) the swing-leg NormalVelocity reference
+    /// targets at touchdown (`frac = 1`), fed as the `touch_down_vz`
+    /// boundary of [`crate::swing_traj::swing_vz_world`]. `0.0` (default)
+    /// reproduces the existing zero-touchdown-velocity profile bit-for-bit.
+    /// A **positive** value has the foot still rising (in world) at
+    /// touchdown so it settles onto the ground instead of slamming — the
+    /// classic swing-leg-retraction landing-shock mitigation — at the cost
+    /// of a slightly later/softer contact. A negative value plants the foot
+    /// more firmly (legged_control uses ≈ −0.10). Only active on the
+    /// `legged_control_parity` path (the only one that emits a swing
+    /// vertical-velocity reference). Other gait modes ignore this knob.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub swing_touchdown_vz: f64,
 }
 
 #[cfg(feature = "serde")]
@@ -508,6 +523,7 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            swing_touchdown_vz: 0.0,
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
@@ -542,6 +558,7 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            swing_touchdown_vz: 0.0,
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
@@ -575,6 +592,7 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            swing_touchdown_vz: 0.0,
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
@@ -607,6 +625,7 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            swing_touchdown_vz: 0.0,
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
@@ -665,6 +684,7 @@ impl GaitConfig {
             warm_start: false,
             mpc_optimized_footstep: false,
             q_foot_xy_world: 500.0,
+            swing_touchdown_vz: 0.0,
             foot_xy_cost_body_frame: false,
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,

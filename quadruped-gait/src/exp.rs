@@ -171,6 +171,17 @@ pub const FULL_CENTROIDAL_EXP_KEYS: &[ExpKey] = &[
                the loop that P2 couldn't.",
     },
     ExpKey {
+        key: "swing_touchdown_vz",
+        label: "swing touchdown vz",
+        kind: ExpKind::F64 { min: -0.30, max: 0.60, logarithmic: false, decimals: 2 },
+        help: "Swing-leg retraction: world-frame vertical foot velocity (m/s) \
+               the swing NormalVelocity reference targets at touchdown. 0.0 \
+               (default) = land with zero vertical velocity. Positive = foot \
+               still rising at touchdown so it settles instead of slamming \
+               (landing-shock mitigation); negative plants firmly \
+               (legged_control ≈ −0.10). Parity path only.",
+    },
+    ExpKey {
         key: "q_foot_xy_world",
         label: "q_foot_xy_world",
         kind: ExpKind::F64 { min: 10.0, max: 5_000.0, logarithmic: true, decimals: 0 },
@@ -221,6 +232,7 @@ impl AnyGaitController {
             "warm_start" => ExpValue::Bool(cfg.warm_start),
             "mpc_optimized_footstep" => ExpValue::Bool(cfg.mpc_optimized_footstep),
             "q_foot_xy_world" => ExpValue::F64(cfg.q_foot_xy_world),
+            "swing_touchdown_vz" => ExpValue::F64(cfg.swing_touchdown_vz),
             _ => return None,
         })
     }
@@ -281,6 +293,10 @@ impl AnyGaitController {
                     "q_foot_xy_world" => {
                         cfg.q_foot_xy_world =
                             value.as_f64().ok_or(wrong("q_foot_xy_world"))?;
+                    }
+                    "swing_touchdown_vz" => {
+                        cfg.swing_touchdown_vz =
+                            value.as_f64().ok_or(wrong("swing_touchdown_vz"))?;
                     }
                     _ => unreachable!("key checked against experimental_keys above"),
                 }

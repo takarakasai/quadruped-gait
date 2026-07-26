@@ -1256,7 +1256,10 @@ impl FullCentroidalMpcGaitController {
                 };
                 contact.is_stance[leg].push(in_stance);
                 let v_z = if in_swing && self.legged_control_parity {
-                    swing_vz_world(swing_h, sub_frac, swing_duration, 0.0, 0.0)
+                    // `swing_touchdown_vz` (default 0.0) retracts the swing
+                    // leg: a positive value has the foot still rising at
+                    // touchdown so it settles rather than slams.
+                    swing_vz_world(swing_h, sub_frac, swing_duration, 0.0, self.cfg.swing_touchdown_vz)
                 } else {
                     0.0
                 };
