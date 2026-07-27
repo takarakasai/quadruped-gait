@@ -87,6 +87,7 @@ mod linear_crawl;
 mod mpc_controller;
 mod mpc_reference;
 mod phase;
+mod robot_state;
 mod srbd_mpc;
 mod swing_traj;
 
@@ -113,6 +114,7 @@ pub use ik::{foot_jacobian_body, forward_leg_kinematics, solve_leg_ik, LegIkSolu
 pub use mpc_controller::capture_point_step;
 pub use mpc_reference::JointReference;
 pub use phase::{ContactDrivenPhase, PhaseErrorTracker};
+pub use robot_state::RobotStateSource;
 // MPC tuning configs + the solution / prediction types the GUI reads
 // back for overlays. The solvers themselves (SrbdMpc / CentroidalMpc /
 // FullCentroidalMpc) and their input / reference / schedule types are
