@@ -1132,6 +1132,10 @@ impl FullCentroidalMpcGaitController {
             [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         let cycle_phase_now = self.phase_gen.cycle_phase();
         let cycle_period = self.cfg.cycle_period_s.max(1e-6);
+        // Front-pair duty. The rear pair may run a different one
+        // (`duty_factor_rear_scale`), so anything inside the per-leg loop
+        // must use `self.cfg.duty_for_slot(leg)`; this alias is only for the
+        // quantities that are genuinely global or FL-referenced.
         let duty = self.cfg.duty_factor.clamp(1e-6, 1.0 - 1e-6);
         let swing_duration = cycle_period * (1.0 - duty);
         let swing_h = effective_swing_height(self.cfg.swing_height_m, &self.cmd);
@@ -1143,6 +1147,7 @@ impl FullCentroidalMpcGaitController {
             arr
         };
         for leg in 0..N_FEET {
+            let duty = self.cfg.duty_for_slot(leg);
             for k in 0..n {
                 let (in_stance, sub_frac, in_swing) = if holding {
                     // Holding (zero cmd): every leg is in mid-stance,
@@ -1177,7 +1182,7 @@ impl FullCentroidalMpcGaitController {
                     // is parity-only by construction).
                     (stance_now[leg], 0.5, false)
                 } else {
-                    (self.cfg.duty_factor > 0.5, 0.5, false)
+                    (duty > 0.5, 0.5, false)
                 };
                 contact.is_stance[leg].push(in_stance);
                 let v_z = if in_swing && self.legged_control_parity {
@@ -1667,7 +1672,11 @@ impl FullCentroidalMpcGaitController {
         kin: &LegKinematics,
         v_err_body: &Vector3<f64>,
     ) -> Footstep {
-        let stance_duration = self.cfg.cycle_period_s * self.cfg.duty_factor;
+        // Per-leg: a rear pair on a shorter duty sweeps the ground for less
+        // time, so its Raibert half-stride `v * stance/2` must shrink to
+        // match or the planned foothold outruns the stance that has to
+        // reach it.
+        let stance_duration = self.cfg.cycle_period_s * self.cfg.duty_for(kin.leg);
         let v_body = Vector3::new(self.cmd.vx, self.cmd.vy, 0.0);
         let omega = Vector3::new(0.0, 0.0, self.cmd.wz);
         let v_hip = v_body + omega.cross(&kin.hip_offset);

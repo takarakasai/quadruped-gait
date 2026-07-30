@@ -185,6 +185,38 @@ pub struct GaitConfig {
     /// rest, increases for slower walks. Per-leg phase function uses this
     /// to discriminate stance vs swing.
     pub duty_factor: f64,
+    /// Multiplier on [`Self::duty_factor`] for the REAR pair only
+    /// (`RL`/`RR`); the front pair always uses `duty_factor` as-is. `1.0`
+    /// (default) is the symmetric behaviour.
+    ///
+    /// This buys the rear pair SWING TIME. Measured on Go2 (2026-07-31), the
+    /// binding budget on a Bound gait is not stride length and not force --
+    /// at the speed ceiling the controller tracks the command to 99% while
+    /// spending 2.2% of ticks above 23.5 N.m -- but whether the foot can
+    /// reach its planned touchdown by the scheduled instant. It cannot:
+    /// touchdowns run 13 ms late at the baseline against a 90 ms swing
+    /// window, and stretching the stride pushes that to 42 ms, at which
+    /// point the scheduled and real contacts desync and the trunk bounces.
+    ///
+    /// Lowering duty globally does buy swing time `(1-d)*T`, but it is paid
+    /// for on the other side: `F_z = mg/(2d)` grows and the stance runs out
+    /// of torque (measured -- duty 0.35 is slower than 0.50). Lowering it on
+    /// the rear only concentrates that cost in one pair while leaving the
+    /// front's stance-force budget untouched.
+    ///
+    /// With `duty_factor` 0.5 and this at 0.8 the schedule becomes: front
+    /// stance over cycle phase [0, 0.5), rear over [0.5, 0.9), flight over
+    /// [0.9, 1.0) -- the rear's swing window grows from 0.5*T to 0.6*T
+    /// (+20%) and a genuine flight phase appears. Total stance coverage
+    /// `d_f + d_r` below 1.0 means flight; above 1.0 means overlap.
+    ///
+    /// NOTE: [`crate::bound_reference::BoundTrimConfig`] is built from
+    /// `duty_factor` alone and its closed form assumes the pairs are
+    /// symmetric, so the trim reference is no longer exact once this is not
+    /// 1.0. It remains the pitch-cancelling solution for the FRONT pair's
+    /// timing.
+    #[cfg_attr(feature = "serde", serde(default = "default_duty_factor_rear_scale"))]
+    pub duty_factor_rear_scale: f64,
     /// Peak swing-foot height above the nominal stance plane (m).
     pub swing_height_m: f64,
     /// Maximum forward step length (m). Footstep planner clamps to this so
@@ -448,6 +480,10 @@ fn default_max_step_length_rear_scale() -> f64 {
     1.0
 }
 
+fn default_duty_factor_rear_scale() -> f64 {
+    1.0
+}
+
 /// Default swing-foot feasibility cap (m/s). Also used to backfill the
 /// field when deserialising configs saved before it existed.
 pub fn default_max_swing_foot_speed() -> f64 {
@@ -461,6 +497,7 @@ impl GaitConfig {
             gait_type: GaitType::Trot,
             cycle_period_s: 0.4,
             duty_factor: 0.5,
+            duty_factor_rear_scale: 1.0,
             swing_height_m: 0.04,
             max_step_length_m: 0.10,
             max_step_length_rear_scale: 1.0,
@@ -494,6 +531,7 @@ impl GaitConfig {
             gait_type: GaitType::Walk,
             cycle_period_s: 0.6,
             duty_factor: 0.75,
+            duty_factor_rear_scale: 1.0,
             swing_height_m: 0.035,
             max_step_length_m: 0.08,
             max_step_length_rear_scale: 1.0,
@@ -526,6 +564,7 @@ impl GaitConfig {
             gait_type: GaitType::Pace,
             cycle_period_s: 0.4,
             duty_factor: 0.5,
+            duty_factor_rear_scale: 1.0,
             swing_height_m: 0.04,
             max_step_length_m: 0.10,
             max_step_length_rear_scale: 1.0,
@@ -557,6 +596,7 @@ impl GaitConfig {
             gait_type: GaitType::Bound,
             cycle_period_s: 0.3,
             duty_factor: 0.5,
+            duty_factor_rear_scale: 1.0,
             swing_height_m: 0.05,
             max_step_length_m: 0.12,
             max_step_length_rear_scale: 1.0,
@@ -614,6 +654,7 @@ impl GaitConfig {
             // for tightest body-velocity tracking.
             cycle_period_s: 1.667,
             duty_factor: 0.85,
+            duty_factor_rear_scale: 1.0,
             swing_height_m: 0.005,
             max_step_length_m: 0.06,
             max_step_length_rear_scale: 1.0,
@@ -649,6 +690,42 @@ impl GaitConfig {
         self.duty_factor = d.clamp(0.05, 0.95);
         self
     }
+    /// The duty factor that actually applies to `leg`, i.e. `duty_factor`
+    /// for the front pair and `duty_factor * duty_factor_rear_scale` for the
+    /// rear. Clamped to the open interval so `pos/duty` and
+    /// `(pos-duty)/(1-duty)` stay finite. Every scheduler must go through
+    /// this rather than reading `duty_factor` directly, or the front and
+    /// rear pairs end up on different clocks.
+    pub fn duty_for(&self, leg: LegId) -> f64 {
+        let d = match leg {
+            LegId::RL | LegId::RR => self.duty_factor * self.duty_factor_rear_scale,
+            LegId::FL | LegId::FR => self.duty_factor,
+        };
+        d.clamp(1e-6, 1.0 - 1e-6)
+    }
+
+    /// [`Self::duty_for`] by slot index, in the canonical `FL, FR, RL, RR`
+    /// order used by the per-foot arrays throughout this crate.
+    pub fn duty_for_slot(&self, slot: usize) -> f64 {
+        let leg = match slot {
+            0 => LegId::FL,
+            1 => LegId::FR,
+            2 => LegId::RL,
+            _ => LegId::RR,
+        };
+        self.duty_for(leg)
+    }
+
+    /// All four duty factors in `FL, FR, RL, RR` order.
+    pub fn duty_factors(&self) -> [f64; 4] {
+        [
+            self.duty_for_slot(0),
+            self.duty_for_slot(1),
+            self.duty_for_slot(2),
+            self.duty_for_slot(3),
+        ]
+    }
+
     pub fn with_max_step_length(mut self, m: f64) -> Self {
         self.max_step_length_m = m.max(0.0);
         self
