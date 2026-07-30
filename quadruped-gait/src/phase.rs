@@ -93,7 +93,6 @@ impl PhaseGenerator {
     /// trajectory generators emit the static-stance pose.
     pub fn legs(&self) -> [PhaseState; 4] {
         let offsets = self.cfg.gait_type.phase_offsets();
-        let duty = self.cfg.duty_factor.clamp(1e-6, 1.0 - 1e-6);
         let mut out = [PhaseState {
             leg: LegId::FL,
             cycle_position: 0.0,
@@ -107,6 +106,11 @@ impl PhaseGenerator {
             } else {
                 (self.cycle_phase + offset).rem_euclid(1.0)
             };
+            // Per-leg duty: the rear pair may run a different one
+            // (`duty_factor_rear_scale`), so this must be resolved inside
+            // the loop rather than hoisted. Keyed on `leg`, not the loop
+            // index, because `phase_offsets()`'s ordering is per gait type.
+            let duty = self.cfg.duty_for(leg);
             let (is_stance, sub) = if self.holding {
                 (true, 0.0)
             } else if pos < duty {
@@ -348,10 +352,15 @@ impl PhaseErrorTracker {
         early_contact_threshold_n: f64,
         late_liftoff_threshold_n: f64,
         cycle_period_s: f64,
-        duty_factor: f64,
+        duty_factors: [f64; 4],
     ) -> [Option<f64>; 4] {
         let mut out = [None; 4];
         for slot in 0..4 {
+            // Per-slot, since front and rear may run different duties
+            // (`GaitConfig::duty_factor_rear_scale`). Passing one scalar here
+            // would size the rear pair's stance/swing windows wrongly and so
+            // misreport exactly the lateness this tracker exists to measure.
+            let duty_factor = duty_factors[slot];
             let ps = nominal[slot];
             let f = contact_force_z[slot];
             let loaded = f > early_contact_threshold_n;
@@ -412,6 +421,50 @@ mod tests {
 
     fn find(legs: [PhaseState; 4], id: LegId) -> PhaseState {
         legs.into_iter().find(|p| p.leg == id).unwrap()
+    }
+
+    /// `duty_factor_rear_scale` must put the two pairs on different clocks,
+    /// and it must be a no-op at 1.0 -- both halves matter, since every
+    /// existing caller relies on the second.
+    #[test]
+    fn rear_duty_scale_splits_the_schedule_and_is_a_no_op_at_one() {
+        let bound = |scale: f64| {
+            let mut cfg = GaitConfig::for_type(crate::config::GaitType::Bound);
+            cfg.duty_factor = 0.5;
+            cfg.duty_factor_rear_scale = scale;
+            cfg
+        };
+
+        // At 1.0 the pairs tile: front stance over [0, 0.5), rear over
+        // [0.5, 1.0), and no instant is either doubly supported or empty.
+        let sym = bound(1.0);
+        for i in 0..100 {
+            let phase = i as f64 / 100.0;
+            let mut g = PhaseGenerator::new(sym.clone());
+            g.advance(phase * sym.cycle_period_s, &VelocityCmd { vx: 0.5, vy: 0.0, wz: 0.0 });
+            let legs = g.legs();
+            let front = find(legs, LegId::FL).is_stance;
+            let rear = find(legs, LegId::RL).is_stance;
+            assert!(front != rear, "phase {phase}: pairs must alternate at scale 1.0");
+        }
+
+        // At 0.8 the rear's stance window shrinks to 0.4 of the cycle, so
+        // [0.9, 1.0) is a genuine flight phase -- and the rear's SWING
+        // window grows from 0.5*T to 0.6*T, which is the whole point.
+        let asym = bound(0.8);
+        assert_eq!(asym.duty_for(LegId::FL), 0.5);
+        assert_eq!(asym.duty_for(LegId::RL), 0.4);
+        assert_eq!(asym.duty_factors(), [0.5, 0.5, 0.4, 0.4]);
+
+        let stance_at = |phase: f64| {
+            let mut g = PhaseGenerator::new(asym.clone());
+            g.advance(phase * asym.cycle_period_s, &VelocityCmd { vx: 0.5, vy: 0.0, wz: 0.0 });
+            let legs = g.legs();
+            (find(legs, LegId::FL).is_stance, find(legs, LegId::RL).is_stance)
+        };
+        assert_eq!(stance_at(0.25), (true, false), "front-only");
+        assert_eq!(stance_at(0.70), (false, true), "rear-only");
+        assert_eq!(stance_at(0.95), (false, false), "flight");
     }
 
     #[test]
@@ -570,7 +623,7 @@ mod tests {
     ) -> Option<f64> {
         let nominal = [err_ps(is_stance, sub_fraction); 4];
         let force = [force_n; 4];
-        tracker.observe(&nominal, force, EARLY_N, LATE_N, T_ERR, DUTY_ERR)[0]
+        tracker.observe(&nominal, force, EARLY_N, LATE_N, T_ERR, [DUTY_ERR; 4])[0]
     }
 
     /// Force always agrees with the nominal schedule (loaded in
