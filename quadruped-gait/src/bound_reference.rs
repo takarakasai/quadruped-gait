@@ -142,8 +142,32 @@ impl BoundTrimConfig {
     /// -- averaging (piecewise-constant, matching this model's
     /// existing philosophy for `F_x`) gives `F_z = m·g/(2·duty_
     /// factor)`, which is exactly `m·g` at `duty_factor=0.5`.
+    /// Duty as the trim's own closed form may use it, clamped to 0.5.
+    ///
+    /// The derivation assumes the two pairs TILE the cycle: exactly one pair
+    /// loaded at a time, so `F_z (2 d) = m g` and the half-cycle splits as
+    /// `[0, T_st)` then flight. Both break for `d > 0.5`, which is the
+    /// overlap (4-support) regime:
+    ///   - `f_z_total` would return `m g / (2 d) < m g`, under-supporting
+    ///     gravity by 9% at d = 0.55 and shrinking `f_x_trim` by the same
+    ///     factor.
+    ///   - `t_st = T d` would exceed `T/2`, so `sample()`'s half-cycle
+    ///     partition overruns and the periodicity closure `theta(T/2) =
+    ///     -theta(0)` no longer holds -- leaving a step discontinuity in the
+    ///     pitch reference at every half-cycle boundary.
+    /// Clamping here keeps the reference well-posed while letting the CONTACT
+    /// SCHEDULE use the real `duty_factor`, which is the point of running
+    /// `d > 0.5`: genuine 4-support rows where both pairs share `F_z`, the
+    /// `r_x` moment arms cancel, and pitch needs no friction at all.
+    ///
+    /// Strictly a no-op for every `duty_factor <= 0.5`, so no existing result
+    /// moves.
+    fn duty_trim(&self) -> f64 {
+        self.duty_factor.min(0.5)
+    }
+
     pub fn f_z_total(&self) -> f64 {
-        self.mass_kg * GRAVITY_MPS2 / (2.0 * self.duty_factor)
+        self.mass_kg * GRAVITY_MPS2 / (2.0 * self.duty_trim())
     }
 
     /// The fore-aft force (both stance feet) that exactly zeroes net
@@ -191,7 +215,7 @@ impl BoundTrimConfig {
     }
 
     fn t_st(&self) -> f64 {
-        self.cycle_period_s * self.duty_factor
+        self.cycle_period_s * self.duty_trim()
     }
 
     /// Aerial (flight) duration within a half-cycle -- `0.0` at
@@ -559,6 +583,47 @@ mod tests {
     /// closed form (`m·g/(2·duty)`), cross-checked against
     /// `simulate_point_mass_bound_flight_phase.py`'s printed table
     /// (Phase 0, local doc Sec.5bq).
+    #[test]
+    fn duty_above_half_is_clamped_and_leaves_lower_duties_untouched() {
+        // The clamp must be a strict no-op at duty <= 0.5 -- every recorded
+        // result in this repo depends on that -- and must keep the closed form
+        // well-posed above it.
+        let mk = |d: f64| BoundTrimConfig { duty_factor: d, ..go2_cfg(0.7) };
+        for d in [0.25, 0.34, 0.40, 0.50] {
+            let c = mk(d);
+            let expected = c.mass_kg * GRAVITY_MPS2 / (2.0 * d);
+            assert!((c.f_z_total() - expected).abs() < 1e-9,
+                    "duty {d} must be untouched by the clamp");
+        }
+        // Above 0.5 everything pins to the duty-0.5 value rather than drifting
+        // into the under-supporting / closure-breaking regime.
+        let at_half = mk(0.50);
+        for d in [0.55, 0.60, 0.70] {
+            let c = mk(d);
+            assert!((c.f_z_total() - at_half.f_z_total()).abs() < 1e-9,
+                    "duty {d} must clamp to the duty-0.5 support force");
+            // gravity is fully supported, never the 0.909*m*g the unclamped
+            // form would give at d = 0.55
+            assert!(c.f_z_total() >= c.mass_kg * GRAVITY_MPS2 - 1e-9,
+                    "duty {d} must not under-support gravity");
+        }
+    }
+
+    #[test]
+    fn duty_above_half_keeps_the_half_cycle_pitch_reference_continuous() {
+        // sample() partitions the half-cycle as [0, t_st) then flight. With
+        // t_st > T/2 that partition overruns and theta(0.5) stops mirroring
+        // theta(0). Check the closure holds across the clamp boundary.
+        for d in [0.50, 0.55, 0.60, 0.70] {
+            let c = BoundTrimConfig { duty_factor: d, ..go2_cfg(0.7) };
+            let a = c.sample(0.0).pitch;
+            let b = c.sample(0.5).pitch;
+            assert!((a + b).abs() < 1e-6,
+                    "duty {d}: theta(0.5) must mirror theta(0), got {a} and {b}");
+            assert!(c.sample(0.25).pitch.is_finite(), "duty {d}: mid-stance must be finite");
+        }
+    }
+
     #[test]
     fn f_z_total_grows_as_duty_factor_shrinks_below_half() {
         let mut cfg = go2_cfg(0.7);

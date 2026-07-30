@@ -1505,9 +1505,19 @@ impl FullCentroidalMpcGaitController {
             // supplying the forward force the velocity-tracking cost
             // can't at high command. `0.0` (default) is a no-op.
             if self.cfg.bound_fx_thrust_bias != 0.0 && total_weight > 1e-9 {
+                // `bound_fx_thrust_rear_frac` splits the push front/rear
+                // (gathered-gallop asymmetry). At the 0.5 default both gains
+                // are exactly 1.0, so this is bit-identical to the symmetric
+                // version that preceded it.
+                let frac = self.cfg.bound_fx_thrust_rear_frac.clamp(0.0, 1.0);
+                let pair_gain = [
+                    2.0 * (1.0 - frac), 2.0 * (1.0 - frac), // FL, FR
+                    2.0 * frac, 2.0 * frac,                 // RL, RR
+                ];
                 for leg in 0..N_FEET {
                     if contact.is_stance[leg][k] {
-                        grfs[leg].x += leg_weights[leg] * self.cfg.bound_fx_thrust_bias / total_weight;
+                        grfs[leg].x += leg_weights[leg] * pair_gain[leg]
+                            * self.cfg.bound_fx_thrust_bias / total_weight;
                     }
                 }
             }
@@ -1742,7 +1752,17 @@ impl FullCentroidalMpcGaitController {
             combined.y = min_y;
         }
         half = combined;
-        let max_half = 0.5 * self.cfg.max_step_length_m;
+        // `max_step_length_rear_scale` lets the rear pair take a longer
+        // stride than the front (gathered-gallop asymmetry). Since the pairs
+        // tile the cycle, v_max = (stride_front + stride_rear)/T, so scaling
+        // only the rear raises the ceiling without touching the FRONT pair's
+        // swing speed -- the thing that breaks when max_step_length_m is
+        // raised uniformly. At the 1.0 default this is the symmetric value.
+        let step_scale = match kin.leg {
+            LegId::RL | LegId::RR => self.cfg.max_step_length_rear_scale.max(0.0),
+            _ => 1.0,
+        };
+        let max_half = 0.5 * self.cfg.max_step_length_m * step_scale;
         let mag = half.norm();
         if mag > max_half && mag > 0.0 {
             half *= max_half / mag;

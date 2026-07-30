@@ -190,6 +190,35 @@ pub struct GaitConfig {
     /// Maximum forward step length (m). Footstep planner clamps to this so
     /// the robot can't ask for a larger swing than its leg geometry allows.
     pub max_step_length_m: f64,
+    /// Multiplier on [`Self::max_step_length_m`] for the REAR pair only
+    /// (`RL`/`RR`); the front pair always uses `max_step_length_m` as-is.
+    /// `1.0` (default) is the symmetric behaviour.
+    ///
+    /// This is the stride half of a gathered gallop, and unlike the postural
+    /// and propulsive halves it has a structural reason to work. In a Bound at
+    /// duty 0.5 the pairs tile the cycle, so the body's travel per cycle is
+    /// the sum of the two pairs' stance sweeps:
+    ///
+    /// ```text
+    /// v_max = (stride_front + stride_rear) / T
+    /// ```
+    ///
+    /// which for the symmetric case reduces to the familiar
+    /// `max_step_length_m / (T * duty)`. Measured on Go2 (2026-07-31), the
+    /// achieved speed pins at that value to within 1% for commands up to 50%
+    /// above it -- the ceiling is geometric, not a force limit (torque
+    /// saturation there is 2.2%).
+    ///
+    /// Raising `max_step_length_m` UNIFORMLY does not lift it: the required
+    /// swing speed `~(stride + v*t_sw + 2*h)/t_sw` then exceeds the knee's
+    /// ~6.4 m/s envelope and the gait falls over. Raising only the rear
+    /// raises `v_max` while leaving the FRONT pair's swing untouched, which
+    /// localises that failure to one pair instead of both.
+    ///
+    /// The rear's own swing speed still rises, so this trades one pair's
+    /// kinematic headroom for speed; it is not free.
+    #[cfg_attr(feature = "serde", serde(default = "default_max_step_length_rear_scale"))]
+    pub max_step_length_rear_scale: f64,
     /// Fraction of each leg's **stance phase** that is treated as a
     /// load / unload transition. Reads only by the FullCentroidal
     /// controller's legged_control-parity path (C1 experiment): at
@@ -330,6 +359,28 @@ pub struct GaitConfig {
     /// the (low-weight) attitude cost must absorb. `0.0` (default) is a
     /// no-op. Applied in world-x (≈ body-forward for straight running).
     pub bound_fx_thrust_bias: f64,
+    /// Front/rear split of [`Self::bound_fx_thrust_bias`]: the fraction of
+    /// the forward-thrust feedforward assigned to the REAR pair. `0.5`
+    /// (default) reproduces the symmetric behaviour exactly -- each pair's
+    /// share is scaled by `2*frac` (rear) and `2*(1-frac)` (front), which is
+    /// `1.0` for both at `0.5`. `1.0` puts the entire thrust on the rear pair
+    /// at double magnitude while the front pair contributes none.
+    ///
+    /// The point is a GATHERED GALLOP. A bounding animal does not push
+    /// equally with both pairs: the rear extends explosively and supplies
+    /// most of the propulsion, while the front mainly catches and redirects.
+    /// Every other force lever here is front/rear symmetric -- notably
+    /// [`crate::bound_reference::BoundTrimConfig`], whose closed form derives
+    /// the rear half-cycle by exact negation of the front and so CANNOT be
+    /// made asymmetric without re-deriving its periodicity closure. This
+    /// knob sits outside the trim (it is a net push the trim's alternating
+    /// pitch-cancelling `F_x` rides on top of), so it can be biased freely.
+    ///
+    /// Biasing thrust rearward also biases the pitch moment it injects, and
+    /// the attitude cost carries that at low weight. Expect nose-up pitch to
+    /// grow with `frac`.
+    #[cfg_attr(feature = "serde", serde(default = "default_bound_fx_thrust_rear_frac"))]
+    pub bound_fx_thrust_rear_frac: f64,
     /// **LinearCrawl-only**: fraction of each per-leg sub-cycle
     /// (`T/4`) held in 4-support before that leg lifts. Range `(0, 1)`;
     /// `0.5` is the default. Only [`crate::linear_crawl::LinearCrawlController`]
@@ -389,6 +440,14 @@ fn default_four_support_fraction() -> f64 {
     0.5
 }
 
+fn default_bound_fx_thrust_rear_frac() -> f64 {
+    0.5
+}
+
+fn default_max_step_length_rear_scale() -> f64 {
+    1.0
+}
+
 /// Default swing-foot feasibility cap (m/s). Also used to backfill the
 /// field when deserialising configs saved before it existed.
 pub fn default_max_swing_foot_speed() -> f64 {
@@ -404,6 +463,7 @@ impl GaitConfig {
             duty_factor: 0.5,
             swing_height_m: 0.04,
             max_step_length_m: 0.10,
+            max_step_length_rear_scale: 1.0,
             transition_fraction: 0.0,
             transition_enforce_constraint: false,
             friction_cone_soft: false,
@@ -415,6 +475,7 @@ impl GaitConfig {
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
             bound_fx_thrust_bias: 0.0,
+            bound_fx_thrust_rear_frac: 0.5,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -435,6 +496,7 @@ impl GaitConfig {
             duty_factor: 0.75,
             swing_height_m: 0.035,
             max_step_length_m: 0.08,
+            max_step_length_rear_scale: 1.0,
             transition_fraction: 0.0,
             transition_enforce_constraint: false,
             friction_cone_soft: false,
@@ -446,6 +508,7 @@ impl GaitConfig {
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
             bound_fx_thrust_bias: 0.0,
+            bound_fx_thrust_rear_frac: 0.5,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -465,6 +528,7 @@ impl GaitConfig {
             duty_factor: 0.5,
             swing_height_m: 0.04,
             max_step_length_m: 0.10,
+            max_step_length_rear_scale: 1.0,
             transition_fraction: 0.0,
             transition_enforce_constraint: false,
             friction_cone_soft: false,
@@ -476,6 +540,7 @@ impl GaitConfig {
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
             bound_fx_thrust_bias: 0.0,
+            bound_fx_thrust_rear_frac: 0.5,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -494,6 +559,7 @@ impl GaitConfig {
             duty_factor: 0.5,
             swing_height_m: 0.05,
             max_step_length_m: 0.12,
+            max_step_length_rear_scale: 1.0,
             transition_fraction: 0.0,
             transition_enforce_constraint: false,
             friction_cone_soft: false,
@@ -505,6 +571,7 @@ impl GaitConfig {
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
             bound_fx_thrust_bias: 0.0,
+            bound_fx_thrust_rear_frac: 0.5,
             four_support_fraction: 0.5,
             lateral_sway_m: 0.0,
             smooth_swing: false,
@@ -549,6 +616,7 @@ impl GaitConfig {
             duty_factor: 0.85,
             swing_height_m: 0.005,
             max_step_length_m: 0.06,
+            max_step_length_rear_scale: 1.0,
             transition_fraction: 0.0,
             transition_enforce_constraint: false,
             friction_cone_soft: false,
@@ -560,6 +628,7 @@ impl GaitConfig {
             bound_symmetric_foothold: false,
             bound_trim_vertical_reference: false,
             bound_fx_thrust_bias: 0.0,
+            bound_fx_thrust_rear_frac: 0.5,
             four_support_fraction: 0.85,
             lateral_sway_m: 0.0,
             smooth_swing: false,
