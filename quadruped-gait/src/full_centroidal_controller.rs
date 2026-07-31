@@ -781,6 +781,34 @@ impl FullCentroidalMpcGaitController {
         Some((lerp(1), lerp(2), lerp(3), lerp(4), lerp(5)))
     }
 
+    /// Vertical acceleration implied by the tabulated reference at `phase`,
+    /// by central-differencing the table's `vz` column with respect to time
+    /// (`dt = period_s * dphase`). `None` when there is no table.
+    ///
+    /// A tabulated orbit states where the body should be and how fast, but
+    /// carries no force columns -- so on its own it asks the MPC to bounce
+    /// while the GRF reference still says "support gravity and nothing else".
+    /// The vertical dynamics fix the missing half uniquely:
+    ///
+    /// ```text
+    /// m * z_ddot = F_z - m*g     =>     F_z = m * (g + z_ddot)
+    /// ```
+    ///
+    /// so the force feedforward that makes a tabulated bounce feasible is
+    /// determined by the table itself, with nothing left to tune.
+    fn sample_tabulated_z_accel(&self, phase: f64, period_s: f64) -> Option<f64> {
+        let t = self.bound_tabulated_reference.as_ref()?;
+        if t.len() < 3 || period_s <= 1e-9 {
+            return None;
+        }
+        // One table row's worth of phase, so the difference is taken over the
+        // table's own resolution rather than an arbitrary epsilon.
+        let dphase = 1.0 / t.len() as f64;
+        let (_, _, _, vz_hi, _) = self.sample_tabulated_reference(phase + dphase)?;
+        let (_, _, _, vz_lo, _) = self.sample_tabulated_reference(phase - dphase)?;
+        Some((vz_hi - vz_lo) / (2.0 * dphase * period_s))
+    }
+
     /// Read the nonlinear pulse branch parameters `(k_pulse, v_db)`.
     /// `k_pulse = 0` means the pulse branch is inactive — the
     /// controller uses pure linear capture-point.
@@ -1497,7 +1525,23 @@ impl FullCentroidalMpcGaitController {
                             // MIT verification, is the aligned choice
                             // (they don't command a bounce force either).
                             if self.cfg.bound_trim_vertical_reference {
-                                grfs[leg].z = leg_weights[leg] * f_z_total / total_weight;
+                                // With a tabulated orbit the trim's own
+                                // `f_z_total` is the wrong number: at duty
+                                // 0.5 it equals m*g exactly (the trim derives
+                                // its surplus from `t_flight = (1-2d)*T`,
+                                // which is zero there), so it commands no
+                                // bounce force no matter what z the table
+                                // asks for. Take the force the TABLE implies
+                                // instead -- `F_z = m*(g + z_ddot)` -- which
+                                // is what makes a tabulated bounce feasible
+                                // at a duty where the trim cannot express one.
+                                let f_z = match self
+                                    .sample_tabulated_z_accel(cycle_phase_k, cycle_period)
+                                {
+                                    Some(z_ddot) => cfg.mass_kg * (9.81 + z_ddot),
+                                    None => f_z_total,
+                                };
+                                grfs[leg].z = leg_weights[leg] * f_z / total_weight;
                             }
                         }
                     }
