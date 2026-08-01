@@ -637,6 +637,32 @@ impl FullCentroidalMpcGaitController {
         self.phase_gen.set_config(self.cfg.clone());
     }
 
+    /// Update `duty_factor` in place, preserving the phase clock, exactly
+    /// as [`Self::set_cycle_period_s`] does for the period.
+    ///
+    /// Exists so duty can be moved CONTINUOUSLY at run time. Measured on Go2
+    /// (2026-07-31), this gait is bistable in its stride parameter with a
+    /// 0.022 m hysteresis interval, and the locked high-stride branch can be
+    /// reached by ramping into it while it cannot be entered by starting
+    /// there -- 2.29 m/s by continuation against 0.55 m/s from a static
+    /// start at the same stride. Every duty result on record was measured
+    /// from a static start, so they measure the reach of initialisation
+    /// rather than the limit of the parameter, and re-testing them requires
+    /// being able to move duty without resetting the clock.
+    ///
+    /// Goes through `PhaseGenerator::set_config` rather than `set_config`,
+    /// which would rebuild the generator and snap `cycle_phase` to 0.
+    pub fn set_duty_factor(&mut self, duty: f64) {
+        self.cfg.duty_factor = duty.clamp(0.05, 0.95);
+        self.phase_gen.set_config(self.cfg.clone());
+    }
+
+    /// Update `max_step_length_rear_scale` in place. Plain field write --
+    /// the footstep planner reads it live, same as `max_step_length_m`.
+    pub fn set_max_step_length_rear_scale(&mut self, scale: f64) {
+        self.cfg.max_step_length_rear_scale = scale.max(0.0);
+    }
+
     /// Update `max_step_length_m` in place. Read live from `self.cfg`
     /// by the footstep planner each tick (not part of `phase_gen`'s own
     /// state), so unlike [`Self::set_cycle_period_s`] this needs no

@@ -605,6 +605,23 @@ impl AnyGaitController {
         }
     }
 
+    /// Update `duty_factor` in place without resetting the phase clock
+    /// (see [`crate::full_centroidal_controller::
+    /// FullCentroidalMpcGaitController::set_duty_factor`]). No-op for
+    /// other modes.
+    pub fn set_duty_factor(&mut self, duty: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_duty_factor(duty);
+        }
+    }
+
+    /// Update `max_step_length_rear_scale` in place. No-op for other modes.
+    pub fn set_max_step_length_rear_scale(&mut self, scale: f64) {
+        if let AnyGaitController::FullCentroidal(c) = self {
+            c.set_max_step_length_rear_scale(scale);
+        }
+    }
+
     /// Set the Bound-specific fore-aft foot-placement feedback gain
     /// (see [`crate::full_centroidal_controller::
     /// FullCentroidalMpcGaitController::set_bound_fore_aft_placement_gain`]).
