@@ -39,6 +39,12 @@ pub struct WbcInputs<'a> {
     pub dj_v: &'a DVector<f64>,
     pub contact_flag: [bool; 4],
     pub friction_mu: f64,
+    /// Minimum normal force demanded of a commanded-stance foot, newtons.
+    /// Zero keeps the `legged_control` behaviour (push-only, no floor); a
+    /// positive value stops the QP satisfying a three- or four-contact plan
+    /// with a two-contact solution. Hard constraint -- keep it well under the
+    /// real per-foot share so touchdown transients stay feasible.
+    pub f_min_stance_n: f64,
     /// Per-actuator torque limit (length `na`).
     pub torque_max: &'a DVector<f64>,
     /// Reference base acceleration from MPC (6: linear + angular,
@@ -282,7 +288,12 @@ pub fn solve_warm_with_weights(
     )
     .weight(w.floating_base_eom)
         + torque_limits::formulate(dims, inputs.torque_max)
-        + friction_cone::formulate(dims, inputs.contact_flag, inputs.friction_mu)
+        + friction_cone::formulate(
+            dims,
+            inputs.contact_flag,
+            inputs.friction_mu,
+            inputs.f_min_stance_n,
+        )
         + no_contact_motion::formulate(
             dims,
             inputs.j_contact,
@@ -419,6 +430,7 @@ mod tests {
             dj_v: &dj_v,
             contact_flag: [true; 4],
             friction_mu: 0.5,
+            f_min_stance_n: 0.0,
             torque_max: &torque_max,
             a_base_des: &a_base_des,
             swing_q_ddot_des: &swing_q_ddot_des,
