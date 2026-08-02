@@ -202,6 +202,7 @@ mod tests {
             dj_v: &f.dj_v,
             contact_flag: [true, true, true, false],
             friction_mu: 0.6,
+            f_min_stance_n: 0.0,
             torque_max: &f.torque_max,
             a_base_des: &f.a_base_des,
             swing_q_ddot_des: &f.swing_des,
