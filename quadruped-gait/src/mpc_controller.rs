@@ -576,11 +576,23 @@ impl MpcGaitController {
         // manifests as visible foot flailing (the τ_ff goes erratic
         // tick-to-tick as clarabel finds different "best impulses").
         //
-        // Non-hold mode uses a coarse `duty_factor > 0.5` proxy for
-        // steps k≥1. This isn't perfect (it ignores the per-leg phase
-        // offset), but it's adequate while the MPC's main job is
-        // step-0 GRF prediction; future work can swap in a proper
-        // per-leg phase projection.
+        // Non-hold mode projects each leg's cycle phase forward by
+        // `k · dt_per_step`, the same way `FullCentroidalMpcGaitController`
+        // does under `legged_control_parity`.
+        //
+        // This replaces a `duty_factor > 0.5` proxy for steps k≥1 that was
+        // documented as "adequate while the MPC's main job is step-0 GRF
+        // prediction". It was not adequate. The proxy ignores the per-leg
+        // phase offset, so it collapses to a single global answer, and for a
+        // trot at duty exactly 0.50 the comparison is false: the MPC planned
+        // all four legs airborne for nine of its ten horizon nodes. At duty
+        // 0.75 and 0.85 it planned all four in stance for all nine, which
+        // means a walk's GRF budget was split four ways when only three feet
+        // were ever down.
+        //
+        // The k=0 row still uses the observed stance flag -- the system is in
+        // that state now, and the no-slip equality at step 0 must not
+        // disagree with reality.
         let holding = self.cmd.is_zero();
         let stance_now: [bool; 4] = [
             output.legs[0].phase.is_stance,
@@ -591,14 +603,30 @@ impl MpcGaitController {
         let mut contact = ContactSchedule {
             is_stance: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
         };
+        let leg_phase_offsets: [f64; 4] = {
+            let mut arr = [0.0_f64; 4];
+            for (leg, off) in self.cfg.gait_type.phase_offsets() {
+                arr[crate::controller::slot_of(leg)] = off;
+            }
+            arr
+        };
+        let cycle_phase_now = self.phase_gen.cycle_phase();
+        let dt_per_step = self.srbd_mpc.config().dt_per_step;
+        let cycle_period = self.cfg.cycle_period_s.max(1e-9);
         for leg in 0..4 {
+            let duty = self.cfg.duty_for_slot(leg);
             for k in 0..n {
                 let in_stance = if holding {
                     true
                 } else if k == 0 {
                     stance_now[leg]
                 } else {
-                    self.cfg.duty_factor > 0.5
+                    let t = k as f64 * dt_per_step;
+                    let cycle_phase_k =
+                        (cycle_phase_now + t / cycle_period).rem_euclid(1.0);
+                    let pos =
+                        (cycle_phase_k + leg_phase_offsets[leg]).rem_euclid(1.0);
+                    pos < duty
                 };
                 contact.is_stance[leg].push(in_stance);
             }
