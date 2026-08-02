@@ -124,6 +124,289 @@ pub fn build_obs(inp: &ObsInput, cmd: &[f64; 3], last_action: &[f64; 12]) -> Vec
 }
 
 /// Clamp a `[vx, vy, wz]` command to the ranges the policy was trained on.
+/// Deploy-side runtime for the **Bound** policy, which has a different
+/// contract from the crawl policy above: 50-d observation, per-block
+/// observation scaling, a heading term, and its own nominal pose and limits.
+///
+/// Kept as a separate module rather than parameterising `build_obs`, because
+/// getting the two mixed up is silent. The widths differ (45 vs 50) so a
+/// straight swap fails loudly, but within the Bound family the SCALED and
+/// RAW-unit generations are both 50 wide -- feeding one the other's units
+/// reads as a slower robot, not as an error. It cost a wrong measurement
+/// (1.700 -> 1.412 m/s) before it was noticed in simulation.
+///
+/// Observation layout, all Isaac joint order:
+///
+/// | slice      | content                          | scale |
+/// |------------|----------------------------------|-------|
+/// | `[0..3)`   | base angular velocity (body)     | 0.25  |
+/// | `[3..6)`   | projected gravity (unit, body)   | 1     |
+/// | `[6..9)`   | velocity command `[vx, vy, wz]`  | 1     |
+/// | `[9..21)`  | joint position − default         | 1     |
+/// | `[21..33)` | joint velocity                   | 0.05  |
+/// | `[33..45)` | previous action                  | 1     |
+/// | `[45..47)` | `(sin, cos)` of heading error    | 1     |
+/// | `[47..50)` | gait phase `(tau, sin, cos)`     | 1     |
+///
+/// **The heading pair is at 45, not at the end.** IsaacLab orders terms by
+/// declaration and `bound_heading` is declared before `bound_phase`, so
+/// appending it would feed the policy its phase in the heading slots with
+/// nothing raised.
+pub mod bound {
+    use super::go2::{DEFAULT_ISAAC, GO2_TO_ISAAC, ISAAC_TO_GO2};
+
+    /// Observation dimension of the deployed Bound policy.
+    pub const N_OBS: usize = 50;
+
+    /// Per-block observation scales. These are part of the policy's
+    /// interface: the graph was trained against scaled values.
+    pub const SCALE_ANG_VEL: f32 = 0.25;
+    pub const SCALE_JOINT_VEL: f32 = 0.05;
+
+    /// `q_des = default + ACTION_SCALE · action`. Half the crawl policy's.
+    pub const ACTION_SCALE: f64 = 0.25;
+
+    /// On-board PD at the trained gains.
+    pub const POLICY_KP: f32 = 25.0;
+    pub const POLICY_KD: f32 = 0.5;
+
+    /// Real Go2 per-joint torque limits, Isaac order (hips, thighs, calves).
+    /// The calf is 45.43, not the uniform 23.5 the stock Isaac config uses.
+    pub const TAU_LIMIT_ISAAC: [f64; 12] = [
+        23.7, 23.7, 23.7, 23.7, 23.7, 23.7, 23.7, 23.7, 45.43, 45.43, 45.43, 45.43,
+    ];
+
+    /// Gait period the phase observation is built on, seconds.
+    pub const PERIOD_S: f64 = 0.18;
+
+    /// Commanded speeds the policy was trained on. It has never seen a zero
+    /// command while walking -- measured, it does not stop, it creeps at
+    /// 0.10 m/s -- which is why stopping is handled by the host, below.
+    pub const CMD_VX_RANGE: (f64, f64) = (0.8, 3.0);
+    pub const CMD_VY_RANGE: (f64, f64) = (-0.2, 0.2);
+    pub const CMD_WZ_RANGE: (f64, f64) = (-0.3, 0.3);
+
+    /// Heading reference, integrated from the gyro.
+    ///
+    /// A 6-axis IMU cannot observe absolute yaw -- there is no horizontal
+    /// reference -- and a Madgwick filter in IMU mode does not correct it
+    /// either; that needs a magnetometer. Absolute yaw is not what the
+    /// policy needs. It needs how far the robot has turned SINCE THE RUN
+    /// STARTED, and integrating gyro z gives that to well under a degree
+    /// over a 10-40 s run, against the 37-74 degrees the policy accumulated
+    /// before the observation existed.
+    ///
+    /// Call [`Self::reset`] whenever the robot is standing still: that is
+    /// what the training environment does, and it is also what keeps the
+    /// integrator from accumulating between runs.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct HeadingIntegrator {
+        yaw_rel_rad: f64,
+    }
+
+    impl HeadingIntegrator {
+        /// Zero the reference. Do this while standing, before the gait starts.
+        pub fn reset(&mut self) {
+            self.yaw_rel_rad = 0.0;
+        }
+
+        /// Advance by one control step. `gyro_z` is the body-frame yaw rate
+        /// in rad/s -- the same channel that feeds observation `[2]`.
+        pub fn step(&mut self, gyro_z_rad_s: f64, dt_s: f64) {
+            self.yaw_rel_rad += gyro_z_rad_s * dt_s;
+        }
+
+        /// Heading error since the last reset, wrapped to (-pi, pi].
+        pub fn error_rad(&self) -> f64 {
+            self.yaw_rel_rad.sin().atan2(self.yaw_rel_rad.cos())
+        }
+
+        /// The `(sin, cos)` pair the observation carries. sin/cos rather than
+        /// the angle so the wrap has no discontinuity for the network.
+        pub fn sin_cos(&self) -> (f32, f32) {
+            let d = self.error_rad();
+            (d.sin() as f32, d.cos() as f32)
+        }
+    }
+
+    /// Gait phase `tau`, in periods, measured from the moment the gait
+    /// starts. Negative while standing.
+    pub fn phase_obs(tau: f64) -> [f32; 3] {
+        let tau_active = tau.max(0.0);
+        [
+            tau.clamp(-2.0, 1.2) as f32,
+            (2.0 * std::f64::consts::PI * tau_active).sin() as f32,
+            (2.0 * std::f64::consts::PI * tau_active).cos() as f32,
+        ]
+    }
+
+    /// Assemble the 50-d scaled observation.
+    pub fn build_obs(
+        inp: &super::ObsInput,
+        cmd: &[f64; 3],
+        last_action: &[f64; 12],
+        heading: &HeadingIntegrator,
+        tau: f64,
+    ) -> Vec<f32> {
+        let mut obs = Vec::with_capacity(N_OBS);
+        for g in inp.gyro_rad_s.iter() {
+            obs.push(*g * SCALE_ANG_VEL);
+        }
+        let q = &inp.quat_wxyz;
+        let (w, x, y, z) = (q[0] as f64, q[1] as f64, q[2] as f64, q[3] as f64);
+        obs.push((2.0 * (w * y - x * z)) as f32);
+        obs.push((-2.0 * (y * z + w * x)) as f32);
+        obs.push((2.0 * (x * x + y * y) - 1.0) as f32);
+        obs.push(cmd[0] as f32);
+        obs.push(cmd[1] as f32);
+        obs.push(cmd[2] as f32);
+        let mut jp = [0.0f32; 12];
+        let mut jv = [0.0f32; 12];
+        for gidx in 0..12 {
+            let iidx = GO2_TO_ISAAC[gidx];
+            jp[iidx] = inp.joint_q_go2[gidx] - DEFAULT_ISAAC[iidx] as f32;
+            jv[iidx] = inp.joint_dq_go2[gidx] * SCALE_JOINT_VEL;
+        }
+        obs.extend_from_slice(&jp);
+        obs.extend_from_slice(&jv);
+        for a in last_action.iter() {
+            obs.push(*a as f32);
+        }
+        let (s, c) = heading.sin_cos();
+        obs.push(s);
+        obs.push(c);
+        obs.extend_from_slice(&phase_obs(tau));
+        debug_assert_eq!(obs.len(), N_OBS);
+        obs
+    }
+
+    /// `action -> joint targets`, in Go2 SDK order.
+    pub fn action_to_q_des_go2(action_isaac: &[f64; 12]) -> [f64; 12] {
+        let mut q_des = [0.0f64; 12];
+        for i in 0..12 {
+            q_des[ISAAC_TO_GO2[i]] = DEFAULT_ISAAC[i] + ACTION_SCALE * action_isaac[i];
+        }
+        q_des
+    }
+
+    /// Hand-off between the standing hold and the policy.
+    ///
+    /// Standing is not a learning problem: commanding the nominal pose at
+    /// these gains settles the trunk at 0.272 m using 6.2 of 23.7 N.m. The
+    /// policies asked to do it themselves stand on THREE legs -- one foot
+    /// never touches down across the whole hold, with a 123 mm spread in
+    /// foot height -- and training that out cost 28% of forward speed. With
+    /// the hold done here instead it costs 0.7%, and the foot spread is
+    /// 0.3 mm.
+    ///
+    /// STOPPING IS THE PART THAT BITES. Handing a robot still carrying 3 m/s
+    /// to a joint-position hold does not stop it: the hold has no way to shed
+    /// momentum, the legs trail, and the trunk drops 0.240 -> 0.079 m in
+    /// 0.36 s and does not get up. Blending the pose transition does not help
+    /// -- 0.0 s and 3.0 s blends both end at 0.052 m, because the transient
+    /// was never the problem. Two things are needed, and this type does both:
+    ///
+    ///   * rate-limit the command so the POLICY brakes, which is its job
+    ///   * hand over only once the body has ACTUALLY stopped, not when the
+    ///     command reaches zero
+    ///
+    /// Verified in simulation over a 0-1-2-3-1.5-0-2.5-0 m/s schedule: every
+    /// stop and restart holds, minimum trunk height 0.220 m, against a
+    /// collapse on the first stop without it.
+    #[derive(Clone, Copy, Debug)]
+    pub struct GaitSupervisor {
+        cmd_slew_mps2: f64,
+        stop_speed_mps: f64,
+        applied_vx: f64,
+        standing: bool,
+        tau: f64,
+    }
+
+    impl Default for GaitSupervisor {
+        fn default() -> Self {
+            Self {
+                cmd_slew_mps2: 1.5,
+                stop_speed_mps: 0.25,
+                applied_vx: 0.0,
+                standing: true,
+                tau: -1.0,
+            }
+        }
+    }
+
+    /// What the host should do with this control step.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum GaitMode {
+        /// Hold [`stand_q_des_go2`]; the policy's output is not used. Run it
+        /// anyway and keep feeding `last_action`, so the value at hand-over
+        /// is the one the policy was trained to see.
+        Standing,
+        /// Track the policy.
+        Walking,
+    }
+
+    impl GaitSupervisor {
+        pub fn new(cmd_slew_mps2: f64, stop_speed_mps: f64) -> Self {
+            Self { cmd_slew_mps2, stop_speed_mps, ..Self::default() }
+        }
+
+        /// Advance one control step.
+        ///
+        /// `requested` is what the higher level wants, `body_speed_mps` the
+        /// measured planar speed, `dt_s` the control period. Returns the
+        /// command to put in the observation and which mode to drive.
+        pub fn step(
+            &mut self,
+            requested: &[f64; 3],
+            body_speed_mps: f64,
+            dt_s: f64,
+        ) -> ([f64; 3], GaitMode) {
+            let step = self.cmd_slew_mps2 * dt_s;
+            self.applied_vx += (requested[0] - self.applied_vx).clamp(-step, step);
+            let cmd = [self.applied_vx, requested[1], requested[2]];
+
+            let want_stop = cmd.iter().all(|c| c.abs() < 1e-6);
+            self.standing = if self.standing {
+                want_stop
+            } else {
+                want_stop && body_speed_mps < self.stop_speed_mps
+            };
+
+            if self.standing {
+                // Phase held before the gait starts, exactly as the training
+                // env does. Clamped so it does not run away over a long hold.
+                self.tau = (self.tau - dt_s / PERIOD_S).max(-2.0);
+            } else {
+                self.tau += dt_s / PERIOD_S;
+            }
+
+            let mode = if self.standing { GaitMode::Standing } else { GaitMode::Walking };
+            (cmd, mode)
+        }
+
+        /// Gait phase for [`build_obs`].
+        pub fn tau(&self) -> f64 {
+            self.tau
+        }
+
+        /// True while the standing hold owns the joints. The heading
+        /// integrator should be reset whenever this is true.
+        pub fn is_standing(&self) -> bool {
+            self.standing
+        }
+    }
+
+    /// Joint targets for the standing hold, in Go2 SDK order: the nominal
+    /// pose, unchanged.
+    pub fn stand_q_des_go2() -> [f64; 12] {
+        let mut q = [0.0f64; 12];
+        for i in 0..12 {
+            q[ISAAC_TO_GO2[i]] = DEFAULT_ISAAC[i];
+        }
+        q
+    }
+}
+
 pub fn clamp_cmd(mut c: [f64; 3]) -> [f64; 3] {
     c[0] = c[0].clamp(CMD_VX_RANGE.0, CMD_VX_RANGE.1);
     c[1] = c[1].clamp(CMD_VY_RANGE.0, CMD_VY_RANGE.1);
@@ -525,5 +808,118 @@ mod tests {
         let row = String::from_utf8(buf).unwrap();
         assert_eq!(row.trim_end().split(',').count(), cols);
         assert!(row.starts_with("1.2500,shadow,123,"));
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::bound::*;
+    use super::ObsInput;
+
+    /// Observation vector produced by the PYTHON side (`sim2sim_bound_mujoco.py`'s
+    /// layout and scales) for a fixed synthetic input. Generated once and pinned
+    /// here.
+    ///
+    /// This is the check that matters for deployment. The two implementations
+    /// disagreeing is SILENT -- the widths match, the policy still runs, and the
+    /// robot merely behaves worse. It cost a wrong measurement once already
+    /// (1.700 -> 1.412 m/s) when scaled values were fed to a graph trained on raw
+    /// ones, with no error raised anywhere.
+    const GOLDEN: [f32; 50] = [
+        2.750000000e-02, -5.500000000e-02, 8.250000000e-02, 3.419225600e-01, -0.000000000e+00,
+        -9.397260800e-01, 2.500000000e+00, 1.000000000e-01, -5.000000000e-02, -1.500000000e-01,
+        -1.000000000e-01, 1.500000000e-01, 2.000000000e-01, -8.000000000e-01, -9.500000000e-01,
+        -7.000000000e-01, -8.500000000e-01, 1.550000000e+00, 1.400000000e+00, 1.850000000e+00,
+        1.700000000e+00, -4.500000000e-02, -1.500000000e-01, 1.650000000e-01, 6.000000000e-02,
+        -1.000000000e-02, -1.150000000e-01, 2.000000000e-01, 9.500000000e-02, 2.500000000e-02,
+        -8.000000000e-02, 2.350000000e-01, 1.300000000e-01, -1.500000000e+00, -1.200000000e+00,
+        -9.000000000e-01, -6.000000000e-01, -3.000000000e-01, 0.000000000e+00, 3.000000000e-01,
+        6.000000000e-01, 9.000000000e-01, 1.200000000e+00, 1.500000000e+00, 1.800000000e+00,
+        3.428978075e-01, 9.393727128e-01, 1.200000000e+00, -9.510565163e-01, -3.090169944e-01,
+    ];
+
+    fn fixture() -> (ObsInput, [f64; 3], [f64; 12], HeadingIntegrator, f64) {
+        let mut q_go2 = [0.0f32; 12];
+        let mut dq_go2 = [0.0f32; 12];
+        for i in 0..12 {
+            q_go2[i] = 0.05 * i as f32 - 0.2;
+            dq_go2[i] = 0.7 * i as f32 - 3.0;
+        }
+        let inp = ObsInput {
+            gyro_rad_s: [0.11, -0.22, 0.33],
+            quat_wxyz: [0.9848, 0.0, 0.1736, 0.0],   // 20 deg pitch
+            joint_q_go2: q_go2,
+            joint_dq_go2: dq_go2,
+        };
+        let cmd = [2.5, 0.1, -0.05];
+        let mut last = [0.0f64; 12];
+        for i in 0..12 {
+            last[i] = 0.3 * i as f64 - 1.5;
+        }
+        // heading error 0.35 rad, reached by integrating 0.35 rad/s for 1 s
+        let mut h = HeadingIntegrator::default();
+        h.step(0.35, 1.0);
+        (inp, cmd, last, h, 1.7)
+    }
+
+    #[test]
+    fn observation_matches_the_python_implementation() {
+        let (inp, cmd, last, h, tau) = fixture();
+        let obs = build_obs(&inp, &cmd, &last, &h, tau);
+        assert_eq!(obs.len(), N_OBS);
+        for (i, (got, want)) in obs.iter().zip(GOLDEN.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 2e-6,
+                "obs[{i}] = {got:.9e}, python says {want:.9e}"
+            );
+        }
+    }
+
+    /// The heading pair sits at 45..47, BEFORE the phase -- IsaacLab orders
+    /// observation terms by declaration and `bound_heading` is declared first.
+    /// Appending it instead would feed the policy its phase in the heading
+    /// slots, and nothing would report it.
+    #[test]
+    fn heading_precedes_phase_in_the_layout() {
+        let (inp, cmd, last, h, tau) = fixture();
+        let obs = build_obs(&inp, &cmd, &last, &h, tau);
+        let (s, c) = h.sin_cos();
+        assert_eq!((obs[45], obs[46]), (s, c));
+        assert_eq!(obs[47..50], phase_obs(tau));
+    }
+
+    /// A stop is only handed to the standing hold once the body has actually
+    /// stopped. Handing over on the command alone drops the trunk from 0.240
+    /// to 0.079 m in simulation, and no blend length fixes it.
+    #[test]
+    fn stopping_waits_for_the_body_not_just_the_command() {
+        let dt = 1.0 / 50.0;
+        let mut sup = GaitSupervisor::new(1.5, 0.25);
+
+        // reach 3 m/s
+        for _ in 0..500 {
+            sup.step(&[3.0, 0.0, 0.0], 3.0, dt);
+        }
+        assert_eq!(sup.is_standing(), false);
+
+        // command zero while still moving fast: must NOT hand over
+        for _ in 0..200 {
+            let (_, mode) = sup.step(&[0.0, 0.0, 0.0], 3.0, dt);
+            assert_eq!(mode, GaitMode::Walking, "handed over while still moving");
+        }
+
+        // now the body has stopped
+        let (_, mode) = sup.step(&[0.0, 0.0, 0.0], 0.05, dt);
+        assert_eq!(mode, GaitMode::Standing);
+    }
+
+    /// The slew limit is what lets the policy brake at all; without it the
+    /// command steps and the hold inherits the momentum.
+    #[test]
+    fn the_command_is_rate_limited() {
+        let dt = 1.0 / 50.0;
+        let mut sup = GaitSupervisor::new(1.5, 0.25);
+        let (cmd, _) = sup.step(&[3.0, 0.0, 0.0], 0.0, dt);
+        assert!((cmd[0] - 1.5 * dt).abs() < 1e-9, "stepped straight to {}", cmd[0]);
     }
 }
