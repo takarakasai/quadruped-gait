@@ -645,7 +645,27 @@ impl MpcGaitController {
         let stance_duration = self.cfg.cycle_period_s * self.cfg.duty_factor;
         let v_body = Vector3::new(self.cmd.vx, self.cmd.vy, 0.0);
         let omega = Vector3::new(0.0, 0.0, self.cmd.wz);
-        let v_hip = v_body + omega.cross(&kin.hip_offset);
+        // Moment arm is the FOOT, not the hip. The thing that has to sweep
+        // the ground under a yaw command is the contact point, and on any
+        // robot with a lateral thigh offset the two sit at different radii.
+        //
+        // With the hip as the arm, the stance feet are handed displacements
+        // consistent with a rotation about the hip ring, and the body rotates
+        // at whatever rate best fits those displacements at the foot ring
+        // instead -- a fixed geometric ratio
+        //
+        //     w_realised / w_cmd = (r_foot . r_hip) / |r_foot|^2
+        //
+        // independent of speed, duty and gait. On namiashi, hip_offset =
+        // (0.1470, 0.0344) and the thigh adds 0.07473 in y, giving 0.7567.
+        // Measured turn rate on all three gaits was 76-77% of command, flat
+        // from 0.10 to 0.90 rad/s. Using the foot arm makes the ratio 1.
+        let r_yaw = Vector3::new(
+            kin.nominal_foot_body.x,
+            kin.nominal_foot_body.y,
+            0.0,
+        );
+        let v_hip = v_body + omega.cross(&r_yaw);
 
         // ── Raibert (open-loop) ────────────────────────────────────
         let mut half = v_hip * (0.5 * stance_duration);
