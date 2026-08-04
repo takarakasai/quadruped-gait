@@ -1265,6 +1265,9 @@ impl FullCentroidalMpc {
             match DefaultSolver::new(&p_csc, &q_slice, &a_csc, &b_vec, &cones, settings) {
                 Ok(s) => s,
                 Err(_) => {
+                    if std::env::var_os("QG_MPC_SOLVE_LOG").is_some() {
+                        eprintln!("[fcm-qp] n={n} setup=Err solved=false");
+                    }
                     return failed_solution(&state_now, &ref_traj.inputs, n);
                 }
             };
@@ -1273,6 +1276,16 @@ impl FullCentroidalMpc {
             solver.solution.status,
             SolverStatus::Solved | SolverStatus::AlmostSolved
         );
+        // Diagnostic: how often the QP actually solves. `failed_solution`
+        // hands the WBC a zeroed `first_input`, so a silent failure looks
+        // like a plan that asks for no ground force rather than like an
+        // error -- worth being able to count from a log.
+        if std::env::var_os("QG_MPC_SOLVE_LOG").is_some() {
+            eprintln!(
+                "[fcm-qp] n={} status={:?} solved={}",
+                n, solver.solution.status, solved
+            );
+        }
         let z_opt: Vec<f64> = solver.solution.x.clone();
         let objective = solver.solution.obj_val;
 
