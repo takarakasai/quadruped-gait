@@ -323,6 +323,25 @@ pub fn solve_warm_with_weights(
     let l1 = HoQp::new_with_higher_warm(task_1, Some(&l0), &warm_inner);
     let l2 = HoQp::new_with_higher_warm(task_2, Some(&l1), &warm_inner);
 
+    // How much room each priority level leaves the next. A level whose null
+    // space has collapsed to zero columns has already fixed every decision
+    // variable, and no weight on a lower-priority task can change the answer --
+    // which is otherwise indistinguishable from a task that is merely
+    // outweighed. `dim_z` after level 1 is what decides whether the
+    // contact-force task at level 2 has any authority at all.
+    if std::env::var_os("QG_WBC_NULLSPACE_LOG").is_some() {
+        let stance = inputs.contact_flag.iter().filter(|c| **c).count();
+        eprintln!(
+            "[hqp] stance={}/{}  n_decision={}  dim_z0={} dim_z1={} dim_z2={}",
+            stance,
+            inputs.contact_flag.len(),
+            l0.null_space().nrows(),
+            l0.null_space().ncols(),
+            l1.null_space().ncols(),
+            l2.null_space().ncols(),
+        );
+    }
+
     WbcSolution::from_x(l2.solution(), dims)
 }
 
