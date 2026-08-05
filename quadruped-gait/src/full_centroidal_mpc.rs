@@ -1286,6 +1286,16 @@ impl FullCentroidalMpc {
                 n, solver.solution.status, solved
             );
         }
+        if !solved {
+            // The status route, not just the setup route. `DefaultSolver::new`
+            // returning `Err` was already funnelled into `failed_solution`, but
+            // a solver that *constructs* and then reports `NumericalError` was
+            // not: its `solution.x` was decoded and handed out as a plan. On
+            // namiashi that is the route actually taken -- 2208 of 2220 solves
+            // at a 0.900 s horizon -- and clarabel leaves x near zero there, so
+            // the WBC received "unload every foot" dressed as a solution.
+            return failed_solution(&state_now, &ref_traj.inputs, n);
+        }
         let z_opt: Vec<f64> = solver.solution.x.clone();
         let objective = solver.solution.obj_val;
 
@@ -1338,13 +1348,32 @@ fn state_to_vec_aug(s: &FullCentroidalState) -> DVector<f64> {
     v
 }
 
+/// The solution handed back when the QP does not produce one.
+///
+/// `first_input` is the reference's own first step -- the gravity-balanced GRF
+/// split across the scheduled stance legs -- not zeros.
+///
+/// It used to be `FullCentroidalInput::default()`, i.e. no ground force at all,
+/// and that made a failing QP invisible. `first_input.grfs_world` is what
+/// reaches the WBC (via `to_compat_mpc_solution_full`'s `grfs_first_step`), and
+/// consumers are not all obliged to check `solved` first, so a numerical
+/// failure arrived downstream as a *valid-looking plan that asks the robot to
+/// unload its feet*. On namiashi at a 0.900 s horizon the QP failed on 2208 of
+/// 2220 solves and the WBC was tracking a +0.03 N vertical reference against a
+/// 32.4 N weight, with nothing in the logs to say so.
+///
+/// `solved` stays false, so consumers that do check are unaffected. The change
+/// only makes the value safe for the ones that do not.
 fn failed_solution(
     state_now: &FullCentroidalState,
     ref_inputs: &[FullCentroidalInput],
     n: usize,
 ) -> FullCentroidalMpcSolution {
     FullCentroidalMpcSolution {
-        first_input: FullCentroidalInput::default(),
+        first_input: ref_inputs
+            .first()
+            .copied()
+            .unwrap_or_else(FullCentroidalInput::default),
         inputs_all_steps: ref_inputs.to_vec(),
         predicted_states: vec![*state_now; n],
         objective: f64::NAN,
