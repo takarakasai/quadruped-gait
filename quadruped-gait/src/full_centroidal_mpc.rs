@@ -353,6 +353,26 @@ pub struct FullCentroidalMpcConfig {
     /// `sqp_iterations = 3` default and existing baselines are bit-
     /// stable. Tests / benchmarks opt-in explicitly.
     pub warm_start: bool,
+    /// Solve the QP in sparse (multiple-shooting) form instead of the dense
+    /// condensed form.
+    ///
+    /// The condensed form eliminates the states, which means building
+    /// `A_x[k] = A_k...A_0` and `B_u[k][j] = A_k...A_{j+1} B_j` explicitly and
+    /// paying `||A||^(2n)` in the conditioning of `B_u' Q B_u`. On namiashi at
+    /// dt 0.030 the angular block carries entries near `1/0.027`, so `I + dt A`
+    /// has eigenvalues above 1 and thirty powers of it are enough to destroy
+    /// the problem: clarabel returned `NumericalError` on 2208 of 2220 solves
+    /// at a 0.900 s horizon, and never once succeeded.
+    ///
+    /// The sparse form keeps the states as decision variables and writes the
+    /// dynamics as equality constraints, so no matrix power is ever formed.
+    /// This is what OCS2 (and so legged_control) does, and it is why a 1.0 s
+    /// horizon is routine there.
+    ///
+    /// Default `false`: the condensed path stays bit-stable for every existing
+    /// baseline, and this is opt-in so the two can be measured against each
+    /// other at horizons where both work.
+    pub sparse_qp: bool,
     /// **A1 — MPC-optimised footstep XY (cost-side soft tracking).**
     ///
     /// Quadratic cost weight on the world-frame XY residual between
@@ -516,6 +536,7 @@ impl FullCentroidalMpcConfig {
             friction_cone_soft: false,
             friction_cone_slack_penalty: 1000.0,
             warm_start: false,
+            sparse_qp: false,
             q_foot_xy_world: 0.0,
             foot_xy_cost_body_frame: false,
             joint_vel_nominal_jacobian: None,
@@ -1066,6 +1087,516 @@ impl FullCentroidalMpc {
         final_sol
     }
 
+    /// Sparse (multiple-shooting) form of [`Self::solve_one_iter`].
+    ///
+    /// Decision vector is `z = [U | X | slacks]`:
+    ///
+    /// ```text
+    ///   U       nu*n        the same inputs, at the same column offsets
+    ///   X       nx*n        per-step states, x_1 .. x_n
+    ///   slacks  n_slacks    friction-cone slacks, moved to the tail
+    /// ```
+    ///
+    /// The dynamics become `nx*n` equality rows rather than being substituted
+    /// away:
+    ///
+    /// ```text
+    ///   k = 0 :  x_1 - B_0 u_0            = A_0 x_0
+    ///   k > 0 :  x_k+1 - A_k x_k - B_k u_k = 0
+    /// ```
+    ///
+    /// Nothing here forms a product of `A_d` matrices, which is the whole
+    /// point. It also makes the constraints simpler to write: stance no-slip
+    /// reads `v_com_k` and `omega_k` straight out of `X[k]` instead of walking
+    /// every column of a lifted `B_u`.
+    ///
+    /// The cost is the same one, just not condensed: `Q` on `X`, `R` on `U`,
+    /// both block-diagonal.
+    fn solve_one_iter_sparse(
+        &self,
+        state_now: FullCentroidalState,
+        ref_traj: &FullCentroidalReference,
+        contact: &FullCentroidalContactSchedule,
+        n: usize,
+    ) -> FullCentroidalMpcSolution {
+        let nx = N_STATE_AUG;
+        let nu = N_INPUT;
+        let n_slacks = n_friction_slack_vars(&self.cfg, contact, n);
+        let off_u = 0usize;
+        let off_x = nu * n;
+        let off_s = off_x + nx * n;
+        let total_vars = off_s + n_slacks;
+
+        // Same joint-acceleration reference as the condensed path: a
+        // finite difference of the reference joint_v trajectory, needed only
+        // by the true-centroidal coupling terms.
+        let joint_accel_ref: Vec<[f64; N_LEG_JOINTS]> = (0..n)
+            .map(|k| {
+                let mut accel = [0.0_f64; N_LEG_JOINTS];
+                if n < 2 {
+                    return accel;
+                }
+                let (v_next, v_prev, dt) = if k + 1 < n {
+                    (
+                        &ref_traj.inputs[k + 1].joint_v,
+                        &ref_traj.inputs[k].joint_v,
+                        self.cfg.dt_per_step,
+                    )
+                } else {
+                    (
+                        &ref_traj.inputs[k].joint_v,
+                        &ref_traj.inputs[k - 1].joint_v,
+                        self.cfg.dt_per_step,
+                    )
+                };
+                for i in 0..N_LEG_JOINTS {
+                    accel[i] = (v_next[i] - v_prev[i]) / dt.max(1e-9);
+                }
+                accel
+            })
+            .collect();
+
+        let mut a_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
+        let mut b_d_per_step: Vec<DMatrix<f64>> = Vec::with_capacity(n);
+        for k in 0..n {
+            let stance = [
+                contact.is_stance[0][k],
+                contact.is_stance[1][k],
+                contact.is_stance[2][k],
+                contact.is_stance[3][k],
+            ];
+            let psi_ref = ref_traj.states[k].base_euler_zyx.z;
+            let (a_c, b_c) = continuous_dynamics_full(
+                &ref_traj.states[k],
+                &ref_traj.inputs[k],
+                &self.cfg,
+                &stance,
+                psi_ref,
+                &joint_accel_ref[k],
+            );
+            let mut a_d = DMatrix::<f64>::identity(nx, nx);
+            a_d += &a_c * self.cfg.dt_per_step;
+            let b_d = b_c * self.cfg.dt_per_step;
+            a_d_per_step.push(a_d);
+            b_d_per_step.push(b_d);
+        }
+
+        // ── Cost ──────────────────────────────────────────────────────
+        let mut p_dense = DMatrix::<f64>::zeros(total_vars, total_vars);
+        let mut q_vec = DVector::<f64>::zeros(total_vars);
+
+        // R on U. The joint_v block picks up the task-space Jacobian mapping
+        // when configured, exactly as in the condensed path.
+        for k in 0..n {
+            let u_ref_k = ref_traj.inputs[k].to_vec();
+            let base = off_u + k * nu;
+            for i in 0..12.min(nu) {
+                let r = self.cfg.r_diag[i];
+                p_dense[(base + i, base + i)] += 2.0 * r;
+                q_vec[base + i] += -2.0 * r * u_ref_k[i];
+            }
+            if let Some(jacobians) = &self.cfg.joint_vel_nominal_jacobian {
+                let r_task = Matrix3::from_diagonal(&Vector3::new(
+                    self.cfg.r_taskspace_joint_vel[0],
+                    self.cfg.r_taskspace_joint_vel[1],
+                    self.cfg.r_taskspace_joint_vel[2],
+                ));
+                for leg in 0..N_FEET {
+                    let j = jacobians[leg];
+                    let r_leg = j.transpose() * r_task * j;
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            let ra = base + 12 + 3 * leg + a;
+                            let rb = base + 12 + 3 * leg + b;
+                            p_dense[(ra, rb)] += 2.0 * r_leg[(a, b)];
+                            q_vec[ra] += -2.0 * r_leg[(a, b)] * u_ref_k[12 + 3 * leg + b];
+                        }
+                    }
+                }
+            } else {
+                for i in 12..nu {
+                    let r = self.cfg.r_diag[i];
+                    p_dense[(base + i, base + i)] += 2.0 * r;
+                    q_vec[base + i] += -2.0 * r * u_ref_k[i];
+                }
+            }
+        }
+
+        // Q on X. The augmented gravity entry carries no weight, same as the
+        // condensed `q_block`, which only fills `0..N_STATE`.
+        for k in 0..n {
+            let x_ref_k = state_to_vec_aug(&ref_traj.states[k]);
+            let base = off_x + k * nx;
+            for i in 0..N_STATE {
+                let qw = self.cfg.q_diag[i];
+                p_dense[(base + i, base + i)] += 2.0 * qw;
+                q_vec[base + i] += -2.0 * qw * x_ref_k[i];
+            }
+        }
+
+        // Slack penalty.
+        for i in 0..n_slacks {
+            p_dense[(off_s + i, off_s + i)] += 2.0 * self.cfg.friction_cone_slack_penalty;
+        }
+
+        self.add_foot_xy_soft_cost_sparse(
+            contact, ref_traj, n, off_x, &mut p_dense, &mut q_vec,
+        );
+
+        // ── Constraint row count ──────────────────────────────────────
+        let x_now = state_to_vec_aug(&state_now);
+        let mu = self.cfg.friction_mu;
+        let soft_cone = self.cfg.friction_cone_soft;
+        let f_max_global = self.cfg.max_normal_force;
+        let legs = [LegId::FL, LegId::FR, LegId::RL, LegId::RR];
+        let effective_f_max = |leg: usize, k: usize| -> f64 {
+            let local = contact.stance_f_max[leg][k];
+            let local_active = local.is_finite() && local >= 0.0;
+            let global_active = f_max_global > 0.0;
+            match (global_active, local_active) {
+                (true, true) => f_max_global.min(local),
+                (true, false) => f_max_global,
+                (false, true) => local,
+                (false, false) => f64::INFINITY,
+            }
+        };
+
+        let mut n_eq = nx * n; // dynamics
+        let mut n_ineq = 0usize;
+        for k in 0..n {
+            for leg in 0..N_FEET {
+                if contact.is_stance[leg][k] {
+                    n_eq += 3; // stance no-slip
+                    let mut count = 4 + 1; // friction +-x, +-y, and f_z >= 0
+                    if effective_f_max(leg, k).is_finite() {
+                        count += 1;
+                    }
+                    n_ineq += count;
+                } else {
+                    n_eq += 3; // swing GRF = 0
+                    if self.cfg.enable_swing_normal_velocity_constraint {
+                        n_eq += 1;
+                    }
+                }
+            }
+        }
+        n_ineq += n_slacks;
+
+        let n_rows = n_eq + n_ineq;
+        let mut a_dense = DMatrix::<f64>::zeros(n_rows, total_vars);
+        let mut b_vec = vec![0.0; n_rows];
+        let mut row = 0usize;
+
+        // ── Equality 0: dynamics ──────────────────────────────────────
+        for k in 0..n {
+            for i in 0..nx {
+                let r = row + i;
+                a_dense[(r, off_x + k * nx + i)] = 1.0;
+                for c in 0..nu {
+                    let v = -b_d_per_step[k][(i, c)];
+                    if v.abs() > 1e-14 {
+                        a_dense[(r, off_u + k * nu + c)] = v;
+                    }
+                }
+                if k == 0 {
+                    let mut rhs = 0.0;
+                    for c in 0..nx {
+                        rhs += a_d_per_step[0][(i, c)] * x_now[c];
+                    }
+                    b_vec[r] = rhs;
+                } else {
+                    for c in 0..nx {
+                        let v = -a_d_per_step[k][(i, c)];
+                        if v.abs() > 1e-14 {
+                            a_dense[(r, off_x + (k - 1) * nx + c)] = v;
+                        }
+                    }
+                }
+            }
+            row += nx;
+        }
+
+        // ── Equality 1: swing GRF = 0 ─────────────────────────────────
+        for k in 0..n {
+            for leg in 0..N_FEET {
+                if !contact.is_stance[leg][k] {
+                    let col = off_u + k * nu + leg * 3;
+                    for ax in 0..3 {
+                        a_dense[(row + ax, col + ax)] = 1.0;
+                    }
+                    row += 3;
+                }
+            }
+        }
+
+        // ── Equality 2: stance no-slip ────────────────────────────────
+        // v_com_k + omega_k x r_ref + R_z J joint_v_leg = 0, read straight
+        // off X[k] rather than through a lifted map.
+        for k in 0..n {
+            for leg in 0..N_FEET {
+                if !contact.is_stance[leg][k] {
+                    continue;
+                }
+                let (r_z_j, m_skew) = self.no_slip_blocks(ref_traj, leg, k, &legs);
+                let x_base = off_x + k * nx;
+                let jv_base = off_u + k * nu + 12 + 3 * leg;
+                for ax in 0..3 {
+                    a_dense[(row + ax, x_base + ax)] += 1.0;
+                    for sr in 0..3 {
+                        let v = -m_skew[(ax, sr)];
+                        if v.abs() > 1e-14 {
+                            a_dense[(row + ax, x_base + 3 + sr)] += v;
+                        }
+                    }
+                    for local in 0..3 {
+                        let v = r_z_j[(ax, local)];
+                        if v.abs() > 1e-14 {
+                            a_dense[(row + ax, jv_base + local)] += v;
+                        }
+                    }
+                }
+                row += 3;
+            }
+        }
+
+        // ── Equality 3 (opt-in): swing-leg vertical foot velocity ─────
+        if self.cfg.enable_swing_normal_velocity_constraint {
+            for k in 0..n {
+                for leg in 0..N_FEET {
+                    if contact.is_stance[leg][k] {
+                        continue;
+                    }
+                    let (r_z_j, m_skew) = self.no_slip_blocks(ref_traj, leg, k, &legs);
+                    let x_base = off_x + k * nx;
+                    let jv_base = off_u + k * nu + 12 + 3 * leg;
+                    let ax = 2; // z-row only
+                    a_dense[(row, x_base + ax)] += 1.0;
+                    for sr in 0..3 {
+                        let v = -m_skew[(ax, sr)];
+                        if v.abs() > 1e-14 {
+                            a_dense[(row, x_base + 3 + sr)] += v;
+                        }
+                    }
+                    for local in 0..3 {
+                        let v = r_z_j[(ax, local)];
+                        if v.abs() > 1e-14 {
+                            a_dense[(row, jv_base + local)] += v;
+                        }
+                    }
+                    b_vec[row] = contact.swing_z_velocity[leg][k];
+                    row += 1;
+                }
+            }
+        }
+
+        // ── Inequality: friction + f_z bounds ─────────────────────────
+        let mut slack_cursor = off_s;
+        for k in 0..n {
+            for leg in 0..N_FEET {
+                if !contact.is_stance[leg][k] {
+                    continue;
+                }
+                let col_x = off_u + k * nu + leg * 3;
+                let col_y = col_x + 1;
+                let col_z = col_x + 2;
+                a_dense[(row, col_z)] = -1.0;
+                row += 1;
+                let f_max_this = effective_f_max(leg, k);
+                if f_max_this.is_finite() {
+                    a_dense[(row, col_z)] = 1.0;
+                    b_vec[row] = f_max_this;
+                    row += 1;
+                }
+                let (sx_col, sy_col) = if soft_cone {
+                    let s_x = slack_cursor;
+                    let s_y = slack_cursor + 1;
+                    slack_cursor += 2;
+                    (Some(s_x), Some(s_y))
+                } else {
+                    (None, None)
+                };
+                for (col, slack) in [(col_x, sx_col), (col_y, sy_col)] {
+                    for sign in [1.0_f64, -1.0] {
+                        a_dense[(row, col)] = sign;
+                        a_dense[(row, col_z)] = -mu;
+                        if let Some(sc) = slack {
+                            a_dense[(row, sc)] = -1.0;
+                        }
+                        row += 1;
+                    }
+                }
+            }
+        }
+
+        // ── Inequality: s_i >= 0 ──────────────────────────────────────
+        for i in 0..n_slacks {
+            a_dense[(row, off_s + i)] = -1.0;
+            row += 1;
+        }
+        debug_assert_eq!(row, n_rows);
+
+        // ── clarabel solve ────────────────────────────────────────────
+        let p_csc = dense_to_csc_upper_24(&p_dense);
+        let a_csc = dense_to_csc_24(&a_dense);
+        let q_slice: Vec<f64> = q_vec.iter().copied().collect();
+        let cones = vec![
+            SupportedConeT::ZeroConeT(n_eq),
+            SupportedConeT::NonnegativeConeT(n_ineq),
+        ];
+        let mut settings = DefaultSettings::default();
+        settings.verbose = false;
+        settings.max_iter = 50;
+        let mut solver =
+            match DefaultSolver::new(&p_csc, &q_slice, &a_csc, &b_vec, &cones, settings) {
+                Ok(s) => s,
+                Err(_) => {
+                    if std::env::var_os("QG_MPC_SOLVE_LOG").is_some() {
+                        eprintln!("[fcm-qp] sparse n={n} setup=Err solved=false");
+                    }
+                    return failed_solution(&state_now, &ref_traj.inputs, n);
+                }
+            };
+        solver.solve();
+        let solved = matches!(
+            solver.solution.status,
+            SolverStatus::Solved | SolverStatus::AlmostSolved
+        );
+        if std::env::var_os("QG_MPC_SOLVE_LOG").is_some() {
+            eprintln!(
+                "[fcm-qp] sparse n={} status={:?} solved={}",
+                n, solver.solution.status, solved
+            );
+        }
+        if !solved {
+            return failed_solution(&state_now, &ref_traj.inputs, n);
+        }
+
+        let z_opt: Vec<f64> = solver.solution.x.clone();
+        let objective = solver.solution.obj_val;
+
+        let mut inputs_all_steps = Vec::with_capacity(n);
+        for k in 0..n {
+            let base = off_u + k * nu;
+            let mut slice = [0.0; N_INPUT];
+            slice.copy_from_slice(&z_opt[base..base + nu]);
+            inputs_all_steps.push(FullCentroidalInput::from_vec(&slice));
+        }
+        // States come straight out of the solution rather than being
+        // re-simulated through the lifted map.
+        let mut predicted_states = Vec::with_capacity(n);
+        for k in 0..n {
+            let base = off_x + k * nx;
+            predicted_states.push(state_from_vec_aug(&z_opt[base..base + nx]));
+        }
+        let first_input = inputs_all_steps[0];
+
+        FullCentroidalMpcSolution {
+            first_input,
+            inputs_all_steps,
+            predicted_states,
+            objective,
+            solved,
+        }
+    }
+
+    /// `(R_z J_foot_body, skew(r_ref))` at the linearisation point for one
+    /// `(leg, step)`. Shared by stance no-slip and the swing normal-velocity
+    /// constraint, which use the same geometry and differ only in which rows
+    /// they emit and what the right-hand side is.
+    fn no_slip_blocks(
+        &self,
+        ref_traj: &FullCentroidalReference,
+        leg: usize,
+        k: usize,
+        legs: &[LegId; 4],
+    ) -> (Matrix3<f64>, Matrix3<f64>) {
+        let psi = ref_traj.states[k].base_euler_zyx.z;
+        let (s, c) = psi.sin_cos();
+        let r_z = Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
+        let kin = self.cfg.kinematics.leg(legs[leg]);
+        let [qhip, qthigh, qcalf] = ref_traj.states[k].leg_joint_q(leg);
+        let foot_body_ref = forward_leg_kinematics(kin, qhip, qthigh, qcalf);
+        let r_ref = r_z * (foot_body_ref - self.cfg.com_offset_body);
+        let j_foot_body = foot_jacobian_body(kin, qhip, qthigh, qcalf);
+        (r_z * j_foot_body, skew_3(&r_ref))
+    }
+
+    /// Sparse counterpart of [`add_foot_xy_soft_cost`]. The residual is a
+    /// direct linear function of `X[k]`, so this is a rank-1 update on the
+    /// state block instead of on a lifted input block.
+    fn add_foot_xy_soft_cost_sparse(
+        &self,
+        contact: &FullCentroidalContactSchedule,
+        ref_traj: &FullCentroidalReference,
+        n: usize,
+        off_x: usize,
+        p_dense: &mut DMatrix<f64>,
+        q_vec: &mut DVector<f64>,
+    ) {
+        let q_foot = self.cfg.q_foot_xy_world;
+        if q_foot <= 0.0 {
+            return;
+        }
+        let nx = N_STATE_AUG;
+        let legs_arr = [LegId::FL, LegId::FR, LegId::RL, LegId::RR];
+        for k in 0..n {
+            for leg in 0..N_FEET {
+                let Some(target_body_offset) = contact.foot_xy_target_body_offset[leg][k] else {
+                    continue;
+                };
+                let psi_ref = ref_traj.states[k].base_euler_zyx.z;
+                let (s, c) = psi_ref.sin_cos();
+                let r_z = Matrix3::new(c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0);
+                let kin = self.cfg.kinematics.leg(legs_arr[leg]);
+                let [qhip, qthigh, qcalf] = ref_traj.states[k].leg_joint_q(leg);
+                let foot_body_ref = forward_leg_kinematics(kin, qhip, qthigh, qcalf);
+                let j_foot_body = foot_jacobian_body(kin, qhip, qthigh, qcalf);
+                let r_z_j = r_z * j_foot_body;
+                let q_ref_leg = Vector3::new(qhip, qthigh, qcalf);
+                let foot_world_ref = r_z * foot_body_ref;
+                let j_times_qref = r_z_j * q_ref_leg;
+                let base_ref = if self.cfg.foot_xy_cost_body_frame {
+                    Vector3::zeros()
+                } else {
+                    ref_traj.states[k].base_pos_world
+                };
+                let target_xy = [
+                    base_ref.x + c * target_body_offset[0] - s * target_body_offset[1],
+                    base_ref.y + s * target_body_offset[0] + c * target_body_offset[1],
+                ];
+
+                for ax in 0..2 {
+                    let mut e_xy = [0.0_f64; N_STATE_AUG];
+                    if !self.cfg.foot_xy_cost_body_frame {
+                        e_xy[6 + ax] = 1.0;
+                    }
+                    for j in 0..3 {
+                        e_xy[12 + 3 * leg + j] = r_z_j[(ax, j)];
+                    }
+                    // residual = e_xy . X[k] + k_xy - target[ax]
+                    let k_xy = foot_world_ref[ax] - j_times_qref[ax];
+                    let r0 = k_xy - target_xy[ax];
+                    let two_q_foot = 2.0 * q_foot;
+                    let base = off_x + k * nx;
+                    for i in 0..nx {
+                        let ei = e_xy[i];
+                        if ei.abs() < 1e-14 {
+                            continue;
+                        }
+                        q_vec[base + i] += two_q_foot * r0 * ei;
+                        for j in 0..nx {
+                            let ej = e_xy[j];
+                            if ej.abs() < 1e-14 {
+                                continue;
+                            }
+                            p_dense[(base + i, base + j)] += two_q_foot * ei * ej;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn solve_one_iter(
         &self,
         state_now: FullCentroidalState,
@@ -1073,6 +1604,9 @@ impl FullCentroidalMpc {
         contact: &FullCentroidalContactSchedule,
         n: usize,
     ) -> FullCentroidalMpcSolution {
+        if self.cfg.sparse_qp {
+            return self.solve_one_iter_sparse(state_now, ref_traj, contact, n);
+        }
         let nx = N_STATE_AUG; // 25
         let nu = N_INPUT; // 24
         // A3: extra decision vars for friction-cone slacks (s_x, s_y per
@@ -1338,6 +1872,19 @@ impl FullCentroidalMpc {
 /// `A` can inject an arbitrary per-linearization-point constant via
 /// `A[row, N_STATE] = <value>`), used for gravity (`A[2, 24] = -9.81`)
 /// and the true-centroidal-coupling bias term.
+/// Inverse of [`state_to_vec_aug`], dropping the trailing constant entry.
+///
+/// Only the sparse path needs this: the condensed solver recovers its
+/// predicted states by pushing the optimised inputs back through the lifted
+/// map, whereas here the states are decision variables and come out of the
+/// solution directly.
+fn state_from_vec_aug(v: &[f64]) -> FullCentroidalState {
+    debug_assert!(v.len() >= N_STATE);
+    let mut body = [0.0_f64; N_STATE];
+    body.copy_from_slice(&v[..N_STATE]);
+    FullCentroidalState::from_vec(&body)
+}
+
 fn state_to_vec_aug(s: &FullCentroidalState) -> DVector<f64> {
     let mut v = DVector::<f64>::zeros(N_STATE_AUG);
     let body = s.to_vec();
@@ -1960,6 +2507,7 @@ mod tests {
             friction_cone_soft: false,
             friction_cone_slack_penalty: 1000.0,
             warm_start: false,
+            sparse_qp: false,
             q_foot_xy_world: 0.0,
             foot_xy_cost_body_frame: false,
             joint_vel_nominal_jacobian: None,
@@ -2524,6 +3072,76 @@ mod tests {
                     assert_eq!(b[(i, 3 * swing_leg + j)], 0.0);
                 }
             }
+        }
+    }
+
+    /// The sparse and condensed forms must describe the same problem.
+    ///
+    /// They are only algebraically identical where the condensed form is
+    /// numerically sound, so this compares them at a short horizon, where the
+    /// dense `A_d^k` products have not yet blown up. If the two disagree here,
+    /// the sparse translation is wrong rather than merely better-conditioned.
+    #[test]
+    fn sparse_and_condensed_agree_at_short_horizon() {
+        let mk = |sparse: bool| {
+            let mut cfg = test_config();
+            cfg.horizon_steps = 6;
+            cfg.sqp_iterations = 1;
+            cfg.sparse_qp = sparse;
+            // Exercise the state-coupled constraint and the foot-XY cost too,
+            // not just the input-only rows -- those are the parts where the
+            // lifted map was doing the work.
+            cfg.enable_swing_normal_velocity_constraint = true;
+            cfg.q_foot_xy_world = 5.0;
+            let n = cfg.horizon_steps;
+            let state_ref = FullCentroidalState {
+                base_pos_world: Vector3::new(0.0, 0.0, 0.30),
+                v_com_world: Vector3::new(0.4, 0.0, 0.0),
+                ..Default::default()
+            };
+            let f_per_foot = cfg.mass_kg * 9.81 / 2.0;
+            let input_ref = FullCentroidalInput {
+                grfs_world: [Vector3::new(0.0, 0.0, f_per_foot); 4],
+                joint_v: [0.0; N_LEG_JOINTS],
+            };
+            let reference = FullCentroidalReference {
+                states: vec![state_ref; n],
+                inputs: vec![input_ref; n],
+            };
+            // A trot-like schedule: diagonal pairs, so both the stance and the
+            // swing constraint paths are populated at every step.
+            let mut contact = FullCentroidalContactSchedule::all_stance(n);
+            for k in 0..n {
+                let front_down = k % 2 == 0;
+                for leg in 0..N_FEET {
+                    let diag_a = leg == 0 || leg == 3;
+                    contact.is_stance[leg][k] = if diag_a { front_down } else { !front_down };
+                    contact.swing_z_velocity[leg][k] = 0.05;
+                    contact.foot_xy_target_body_offset[leg][k] = Some([0.02, 0.0]);
+                }
+            }
+            let mut mpc = FullCentroidalMpc::new(cfg);
+            mpc.solve(state_ref, &reference, &contact)
+        };
+        let dense = mk(false);
+        let sparse = mk(true);
+        assert!(dense.solved, "condensed QP must solve at a 6-step horizon");
+        assert!(sparse.solved, "sparse QP must solve at a 6-step horizon");
+        for leg in 0..N_FEET {
+            let d = dense.first_input.grfs_world[leg];
+            let s = sparse.first_input.grfs_world[leg];
+            assert!(
+                (d - s).norm() < 1e-4,
+                "leg {leg} first-step GRF differs: condensed {d:?} vs sparse {s:?}",
+            );
+        }
+        for i in 0..N_LEG_JOINTS {
+            let d = dense.first_input.joint_v[i];
+            let s = sparse.first_input.joint_v[i];
+            assert!(
+                (d - s).abs() < 1e-4,
+                "joint_v[{i}] differs: condensed {d} vs sparse {s}",
+            );
         }
     }
 
