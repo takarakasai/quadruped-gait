@@ -19,6 +19,9 @@
 //! the 12 angles onto its own model via its detected per-leg joint names.
 //!
 //! # Publishing
+//! `doc/viz_publisher.md` in this repo writes this out for someone implementing
+//! a publisher from scratch; the contract itself is:
+//!
 //! A publisher that only generates a gait sends one stream, on
 //! [`VIZ_KEY_PLANNED`]. One that also reads state back sends a second stream on
 //! [`VIZ_KEY_MEASURED`], and the pairing is what makes the two useful:
