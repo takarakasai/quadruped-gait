@@ -37,3 +37,6 @@ viz-sub = ["viz", "dep:zenoh", "dep:serde_json"]
 
 [dev-dependencies]
 approx = "0.5"
+# The viz wire-format tests encode/decode frames; the runtime dependency above
+# is optional (only `viz-sub` needs it), so tests carry their own copy.
+serde_json = "1"
