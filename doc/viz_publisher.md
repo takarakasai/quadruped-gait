@@ -30,6 +30,9 @@ quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git", fe
   それでモデルを駆動し、ゴーストを描かない
 - 逆に measured のみでも成立する
 
+キーの構造は **`<robot>/gait/<stream>`**。先頭チャンクがロボットの識別子で、機体は
+これで切り分ける（既定値の `go2` は既にこの規約に従っている）。詳細は §5.4。
+
 ## 2. フレーム内容
 
 `GaitVizFrame`（JSON、`Encoding::APPLICATION_JSON` で put）:
@@ -81,13 +84,105 @@ quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git", fe
   `mod viz_pub`（`VizPublisher::new` がスレッドを立て、`publish()` はフレーム構築と
   `try_send` のみ）
 
-## 5. Zenoh 設定
+## 5. Zenoh トランスポート仕様
 
-- 通常は multicast の自動探索でよい
-- **同一ホスト / WSL2 / multicast 不可の環境**では、配信側が
-  `listen/endpoints = ["tcp/0.0.0.0:7447"]` で待ち受け、`scouting/multicast/enabled = false`。
-  受信側（articara）が `connect` する。配信元が複数ある場合は**別ポートで待ち受ける**こと
-  （articara 側はストリームごとに接続先を指定できる）
+実装（`go2-gait-runner` の `viz_pub`、`quadruped-gait` の `viz_sub`）は zenoh 1.9 を
+**ほぼ既定設定のまま**使っている。以下の既定値は zenoh 1.9 のソースで確認したもので、
+明示的に設定しているのは §5.2 の endpoint 関連だけ。
+
+### 5.1 セッション
+
+| 項目 | 値 | 出所 |
+|---|---|---|
+| モード | `peer` | `zenoh_config::defaults::mode` |
+| scouting multicast | 有効、`224.0.0.224:7446`、timeout 3000 ms | `defaults::scouting::multicast` |
+| peer の listen 既定 | `tcp/[::]:0`（**エフェメラルポート**） | `ListenConfig::default()` |
+| connect の再試行 | peer は `timeout_ms = -1`（無限）、`exit_on_failure = false` | `defaults::connect` |
+| 再試行間隔 | 1000 ms から開始、×2 で増加、上限 4000 ms | `ConnectionRetryModeDependentConf::default()` |
+
+再試行が無限なので **受信側を先に起動してもよい**。配信側が上がれば最大4秒ほどで繋がる。
+
+### 5.2 明示している設定（唯一の非既定）
+
+multicast が使えない環境（同一ホスト / WSL2 / multicast 不可の LAN）向け:
+
+- 配信側: `listen/endpoints = ["tcp/0.0.0.0:7447"]`、`scouting/multicast/enabled = false`
+- 受信側: `connect/endpoints = ["tcp/<host>:7447"]`、`scouting/multicast/enabled = false`
+
+peer の listen 既定がエフェメラルポートなので、**接続先を固定したいなら明示が必須**。
+配信元が複数ある場合は別ポートを割り当てる（7447, 7448, …）。受信側 articara は
+ストリームごとに接続先を指定できる。multicast が通る LAN なら両側とも無指定でよい。
+
+### 5.3 QoS
+
+`session.put()` に QoS を指定していないので、すべて zenoh の既定値。
+
+| 項目 | 既定値 | 意味 |
+|---|---|---|
+| CongestionControl | `Drop` | **送信キューが詰まったらブロックせず捨てる**。可視化の要求と一致 |
+| Priority | `Data` | 8段階の中位 |
+| Reliability | `Reliable` | トランスポート層の再送あり。ただし輻輳時は上の `Drop` が優先で捨てられる |
+| express | `false` | バッチング有効。スループット優先で、遅延はバッチ分だけ増える |
+
+`Drop` なので **受信側が固まっても配信側が無限にブロックすることはない**。
+それでも put を制御ループから出すべき理由は「無限停止の回避」ではなく、直列化・確保・
+ロック・write システムコールが 500 Hz の tick に乗る**ジッタ**として効くため（§4）。
+
+変える必要が出るとしたら:
+
+- 可視化が他のトラフィックを圧迫する → `Priority::Background`
+- 1フレームの遅延を削りたい → `express = true`（バッチングを切る。帯域効率は落ちる）
+
+### 5.4 キー空間
+
+```
+<robot>/gait/<stream>
+   |      |      +--- planned | measured
+   |      +---------- 用途。将来 gait 以外を流すならここで分ける
+   +----------------- ロボット識別子。機体はここで切り分ける
+```
+
+- `<robot>` は**機体1台に1つ**。同型機が複数あるなら型名では足りないので
+  `go2-01`, `go2-02` のように識別子まで含める
+- 使える文字: zenoh のキー式チャンクなので `/ * ? # $` が使えない（`#` と `?` は禁止、
+  `$` は `$*` の形しか許されずそれはワイルドカード）。**`[a-z0-9][a-z0-9-]*` に収めるのが安全**
+- 既定の `go2/gait/planned` は既にこの規約に従っている（`go2` が `<robot>`）ので、
+  規約の導入で既存の設定は壊れない
+- 配信側はロボット名だけ差し替えられるようにする（`go2-gait-runner` は `--viz-robot NAME`。
+  キー全体を `--viz-key` で指定する経路も残っている）
+
+**ワイルドカード購読はしないこと。** `*/gait/measured` のような購読は zenoh 的には可能だが、
+受信側 articara は1つのモデルを1つのフレーム列で駆動するので、複数機体のフレームが同じ
+モデルを奪い合って姿勢が飛ぶ。**1窓につき1機体を明示指定**する。複数機体を同時に見たい
+場合は articara を複数起動する。
+
+### 5.5 ペイロードと帯域
+
+JSON で put（`Encoding::APPLICATION_JSON`）。1フレームの実測値:
+
+| ケース | サイズ |
+|---|---|
+| 全ゼロ（下限） | 168 B |
+| 実走の典型値（f64 が長い展開になる） | 324 B |
+| 最悪ケース（全フィールドが最長展開） | 508 B |
+
+帯域（1機体あたり、TCP / Zenoh のヘッダを除く）:
+
+| レート | planned のみ | planned + measured |
+|---|---|---|
+| 100 Hz（既定） | 32 KiB/s | **63 KiB/s**（最悪 99 KiB/s） |
+| 50 Hz | 16 KiB/s | 32 KiB/s |
+| 30 Hz | 9.5 KiB/s | 19 KiB/s |
+
+LAN では無視できる量。無線経由や機体を多数並べる場合はレートを落とす。JSON をやめて
+bincode 等にすれば3〜4割減るが、可読性を失うので現状は JSON のまま。
+
+### 5.6 時刻
+
+- フレームの `t_s` は**走行開始からの経過秒**。壁時計ではなく、機体間で同期もしていない
+- zenoh の timestamp 機能（`put().timestamp()`）は使っていない
+- 送受信でホストが違っても時刻同期は不要。受信側は `t_s` を表示に使わず、
+  2ストリームの対応には `seq` だけを使う
 
 ## 6. 受信側の挙動（送信側が知っておくべき分）
 
