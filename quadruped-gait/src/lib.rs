@@ -58,6 +58,12 @@
 pub mod exp;
 /// Live gait-visualization wire format (see [`viz::GaitVizFrame`]).
 pub mod viz;
+/// Zenoh session shape shared by the viz publisher and subscriber.
+#[cfg(any(feature = "viz-pub", feature = "viz-sub"))]
+pub mod viz_net;
+/// Zenoh publisher for the viz stream (see [`viz_pub::VizPublisher`]).
+#[cfg(feature = "viz-pub")]
+pub mod viz_pub;
 #[cfg(feature = "viz-sub")]
 pub mod viz_sub;
 /// Hierarchical whole-body-control QP solver.

@@ -34,6 +34,10 @@ viz = ["dep:serde"]
 # transport for viewers. Separate from `viz` so publishers / wire-type-only
 # consumers don't pull zenoh.
 viz-sub = ["viz", "dep:zenoh", "dep:serde_json"]
+# Zenoh publisher for the viz stream (`viz_pub::VizPublisher`): the counterpart
+# to `viz-sub`, so a runner doesn't have to re-implement the transport (and its
+# threading, back-pressure and stream pairing) to feed a viewer.
+viz-pub = ["viz", "dep:zenoh", "dep:serde_json"]
 
 [dev-dependencies]
 approx = "0.5"

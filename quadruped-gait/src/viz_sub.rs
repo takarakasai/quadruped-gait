@@ -5,7 +5,9 @@
 //! viewer's concern.
 //!
 //! Feature-gated behind `viz-sub` so wire-type-only consumers (publishers,
-//! log tooling) don't pull zenoh.
+//! log tooling) don't pull zenoh. The publishing side is [`crate::viz_pub`];
+//! both take the same [`VizEndpoints`] so either end can listen, connect, or
+//! discover.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,51 +16,52 @@ use std::time::Duration;
 use zenoh::Wait;
 
 use crate::viz::GaitVizFrame;
+use crate::viz_net::VizEndpoints;
 
-/// Background Zenoh subscriber holding the latest received frame.
+/// A Zenoh session viz subscribers ride on.
 ///
-/// Dropping the subscriber signals the background thread to exit (it polls
-/// with a 200 ms timeout, so shutdown is prompt but not instant).
-pub struct VizSubscriber {
-    latest: Arc<Mutex<Option<GaitVizFrame>>>,
-    running: Arc<AtomicBool>,
-    _handle: std::thread::JoinHandle<()>,
+/// One session per *network configuration*, not per stream. Two sessions that
+/// both listen on the same endpoint collide outright — the second one fails to
+/// bind — and even where they don't, a second session to the same publisher is
+/// pure overhead. A viewer watching a planned and a measured stream from one
+/// runner should open this once and [`Self::subscribe`] twice.
+///
+/// Cloning is cheap (Zenoh sessions are reference-counted); the session closes
+/// when the last handle, including any live subscriber's, goes away.
+#[derive(Clone)]
+pub struct VizSession {
+    session: zenoh::Session,
 }
 
-impl VizSubscriber {
-    /// `endpoint = Some(ep)` connects to a Zenoh peer listening at `ep` (TCP)
-    /// and disables multicast — use it when multicast discovery isn't
-    /// available (same host / WSL2). `None` = auto multicast discovery.
-    pub fn new(key: &str, endpoint: Option<&str>) -> Result<Self, String> {
+impl VizSession {
+    /// Open a session, joining the network as `endpoints` says.
+    ///
+    /// Failures surface here rather than in a background thread: a viewer that
+    /// reports itself subscribed while its session never opened is worse than
+    /// one that says it couldn't start.
+    pub fn open(endpoints: &VizEndpoints) -> Result<Self, String> {
+        let mut config = zenoh::Config::default();
+        endpoints.apply(&mut config)?;
+        let session = zenoh::open(config)
+            .wait()
+            .map_err(|e| format!("zenoh open ({}): {e}", endpoints.describe()))?;
+        Ok(Self { session })
+    }
+
+    /// Subscribe to `key` and start polling it in the background.
+    pub fn subscribe(&self, key: &str) -> Result<VizSubscriber, String> {
         let latest: Arc<Mutex<Option<GaitVizFrame>>> = Arc::new(Mutex::new(None));
         let running = Arc::new(AtomicBool::new(true));
         let l2 = latest.clone();
         let r2 = running.clone();
-        let key = key.to_string();
-        let mut config = zenoh::Config::default();
-        if let Some(ep) = endpoint {
-            config
-                .insert_json5("connect/endpoints", &format!("[\"{ep}\"]"))
-                .map_err(|e| format!("zenoh connect endpoint '{ep}': {e}"))?;
-            let _ = config.insert_json5("scouting/multicast/enabled", "false");
-        }
+        let sub = self
+            .session
+            .declare_subscriber(key)
+            .wait()
+            .map_err(|e| format!("zenoh subscribe '{key}': {e}"))?;
         let handle = std::thread::Builder::new()
             .name("viz-sub".into())
             .spawn(move || {
-                let session = match zenoh::open(config).wait() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("viz-sub: zenoh open failed: {e}");
-                        return;
-                    }
-                };
-                let sub = match session.declare_subscriber(&key).wait() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("viz-sub: subscribe '{key}' failed: {e}");
-                        return;
-                    }
-                };
                 // recv_timeout (not blocking recv) so the thread can notice
                 // the stop flag and exit when the subscriber is dropped.
                 while r2.load(Ordering::Relaxed) {
@@ -77,11 +80,38 @@ impl VizSubscriber {
                 }
             })
             .map_err(|e| format!("spawn viz-sub thread: {e}"))?;
-        Ok(Self {
+        Ok(VizSubscriber {
             latest,
             running,
+            _session: self.session.clone(),
             _handle: handle,
         })
+    }
+}
+
+/// Background Zenoh subscriber holding the latest received frame.
+///
+/// Dropping the subscriber signals the background thread to exit (it polls
+/// with a 200 ms timeout, so shutdown is prompt but not instant).
+pub struct VizSubscriber {
+    latest: Arc<Mutex<Option<GaitVizFrame>>>,
+    running: Arc<AtomicBool>,
+    /// Keeps the session alive for as long as this subscriber polls it.
+    _session: zenoh::Session,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl VizSubscriber {
+    /// Open a session of its own and subscribe to `key` — the single-stream
+    /// convenience. A viewer taking two streams off one publisher should open a
+    /// [`VizSession`] and subscribe twice instead, so they share it.
+    ///
+    /// A viewer usually connects to the publisher
+    /// ([`VizEndpoints::connect`]), but the reverse works too: listen and let
+    /// the robot dial in, which is what you want when the robot's address is
+    /// the one that moves. [`VizEndpoints::auto`] uses multicast discovery.
+    pub fn new(key: &str, endpoints: &VizEndpoints) -> Result<Self, String> {
+        VizSession::open(endpoints)?.subscribe(key)
     }
 
     /// Take (consume) the latest frame, if a new one has arrived since the

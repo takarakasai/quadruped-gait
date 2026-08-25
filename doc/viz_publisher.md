@@ -11,11 +11,18 @@
 ## 0. 依存
 
 ```toml
+# 送信の仕組みごと使う（推奨）
+quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git", features = ["viz-pub"] }
+# 型だけ使って自前で送る場合
 quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git", features = ["viz"] }
 ```
 
-- 必要 rev: **`1500acc`** 以降（`GaitVizFrame::pose_rp` と `VIZ_KEY_MEASURED` を含む）
-- `viz` feature で `GaitVizFrame` に serde derive が付く。zenoh は自前で持つ（`zenoh = "1.9"`）
+- `viz-pub` feature が [`viz_pub::VizPublisher`] を提供する。**トランスポート・スレッド・
+  背圧・2ストリームの対応付けはこれが持っている**ので、§3 と §4 の要求は自動的に満たされる。
+  配信側が書くのは「フレームをどう組むか」（関節順・符号・実測姿勢の出所）だけ
+- `viz` feature だけなら `GaitVizFrame` の serde derive のみ。zenoh は自前で持つ
+  （`zenoh = "1.9"`）。この場合は §3〜§5 を自力で満たすこと
+- 必要 rev: **`5044caa`** 以降（`viz_pub` / `viz_net` を含む rev は §5.2 参照）
 
 ## 1. 2ストリーム
 
@@ -68,7 +75,9 @@ quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git", fe
 ## 3. タイミング
 
 - **planned と measured は同一 tick・同一 `seq` で送る。** 受信側は2ストリームを独立に
-  サンプリングするため、これが両者のズレを1配信周期に抑える唯一の保証になる
+  サンプリングするため、これが両者のズレを1配信周期に抑える唯一の保証になる。
+  `VizPublisher::publish()` は両フレームの `seq` を自分で打ち直してこれを保証する
+  （手で合わせるには壊れやすすぎるため）
 - 配信レートは制御周期から間引く（既定 100 Hz 相当）。500 Hz 制御なら5 tick に1回
 - **最初の状態読み戻しが済むまで measured を送らない。** ゼロ姿勢のフレームは
   「崩れ落ちたロボット」として描画される
@@ -80,9 +89,11 @@ quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git", fe
 - 推奨形：`sync_channel(8)` 程度の**有界チャネル**で publisher スレッドへ渡し、
   満杯なら `try_send` の失敗として**捨てる**（可視化は lossy でよい）。
   取りこぼし数を数えて終了時に出すと、詰まりが「健全な配信」に見えなくなる
-- 参考実装: [go2-gait-runner](https://github.com/takarakasai/go2-gait-runner) の
-  `mod viz_pub`（`VizPublisher::new` がスレッドを立て、`publish()` はフレーム構築と
-  `try_send` のみ）
+- **`viz_pub::VizPublisher` がこれを実装済み**。`publish()` は間引き判定 →
+  （publish する tick だけ）フレーム構築 → 有界チャネルへ `try_send`、で終わる。
+  セッションを持つスレッドが直列化と put を担当する。取りこぼし数は `dropped()`
+- 自前で書く場合も同じ形にすること。参考は
+  [go2-gait-runner](https://github.com/takarakasai/go2-gait-runner) の呼び出し側
 
 ## 5. Zenoh トランスポート仕様
 
@@ -102,16 +113,31 @@ quadruped-gait = { git = "https://github.com/takarakasai/quadruped-gait.git", fe
 
 再試行が無限なので **受信側を先に起動してもよい**。配信側が上がれば最大4秒ほどで繋がる。
 
-### 5.2 明示している設定（唯一の非既定）
+### 5.2 トポロジ（接続の向き）
 
-multicast が使えない環境（同一ホスト / WSL2 / multicast 不可の LAN）向け:
+zenoh の peer は対称なので、**どちらが待ち受けてもよい**。`viz_net::VizEndpoints` が
+その選択を持ち、配信側 (`viz_pub`) と受信側 (`viz_sub`) の両方が同じ型を受け取る。
 
-- 配信側: `listen/endpoints = ["tcp/0.0.0.0:7447"]`、`scouting/multicast/enabled = false`
-- 受信側: `connect/endpoints = ["tcp/<host>:7447"]`、`scouting/multicast/enabled = false`
+| トポロジ | 配信側 | 受信側 | 使う場面 |
+|---|---|---|---|
+| discovery | `auto()` | `auto()` | multicast が通る LAN。アドレス不要 |
+| 配信が待つ | `listen(["tcp/0.0.0.0:7447"])` | `connect(["tcp/<robot>:7447"])` | 既定。ロボットのアドレスが既知 |
+| 受信が待つ | `connect(["tcp/<pc>:7447"])` | `listen(["tcp/0.0.0.0:7447"])` | **ロボット側のアドレスが動く / NAT 越し** |
+| router 経由 | `connect(["tcp/<router>:7447"])` | `connect(["tcp/<router>:7447"])` | zenohd を挟む。多対多になる場合 |
 
-peer の listen 既定がエフェメラルポートなので、**接続先を固定したいなら明示が必須**。
-配信元が複数ある場合は別ポートを割り当てる（7447, 7448, …）。受信側 articara は
-ストリームごとに接続先を指定できる。multicast が通る LAN なら両側とも無指定でよい。
+- `listen` と `connect` は排他ではない。両方指定して「受信を待ちつつ router にも繋ぐ」も可
+- エンドポイントを1つでも指定すると **multicast scouting は自動的に無効**になる
+  （指定する理由は大抵 discovery が効かないため）。`with_multicast(true)` で上書き可
+- peer の listen 既定がエフェメラルポートなので、**待ち受け側は明示が必須**
+- 配信元が複数ある場合は別ポートを割り当てる（7447, 7448, …）
+- `go2-gait-runner` では `--viz-endpoint`（listen）と `--viz-connect`（connect）。
+  どちらもカンマ区切りで複数指定できる
+- articara では Live feed 窓の `mode`（auto / connect / listen）と `endpoint`
+
+**受信側が listen する場合、セッションは1本にすること。** planned と measured で別々に
+セッションを開いて同じポートを listen すると2本目が bind に失敗する。`viz_sub::VizSession`
+を1つ開いて `subscribe()` を2回呼ぶ（articara はそうしている）。配信元が2つに分かれて
+いる場合だけセッションも2本になる。
 
 ### 5.3 QoS
 
