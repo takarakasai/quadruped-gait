@@ -588,6 +588,27 @@ impl AnyGaitController {
         }
     }
 
+    /// Replace the whole [`GaitConfig`] in place, **preserving the cycle
+    /// phase**.
+    ///
+    /// This is the way to retune timing, stride, swing height or duty
+    /// while the robot is walking. Rebuilding the controller instead
+    /// (`AnyGaitController::new`) snaps the phase clock back to 0, which
+    /// reassigns stance and swing mid-stride and steps every foot target.
+    ///
+    /// No-op for [`AnyGaitController::LinearCrawl`]: it is built from
+    /// [`crate::linear_crawl::LinearCrawlConfig`], not [`GaitConfig`], so
+    /// there is nothing here to replace.
+    pub fn set_config(&mut self, cfg: GaitConfig) {
+        match self {
+            AnyGaitController::Champ(c) => c.set_config(cfg),
+            AnyGaitController::Mpc(c) => c.set_config(cfg),
+            AnyGaitController::CentroidalSrbd(c) => c.set_config(cfg),
+            AnyGaitController::FullCentroidal(c) => c.set_config(cfg),
+            AnyGaitController::LinearCrawl(_) => {}
+        }
+    }
+
     /// Update `cycle_period_s` in place without resetting the phase
     /// clock (see [`crate::full_centroidal_controller::
     /// FullCentroidalMpcGaitController::set_cycle_period_s`]'s doc
