@@ -57,8 +57,74 @@ pub fn formulate(
     Task::equality(a, b)
 }
 
+/// No-contact-motion with a **continuous contact weight** per foot.
+///
+/// Same reason as [`super::friction_cone::formulate_weighted`]: with a
+/// boolean flag the equality block gains or loses three rows on the tick a
+/// foot changes state, and the rank jump is what breaks the solve. Here
+/// every foot contributes three rows every tick, scaled by its weight:
+///
+/// ```text
+/// w_i · J_i · q̈ = −w_i · J̇_i · q̇
+/// ```
+///
+/// At `w = 0` the rows are identically zero, so the foot is unconstrained
+/// exactly as if it had been left out -- but the block keeps its shape, and
+/// the transition between the two is continuous.
+pub fn formulate_weighted(
+    dims: WbcDims,
+    j_contact: &DMatrix<f64>,
+    dj_v: &DVector<f64>,
+    contact_weight: [f64; 4],
+) -> Task {
+    debug_assert_eq!(j_contact.shape(), (3 * dims.nc, dims.nv));
+    debug_assert_eq!(dj_v.len(), 3 * dims.nc);
+
+    let n = dims.n_decision();
+    let mut a = DMatrix::zeros(3 * dims.nc, n);
+    let mut b = DVector::zeros(3 * dims.nc);
+    for i in 0..dims.nc {
+        let w = contact_weight[i].clamp(0.0, 1.0);
+        let row = 3 * i;
+        let j_block = j_contact.view((row, 0), (3, dims.nv));
+        let mut dst = a.view_mut((row, dims.q_offset()), (3, dims.nv));
+        dst.copy_from(&j_block);
+        dst *= w;
+        for k in 0..3 {
+            b[row + k] = -w * dj_v[row + k];
+        }
+    }
+
+    Task::equality(a, b)
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Weight zero leaves the foot unconstrained, but **the block keeps its
+    /// shape** -- the rows are there and identically zero.
+    #[test]
+    fn zero_weight_gives_zero_rows_without_changing_the_shape() {
+        let dims = WbcDims { nv: 18, nc: 4, na: 12 };
+        let j = DMatrix::from_element(3 * dims.nc, dims.nv, 1.0);
+        let dj_v = DVector::from_element(3 * dims.nc, 2.0);
+        let task = formulate_weighted(dims, &j, &dj_v, [0.0; 4]);
+        assert_eq!(task.n_eq(), 12);
+        assert!(task.a.iter().all(|v| *v == 0.0));
+        assert!(task.b.iter().all(|v| *v == 0.0));
+    }
+
+    /// Weight one reproduces the boolean formulation row for row.
+    #[test]
+    fn unit_weight_matches_the_boolean_form() {
+        let dims = WbcDims { nv: 18, nc: 4, na: 12 };
+        let j = DMatrix::from_fn(3 * dims.nc, dims.nv, |r, c| (r + 2 * c) as f64);
+        let dj_v = DVector::from_fn(3 * dims.nc, |r, _| r as f64);
+        let weighted = formulate_weighted(dims, &j, &dj_v, [1.0; 4]);
+        let boolean = formulate(dims, &j, &dj_v, [true; 4]);
+        assert_eq!(weighted.a, boolean.a);
+        assert_eq!(weighted.b, boolean.b);
+    }
     use super::*;
 
     #[test]

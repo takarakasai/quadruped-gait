@@ -105,9 +105,140 @@ pub fn formulate(
     Task { a, b, d, f }
 }
 
+/// Friction cone with a **continuous contact weight** per foot instead of a
+/// boolean flag.
+///
+/// [`formulate`] switches a foot between "force must be exactly zero"
+/// (a hard equality) and "force may be anywhere in the cone". The rank of
+/// the priority-0 block therefore jumps by 3 on the tick a foot changes
+/// state, and a hierarchical least-squares solver can return a point that
+/// satisfies none of its blocks on exactly that tick. Measured on a 53 kg
+/// quadruped in MuJoCo: total vertical reaction 0.1 N against a 523 N
+/// machine while the solved base angular acceleration was 57 rad/s², once
+/// per stance swap.
+///
+/// Weighting removes the switch. Every foot gets the same six inequalities
+/// every tick and only the bounds move:
+///
+/// ```text
+///     −f_z ≤ −w·f_min           (f_z ≥ w·f_min)
+///      f_z ≤  w·f_max
+///  ±f_x − μ·f_z ≤ 0
+///  ±f_y − μ·f_z ≤ 0
+/// ```
+///
+/// **At `w = 0` this is the swing equality.** `0 ≤ f_z ≤ 0` pins the normal
+/// force, and the pyramid then pins the tangential one, so `f = 0` follows
+/// without a separate equality block. At `w = 1` it is [`formulate`] plus an
+/// upper bound. In between the foot may carry a fraction of the load, which
+/// is what a foot that is leaving or arriving is physically doing.
+///
+/// `f_max` is the per-foot vertical cap at full weight; pass something like
+/// twice the machine's weight. It must be finite -- the cap is what makes
+/// the ramp mean anything.
+pub fn formulate_weighted(
+    dims: WbcDims,
+    contact_weight: [f64; 4],
+    friction_mu: f64,
+    f_min: f64,
+    f_max: f64,
+) -> Task {
+    debug_assert_eq!(
+        dims.nc, 4,
+        "friction_cone currently assumes 4 contact points"
+    );
+    debug_assert!(f_max.is_finite() && f_max > 0.0, "f_max must be finite");
+
+    let n = dims.n_decision();
+    // Six rows per foot, always. **The row count must not depend on the
+    // contact state** -- that is the whole point.
+    let mut d = DMatrix::zeros(6 * dims.nc, n);
+    let mut f = DVector::zeros(6 * dims.nc);
+    for i in 0..dims.nc {
+        let w = contact_weight[i].clamp(0.0, 1.0);
+        let col = dims.f_offset() + 3 * i;
+        let row = 6 * i;
+        // f_z ≥ w·f_min
+        d[(row, col + 2)] = -1.0;
+        f[row] = -w * f_min;
+        // f_z ≤ w·f_max
+        d[(row + 1, col + 2)] = 1.0;
+        f[row + 1] = w * f_max;
+        // ±f_x − μ·f_z ≤ 0, ±f_y − μ·f_z ≤ 0
+        for (k, axis) in [0usize, 1].into_iter().enumerate() {
+            let r = row + 2 + 2 * k;
+            d[(r, col + axis)] = 1.0;
+            d[(r, col + 2)] = -friction_mu;
+            d[(r + 1, col + axis)] = -1.0;
+            d[(r + 1, col + 2)] = -friction_mu;
+        }
+    }
+
+    Task {
+        a: DMatrix::zeros(0, n),
+        b: DVector::zeros(0),
+        d,
+        f,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The block keeps its shape whatever the contact state is.** That is
+    /// what stops the rank of priority 0 from jumping mid-stride.
+    #[test]
+    fn the_weighted_block_has_a_constant_shape() {
+        let dims = WbcDims { nv: 18, nc: 4, na: 12 };
+        for w in [[0.0; 4], [1.0; 4], [0.0, 0.3, 0.7, 1.0]] {
+            let task = formulate_weighted(dims, w, 0.5, 0.0, 1000.0);
+            assert_eq!(task.n_eq(), 0);
+            assert_eq!(task.n_iq(), 24);
+        }
+    }
+
+    /// **Weight zero is the swing equality.** `0 ≤ f_z ≤ 0` pins the normal
+    /// force and the pyramid then pins the tangential one, so any non-zero
+    /// force violates something.
+    #[test]
+    fn zero_weight_pins_the_foot_force_to_zero() {
+        let dims = WbcDims { nv: 0, nc: 4, na: 0 };
+        let task = formulate_weighted(dims, [0.0; 4], 0.5, 0.0, 1000.0);
+        let off = dims.f_offset();
+        for (axis, name) in [(0, "f_x"), (1, "f_y"), (2, "f_z")] {
+            for sign in [1.0, -1.0] {
+                let mut x = DVector::zeros(dims.n_decision());
+                x[off + axis] = sign * 10.0;
+                let lhs = &task.d * &x;
+                assert!(
+                    (0..task.n_iq()).any(|r| lhs[r] > task.f[r] + 1e-9),
+                    "{name} = {sign}·10 should violate something at w = 0"
+                );
+            }
+        }
+        // Zero force itself is feasible.
+        let x = DVector::zeros(dims.n_decision());
+        let lhs = &task.d * &x;
+        assert!((0..task.n_iq()).all(|r| lhs[r] <= task.f[r] + 1e-9));
+    }
+
+    /// The cap scales with the weight, so a foot that is half in contact may
+    /// carry half the load.
+    #[test]
+    fn the_normal_force_cap_follows_the_weight() {
+        let dims = WbcDims { nv: 0, nc: 4, na: 0 };
+        let task = formulate_weighted(dims, [0.5, 0.0, 0.0, 0.0], 0.5, 0.0, 800.0);
+        let off = dims.f_offset();
+        let feasible = |fz: f64| {
+            let mut x = DVector::zeros(dims.n_decision());
+            x[off + 2] = fz;
+            let lhs = &task.d * &x;
+            (0..task.n_iq()).all(|r| lhs[r] <= task.f[r] + 1e-9)
+        };
+        assert!(feasible(399.0));
+        assert!(!feasible(401.0));
+    }
 
     #[test]
     fn all_swing_only_equalities() {
