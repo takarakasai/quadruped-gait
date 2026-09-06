@@ -690,8 +690,23 @@ impl AnyGaitController {
     /// Feed the observed base roll/pitch (rad) to the Poincaré/deadbeat
     /// pitch foot-placement. No-op for other modes.
     pub fn set_body_attitude_observed(&mut self, roll: f64, pitch: f64) {
-        if let AnyGaitController::FullCentroidal(c) = self {
-            c.set_body_attitude_observed(roll, pitch);
+        match self {
+            AnyGaitController::FullCentroidal(c) => c.set_body_attitude_observed(roll, pitch),
+            // SRBD MPC: closes the attitude loop in `build_srbd_inputs`
+            // (current state carries the observed roll / pitch, the
+            // reference stays level).
+            AnyGaitController::Mpc(c) => c.set_body_attitude_observed(roll, pitch),
+            _ => {}
+        }
+    }
+
+    /// Feed the observed body height above the support feet (m) to the
+    /// SRBD MPC so it can regulate height instead of assuming the nominal
+    /// stance height. No-op for other modes. `None` restores the legacy
+    /// behaviour.
+    pub fn set_body_height_observed(&mut self, height_m: Option<f64>) {
+        if let AnyGaitController::Mpc(c) = self {
+            c.set_body_height_observed(height_m);
         }
     }
 

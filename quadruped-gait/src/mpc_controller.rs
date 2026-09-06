@@ -155,6 +155,14 @@ pub struct MpcGaitController {
     /// any yaw-corrective GRFs and breaks in-place rotation. Wiring the
     /// observed gyro / `body cvel` here closes the angular loop.
     omega_observed_world: Vector3<f64>,
+    /// Observed body height above the support feet (m), if the host has an
+    /// estimator for it. `None` keeps the legacy behaviour: `s_now.z` is
+    /// pinned to the nominal stance height, so the MPC can never see (or
+    /// correct) a height error. See [`Self::set_body_height_observed`].
+    height_observed: Option<f64>,
+    /// Observed body roll / pitch (rad). `None` keeps roll = pitch = 0 in
+    /// `s_now`, which likewise hides any attitude error from the MPC.
+    attitude_observed: Option<(f64, f64)>,
 
     /// Convex SRBD MPC (Di Carlo et al. 2018) used to predict the
     /// ground reaction forces required to track the velocity command
@@ -212,6 +220,8 @@ impl MpcGaitController {
             k_capture: DEFAULT_CAPTURE_POINT_GAIN_S,
             v_observed_world: Vector3::zeros(),
             omega_observed_world: Vector3::zeros(),
+            height_observed: None,
+            attitude_observed: None,
             srbd_mpc: SrbdMpc::new(SrbdMpcConfig::default()),
             last_mpc_solution: None,
             mpc_solve_accumulator_s: f64::INFINITY,
@@ -383,6 +393,31 @@ impl MpcGaitController {
         self.omega_observed_world = omega_world;
     }
 
+    /// Feed the observed body height above the support feet (m).
+    ///
+    /// Until this is wired the MPC's current state uses the nominal stance
+    /// height, and because the reference trajectory is built *from the
+    /// current state*, the height error is zero by construction: the MPC
+    /// cannot ask for any vertical correction. legged_control feeds the
+    /// full estimated state here (`setCurrentObservation`); this closes
+    /// the same loop for the SRBD variant. `None` restores the legacy
+    /// behaviour.
+    pub fn set_body_height_observed(&mut self, height_m: Option<f64>) {
+        self.height_observed = height_m;
+    }
+
+    /// Feed the observed body roll / pitch (rad). Same reasoning as
+    /// [`Self::set_body_height_observed`]: with roll = pitch = 0 assumed,
+    /// the attitude error is invisible to the MPC. `None` restores the
+    /// legacy behaviour.
+    pub fn set_body_attitude_observed(&mut self, roll: f64, pitch: f64) {
+        self.attitude_observed = Some((roll, pitch));
+    }
+
+    pub fn clear_body_attitude_observed(&mut self) {
+        self.attitude_observed = None;
+    }
+
     /// Feed observed body pose (yaw + world-frame position). When the
     /// host wires this, the MPC's `s_now.position` and the body→world
     /// rotation used by `solve_srbd_mpc` and `compute_mpc_footstep`
@@ -536,15 +571,22 @@ impl MpcGaitController {
         // pose; roll/pitch tracked elsewhere are approximated as zero
         // (the gait controller doesn't observe body orientation in
         // Phase 2).
+        let nominal_z = -self.kin.legs()[0].nominal_foot_body.z;
+        let (roll, pitch) = self.attitude_observed.unwrap_or((0.0, 0.0));
         let s_now = SrbdState {
-            orientation_rpy: Vector3::new(0.0, 0.0, self.body_state.world_yaw),
+            // Roll / pitch are the observed values when the host wires
+            // them, otherwise 0 (legacy). Yaw is always the integrated /
+            // observed body_state yaw.
+            orientation_rpy: Vector3::new(roll, pitch, self.body_state.world_yaw),
             position: Vector3::new(
                 self.body_state.world_position.x,
                 self.body_state.world_position.y,
-                // Use the kinematics' nominal stance height as a proxy
-                // for the body z; gives a stable level for the MPC to
-                // regulate to.
-                -self.kin.legs()[0].nominal_foot_body.z,
+                // Observed height when available; otherwise the nominal
+                // stance height (legacy proxy). **The reference below is
+                // built from `s_ref`, which always carries the nominal
+                // height and a level attitude** -- that is what turns the
+                // observation into a correction instead of a new setpoint.
+                self.height_observed.unwrap_or(nominal_z),
             ),
             // Use the observed yaw rate (world frame) so the MPC sees
             // a real angular-velocity error against the reference and
@@ -561,8 +603,15 @@ impl MpcGaitController {
             Vector3::new(self.cmd.vx, self.cmd.vy, 0.0),
             self.body_state.world_yaw,
         );
+        // Reference: level attitude at the nominal height, moving at the
+        // commanded velocity. Built from `s_ref`, not `s_now`, so that an
+        // observed height / attitude error shows up as a tracking error.
+        let mut s_ref = s_now;
+        s_ref.orientation_rpy.x = 0.0;
+        s_ref.orientation_rpy.y = 0.0;
+        s_ref.position.z = nominal_z;
         let reference =
-            ReferenceTrajectory::from_constant_velocity(s_now, v_world_cmd, self.cmd.wz, cfg);
+            ReferenceTrajectory::from_constant_velocity(s_ref, v_world_cmd, self.cmd.wz, cfg);
 
         // Contact schedule: project current per-leg phase forward by
         // `dt_per_step` for each horizon step.
@@ -639,13 +688,26 @@ impl MpcGaitController {
         // For yaw=0 body=world so the bug is invisible at start, but
         // any integrated yaw makes the cross product mix frames and
         // breaks in-place rotation tracking.
+        // With an observed attitude the moment arms must be rotated by the
+        // full attitude, not yaw only -- otherwise `[r_i]x f_i` mixes a
+        // tilted body frame with world-frame forces.
         let yaw = self.body_state.world_yaw;
-        let foot_world: [Vector3<f64>; 4] = [
-            body_to_world_horizontal(output.legs[0].foot_body, yaw),
-            body_to_world_horizontal(output.legs[1].foot_body, yaw),
-            body_to_world_horizontal(output.legs[2].foot_body, yaw),
-            body_to_world_horizontal(output.legs[3].foot_body, yaw),
-        ];
+        let rot = nalgebra::Rotation3::from_euler_angles(roll, pitch, yaw);
+        let foot_world: [Vector3<f64>; 4] = if self.attitude_observed.is_some() {
+            [
+                rot * output.legs[0].foot_body,
+                rot * output.legs[1].foot_body,
+                rot * output.legs[2].foot_body,
+                rot * output.legs[3].foot_body,
+            ]
+        } else {
+            [
+                body_to_world_horizontal(output.legs[0].foot_body, yaw),
+                body_to_world_horizontal(output.legs[1].foot_body, yaw),
+                body_to_world_horizontal(output.legs[2].foot_body, yaw),
+                body_to_world_horizontal(output.legs[3].foot_body, yaw),
+            ]
+        };
         let feet = FootOffsets::constant_per_leg(foot_world, n);
 
         (s_now, reference, contact, feet)
