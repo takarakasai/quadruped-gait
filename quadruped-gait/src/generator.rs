@@ -433,21 +433,23 @@ impl AnyGaitController {
         }
     }
 
-    /// Configure the FullCentroidal controller's nonlinear pulse
-    /// branch of the capture-point feedback (η-2 experiment, see
-    /// [`crate::mpc_controller::capture_point_step`]). No-op for any
-    /// other gait mode — only `FullCentroidal` carries the pulse
-    /// fields today; the other closed-loop modes still use pure
-    /// linear `k · v_err`.
+    /// Configure the nonlinear pulse branch of the capture-point
+    /// feedback (η-2 experiment, see
+    /// [`crate::mpc_controller::capture_point_step`]). Applies to
+    /// `Mpc` and `FullCentroidal`; no-op for the other modes, which
+    /// carry no capture-point feedback at all.
     pub fn set_capture_point_pulse(&mut self, k_pulse: f64, v_db: f64) {
-        if let AnyGaitController::FullCentroidal(c) = self {
-            c.set_capture_point_pulse(k_pulse, v_db);
+        match self {
+            AnyGaitController::FullCentroidal(c) => c.set_capture_point_pulse(k_pulse, v_db),
+            AnyGaitController::Mpc(c) => c.set_capture_point_pulse(k_pulse, v_db),
+            _ => {}
         }
     }
 
     pub fn capture_point_pulse(&self) -> Option<(f64, f64)> {
         match self {
             AnyGaitController::FullCentroidal(c) => Some(c.capture_point_pulse()),
+            AnyGaitController::Mpc(c) => Some(c.capture_point_pulse()),
             _ => None,
         }
     }

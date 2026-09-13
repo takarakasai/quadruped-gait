@@ -138,6 +138,11 @@ pub struct MpcGaitController {
     /// model). Larger → more aggressive correction → faster velocity
     /// tracking but bigger overshoot.
     k_capture: f64,
+    /// Slope of the deadbanded pulse branch of the capture-point
+    /// feedback. `0` (default) leaves the feedback purely linear.
+    k_capture_pulse: f64,
+    /// Deadband [m/s] below which the pulse branch contributes nothing.
+    v_capture_deadband: f64,
 
     /// Last reported observed body linear velocity in world frame.
     /// Defaults to zero; the host should call
@@ -218,6 +223,8 @@ impl MpcGaitController {
             cmd: VelocityCmd::zero(),
             knee_forward: [false; 4],
             k_capture: DEFAULT_CAPTURE_POINT_GAIN_S,
+            k_capture_pulse: 0.0,
+            v_capture_deadband: 0.0,
             v_observed_world: Vector3::zeros(),
             omega_observed_world: Vector3::zeros(),
             height_observed: None,
@@ -372,6 +379,23 @@ impl MpcGaitController {
     pub fn capture_point_gain(&self) -> f64 {
         self.k_capture
     }
+    /// Read the pulse branch parameters `(k_pulse, v_db)`.
+    pub fn capture_point_pulse(&self) -> (f64, f64) {
+        (self.k_capture_pulse, self.v_capture_deadband)
+    }
+
+    /// Configure the deadbanded pulse branch.
+    ///
+    /// **This is the branch that lets a push move the foothold without
+    /// the drift a larger linear gain brings.** The linear term acts on
+    /// every tick's velocity error, so raising it amplifies tracking
+    /// error into foot placement; the pulse stays exactly zero until the
+    /// error passes `v_db`, then rises steeply.
+    pub fn set_capture_point_pulse(&mut self, k_pulse: f64, v_db: f64) {
+        self.k_capture_pulse = k_pulse.max(0.0);
+        self.v_capture_deadband = v_db.max(0.0);
+    }
+
     pub fn set_capture_point_gain(&mut self, k: f64) {
         // Allow zero (turns the feedback off → degenerates to CHAMP-equivalent).
         self.k_capture = k.max(0.0);
@@ -770,8 +794,21 @@ impl MpcGaitController {
         let feedback_enabled = !self.cmd.is_zero();
         let mut feedback = Vector3::zeros();
         if feedback_enabled {
-            feedback.x = self.k_capture * v_err_body.x;
-            feedback.y = self.k_capture * v_err_body.y;
+            // Linear plus the deadbanded pulse branch. With
+            // `k_capture_pulse = 0` (default) this is the old
+            // `k · v_err` bit for bit.
+            feedback.x = capture_point_step(
+                v_err_body.x,
+                self.k_capture,
+                self.k_capture_pulse,
+                self.v_capture_deadband,
+            );
+            feedback.y = capture_point_step(
+                v_err_body.y,
+                self.k_capture,
+                self.k_capture_pulse,
+                self.v_capture_deadband,
+            );
         }
 
         // ── LIP horizon look-ahead ────────────────────────────────
